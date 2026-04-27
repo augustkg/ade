@@ -3,7 +3,6 @@ name = "ade"
 version = "0.1.0"
 edition = "2021"
 description = "Agentic Development Environment — cross-machine tmux session manager"
-license = "MIT"
 
 [[bin]]
 name = "ade"

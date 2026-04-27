@@ -34,7 +34,3 @@ target = "hume@100.112.161.65"
 ## Keys
 
 `j`/`k` navigate · `Enter` attach · `n` new · `R` rename · `d` delete · `H` hosts · `r` refresh · `q` quit
-
-## License
-
-MIT
