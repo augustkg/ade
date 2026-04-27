@@ -1,6 +1,7 @@
 mod app;
 mod claude_status;
 mod cwd;
+mod debug;
 mod hosts;
 mod install_hooks;
 mod model;
@@ -30,6 +31,7 @@ fn main() -> Result<()> {
     if argv.len() >= 2 {
         match argv[1].as_str() {
             "install-hooks" => return run_install_hooks(&argv[2..]),
+            "debug" => return run_debug(&argv[2..]),
             "--help" | "-h" | "help" => {
                 print_usage();
                 return Ok(());
@@ -68,8 +70,51 @@ fn print_usage() {
          \x20\x20ade                          Launch the TUI\n\
          \x20\x20ade install-hooks            Install Claude Code status hooks locally\n\
          \x20\x20ade install-hooks --host H   Install hooks on a configured remote host\n\
+         \x20\x20ade debug claude             Diagnose why ADE does/doesn't see Claude per pane\n\
+         \x20\x20ade debug claude --host H    Same, scoped to one configured host (or 'local')\n\
          \x20\x20ade help                     Show this message"
     );
+}
+
+fn run_debug(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        eprintln!("Error: `ade debug` requires a subcommand. Try `ade debug claude`.");
+        std::process::exit(2);
+    }
+    match args[0].as_str() {
+        "claude" => {
+            let mut host: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--host" => {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("Error: --host requires a value");
+                            std::process::exit(2);
+                        }
+                        host = Some(args[i].clone());
+                    }
+                    other => {
+                        eprintln!("Error: unknown argument '{}'", other);
+                        std::process::exit(2);
+                    }
+                }
+                i += 1;
+            }
+            match debug::run(host.as_deref()) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        other => {
+            eprintln!("Error: unknown debug subcommand '{}'", other);
+            std::process::exit(2);
+        }
+    }
 }
 
 fn run_install_hooks(args: &[String]) -> Result<()> {
