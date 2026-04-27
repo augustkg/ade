@@ -117,9 +117,44 @@ fn attach(name: &str, machine: &Machine, config: &Config) {
     let target = format!("={}", name);
     let inside = tmux::is_inside_tmux();
 
+    // Diagnostic log: starts a fresh /tmp/ade-attach.log on every attempt.
+    // run_status appends subprocess results below, so the file ends up with
+    // a complete trace of one attach attempt — including the env we used to
+    // decide inside vs outside tmux.
+    let env_tmux = std::env::var("TMUX").unwrap_or_default();
+    let env_tmux_pane = std::env::var("TMUX_PANE").unwrap_or_default();
+    let current = tmux::current_session().unwrap_or_default();
+    let log = format!(
+        "{}\n\
+         attach: name={} machine={:?} inside_tmux={} target={}\n\
+         env: TMUX={:?} TMUX_PANE={:?}\n\
+         current_session: {:?}\n",
+        chrono_now(),
+        name,
+        machine,
+        inside,
+        target,
+        env_tmux,
+        env_tmux_pane,
+        current,
+    );
+    let _ = std::fs::write("/tmp/ade-attach.log", log);
+
     match machine {
         Machine::Local => {
             if inside {
+                // Same-session early return: switch-client to the session
+                // we're already in is a silent no-op, so just quit cleanly
+                // instead. The user sees no popup; ADE exits and they're
+                // back at the session they wanted (the one they were in).
+                if let Some(current) = tmux::current_session() {
+                    if current == name {
+                        append_attach_log(
+                            "skipped: already in this session (switch-client would be a no-op)\n",
+                        );
+                        return;
+                    }
+                }
                 run_status("tmux", &["switch-client", "-t", &target]);
             } else {
                 exec_replace("tmux", &["attach-session", "-t", &target]);
@@ -130,17 +165,27 @@ fn attach(name: &str, machine: &Machine, config: &Config) {
                 eprintln!("Error: host '{}' not found in config", host_name);
                 std::process::exit(1);
             };
-            if inside {
-                let inner = build_attach_shell_cmd(host, &target);
-                let window_name = format!("{}@{}", name, host.name);
-                run_status("tmux", &["new-window", "-n", &window_name, &inner]);
-            } else {
-                let (program, args) = build_attach_command(host, &target);
-                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                exec_replace(&program, &arg_refs);
-            }
+            // Always exec-replace into ssh/mosh. From outside tmux, that's
+            // the obvious thing. From inside tmux, this means our current
+            // pane becomes the mosh/ssh client and the user sees the remote
+            // session attach right where ADE was — same UX in both contexts,
+            // no "did the new window auto-select?" ambiguity. When the user
+            // detaches, the pane closes (or returns to its shell), same as
+            // any other terminal-replacing command.
+            let (program, args) = build_attach_command(host, &target);
+            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            exec_replace(&program, &arg_refs);
+            let _ = inside; // remote attach path no longer branches on inside-tmux
         }
     }
+}
+
+fn chrono_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| format!("epoch={}", d.as_secs()))
+        .unwrap_or_default()
 }
 
 /// The remote command to run on the destination host. Always pre-quoted for
@@ -189,7 +234,10 @@ fn build_attach_command(host: &Host, target: &str) -> (String, Vec<String>) {
     }
 }
 
+#[allow(dead_code)]
 /// Build a single shell command-line suitable for `tmux new-window -- <cmd>`.
+/// Currently unused — remote attaches always go through exec_replace — but
+/// kept around in case we ever want to reintroduce a "new window" attach mode.
 /// The string is parsed by the *local* shell into argv before reaching ssh/mosh.
 ///
 /// For SSH, we additionally need remote-shell quoting on `target` because ssh
@@ -201,7 +249,7 @@ fn build_attach_command(host: &Host, target: &str) -> (String, Vec<String>) {
 /// directly to execvp on the remote, no remote shell. So we shell-quote each
 /// arg only for the local layer; the unquoted form reaches tmux verbatim.
 fn build_attach_shell_cmd(host: &Host, target: &str) -> String {
-    match host.kind {
+    let raw = match host.kind {
         HostKind::Ssh => {
             let remote_cmd = remote_attach_cmd(target);
             let mut s = String::from("ssh");
@@ -231,20 +279,69 @@ fn build_attach_shell_cmd(host: &Host, target: &str) -> String {
             s.push_str(&hosts::shell_quote(target));
             s
         }
-    }
+    };
+
+    // tmux auto-closes a window when its command exits, which silently hides
+    // failures (mosh can't connect, remote tmux session was killed, etc.).
+    // Wrap the command so a non-zero exit prints the code and waits for the
+    // user to press Enter — making the failure visible. Normal exits (the
+    // user detached cleanly) close the window as usual.
+    format!(
+        "{}; __ade_ec=$?; if [ \"$__ade_ec\" -ne 0 ]; then printf '\\n[exited with status %s — press Enter to close]\\n' \"$__ade_ec\"; read -r _ </dev/tty 2>/dev/null || sleep 60; fi",
+        raw
+    )
 }
 
 fn run_status(program: &str, args: &[&str]) {
-    match Command::new(program).args(args).status() {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!("Error: {} exited with {}", program, status);
-            std::process::exit(1);
+    match Command::new(program).args(args).output() {
+        Ok(out) => {
+            // Always append a record so /tmp/ade-attach.log captures the
+            // exact subprocess result, including silent successes.
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            append_attach_log(&format!(
+                "subprocess: {} {}\n  status: {}\n  stdout: {}\n  stderr: {}\n",
+                program,
+                args.join(" "),
+                out.status,
+                stdout.trim(),
+                stderr.trim(),
+            ));
+
+            if !out.status.success() {
+                let stderr_trim = stderr.trim();
+                if stderr_trim.is_empty() {
+                    eprintln!("Error: {} exited with {}", program, out.status);
+                } else {
+                    eprintln!(
+                        "Error: {} exited with {}: {}",
+                        program, out.status, stderr_trim
+                    );
+                }
+                std::process::exit(1);
+            }
         }
         Err(e) => {
+            append_attach_log(&format!(
+                "subprocess: {} {} (spawn failed)\n  error: {}\n",
+                program,
+                args.join(" "),
+                e
+            ));
             eprintln!("Error: failed to run {}: {}", program, e);
             std::process::exit(1);
         }
+    }
+}
+
+fn append_attach_log(line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open("/tmp/ade-attach.log")
+    {
+        let _ = f.write_all(line.as_bytes());
     }
 }
 

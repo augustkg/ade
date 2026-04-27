@@ -7,8 +7,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    App, AppState, CreateField, CreateForm, FocusArea, HostField, HostForm, PendingConfirm,
-    SessionAction,
+    App, AppState, CreateField, CreateForm, FocusArea, HostField, HostForm, Notice, NoticeKind,
+    PendingConfirm, SessionAction,
 };
 use crate::claude_status::ClaudeState;
 use crate::hosts::{Host, HostKind};
@@ -116,7 +116,20 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
                     spans.extend(text_field_spans(&app.input_buffer, true, theme::PEACH));
                     ListItem::new(Line::from(spans))
                 } else {
-                    render_session_row(session, in_folder, is_selected, app.selected_action)
+                    let is_current = matches!(session.machine, Machine::Local)
+                        && app
+                            .tree
+                            .current_session
+                            .as_deref()
+                            .map(|n| n == session.raw_name)
+                            .unwrap_or(false);
+                    render_session_row(
+                        session,
+                        in_folder,
+                        is_selected,
+                        app.selected_action,
+                        is_current,
+                    )
                 }
             }
             Row::NewSession => ListItem::new(Line::from(vec![
@@ -237,6 +250,7 @@ fn render_session_row(
     in_folder: bool,
     is_selected: bool,
     selected_action: SessionAction,
+    is_current: bool,
 ) -> ListItem<'static> {
     let dot = if session.attached { "●" } else { "○" };
     let dot_color = if session.attached {
@@ -297,6 +311,16 @@ fn render_session_row(
     if let Some(state) = session.claude {
         spans.push(Span::raw("  "));
         spans.push(claude_chip(state));
+    }
+
+    if is_current {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            " · here ",
+            Style::default()
+                .fg(theme::SUBTEXT0)
+                .bg(theme::SURFACE1),
+        ));
     }
 
     if is_selected {
@@ -365,6 +389,25 @@ fn indent_for(in_folder: bool) -> &'static str {
 }
 
 fn render_hosts_list(frame: &mut Frame, area: Rect, app: &App) {
+    // Vertical split: optional 2-row banner (hosts_notice), the list itself,
+    // and a 1-row footer for local-machine hook status.
+    let banner_h: u16 = if app.hosts_notice.is_some() { 2 } else { 0 };
+    let chunks = Layout::vertical([
+        Constraint::Length(banner_h),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    if let Some(notice) = &app.hosts_notice {
+        render_notice_banner(frame, chunks[0], notice);
+    }
+
+    render_hosts_list_body(frame, chunks[1], app);
+    render_local_hooks_footer(frame, chunks[2], app);
+}
+
+fn render_hosts_list_body(frame: &mut Frame, area: Rect, app: &App) {
     let selected = match app.state {
         AppState::HostsList { selected } => selected,
         AppState::HostForm(ref f) => f.editing_idx.unwrap_or(0),
@@ -378,9 +421,10 @@ fn render_hosts_list(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme::OVERLAY1),
         )])));
     } else {
-        for (i, host) in app.config.hosts.iter().enumerate() {
-            let is_selected = i == selected;
-            items.push(render_host_row(host, is_selected));
+        for host in app.config.hosts.iter() {
+            let hook_state = app.host_hooks.get(&host.name).copied().flatten();
+            let unreachable = matches!(app.host_hooks.get(&host.name), Some(None));
+            items.push(render_host_row(host, hook_state, unreachable));
         }
     }
     items.push(ListItem::new(Line::from(vec![
@@ -415,7 +459,11 @@ fn render_hosts_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_host_row(host: &Host, _is_selected: bool) -> ListItem<'static> {
+fn render_host_row(
+    host: &Host,
+    hooks_installed: Option<bool>,
+    unreachable: bool,
+) -> ListItem<'static> {
     let m_color = machine_color(&Machine::Remote(host.name.clone()));
     let kind_color = match host.kind {
         HostKind::Ssh => theme::TEAL,
@@ -427,7 +475,7 @@ fn render_host_row(host: &Host, _is_selected: bool) -> ListItem<'static> {
         format!("  {}", host.ssh_args.join(" "))
     };
 
-    ListItem::new(Line::from(vec![
+    let mut spans = vec![
         Span::raw("  "),
         Span::styled(
             host.name.clone(),
@@ -441,7 +489,81 @@ fn render_host_row(host: &Host, _is_selected: bool) -> ListItem<'static> {
         Span::raw("  "),
         Span::styled(host.target.clone(), Style::default().fg(theme::SUBTEXT1)),
         Span::styled(args, Style::default().fg(theme::OVERLAY0)),
-    ]))
+    ];
+
+    // Status chips — clean state shows nothing; only attention-needed states
+    // get a chip, matching the rest of the UI's "quiet by default" feel.
+    if unreachable {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            " unreachable ",
+            Style::default().fg(theme::OVERLAY1).bg(theme::SURFACE1),
+        ));
+    } else if hooks_installed == Some(false) {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            " install hooks ",
+            Style::default()
+                .fg(theme::BASE)
+                .bg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    ListItem::new(Line::from(spans))
+}
+
+fn render_local_hooks_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let line = if app.local_hooks_installed {
+        Line::from(vec![
+            Span::styled(
+                " Local: hooks installed",
+                Style::default().fg(theme::OVERLAY1),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " Local: hooks missing",
+                Style::default().fg(theme::PEACH).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " — press ",
+                Style::default().fg(theme::OVERLAY1),
+            ),
+            Span::styled(
+                "L",
+                Style::default().fg(theme::PEACH).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " to install",
+                Style::default().fg(theme::OVERLAY1),
+            ),
+        ])
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_notice_banner(frame: &mut Frame, area: Rect, notice: &Notice) {
+    let (bg, fg, prefix) = match notice.kind {
+        NoticeKind::Success => (theme::GREEN, theme::BASE, "✓"),
+        NoticeKind::Warning => (theme::PEACH, theme::BASE, "⚠"),
+        NoticeKind::Error => (theme::RED, theme::BASE, "✕"),
+        NoticeKind::Info => (theme::SAPPHIRE, theme::BASE, "ℹ"),
+    };
+
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" {} ", prefix),
+            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            notice.text.clone(),
+            Style::default().fg(theme::TEXT),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
@@ -512,8 +634,12 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
             txt(" edit  "),
             key("d"),
             txt(" delete  "),
+            key("i"),
+            txt(" install  "),
+            key("L"),
+            txt(" install local  "),
             key("Esc/H"),
-            txt(" back to tree"),
+            txt(" back"),
         ],
         AppState::HostForm(_) => vec![
             Span::raw(" "),
@@ -653,7 +779,9 @@ fn render_host_form_modal(frame: &mut Frame, form: &HostForm) {
         Constraint::Length(1), // Target
         Constraint::Length(1), // SSH args
         Constraint::Length(1), // spacer
-        Constraint::Length(2), // Preview (may wrap)
+        Constraint::Length(1), // Preview command
+        Constraint::Length(1), // Spacer
+        Constraint::Length(2), // Educational hint about hooks
     ])
     .margin(1)
     .split(inner);
@@ -739,6 +867,19 @@ fn render_host_form_modal(frame: &mut Frame, form: &HostForm) {
         ))
     };
     frame.render_widget(Paragraph::new(preview), rows[5]);
+
+    // Educational hint about what saving will do.
+    let hint_lines = vec![
+        Line::from(Span::styled(
+            "On save, ADE installs Claude Code status hooks on this host so",
+            Style::default().fg(theme::OVERLAY1),
+        )),
+        Line::from(Span::styled(
+            "the tree shows when Claude is busy vs idle there.",
+            Style::default().fg(theme::OVERLAY1),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(hint_lines), rows[7]);
 }
 
 fn preview_command(host: &Host) -> String {

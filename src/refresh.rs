@@ -17,6 +17,9 @@ pub struct RefreshResult {
     /// True if the local `~/.claude/settings.local.json` contains ADE's
     /// hook marker. Cheap to compute (single file read).
     pub local_hooks_installed: bool,
+    /// Name of the local tmux session the user's current client is viewing,
+    /// if ADE was launched from inside tmux. Used for the `· here` marker.
+    pub current_session: Option<String>,
 }
 
 type RemoteHandle = (String, JoinHandle<Result<RemoteRefresh, String>>);
@@ -67,5 +70,6 @@ pub fn refresh_all(config: &Config) -> RefreshResult {
         errors,
         remote_hooks,
         local_hooks_installed: install_hooks::is_installed_local(),
+        current_session: tmux::current_session(),
     }
 }

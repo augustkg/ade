@@ -23,8 +23,34 @@ pub trait TmuxBackend {
     fn kill_session(&self, name: &str) -> Result<(), String>;
 }
 
+/// True if ADE is being launched from inside a tmux pane. Checks `TMUX`
+/// first (the canonical signal) and falls back to `TMUX_PANE`, which some
+/// shell setups expose even when `TMUX` has been stripped.
 pub fn is_inside_tmux() -> bool {
-    std::env::var("TMUX").is_ok()
+    std::env::var("TMUX").is_ok() || std::env::var("TMUX_PANE").is_ok()
+}
+
+/// When ADE is launched from inside tmux, returns the name of the session
+/// the calling pane belongs to. Uses `#{session_name}` — `#{client_session}`
+/// is empty when tmux is invoked as a subprocess (no client context), so
+/// using it gave us false negatives on the same-session check.
+pub fn current_session() -> Option<String> {
+    if !is_inside_tmux() {
+        return None;
+    }
+    let out = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "#{session_name}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 pub fn local() -> local::LocalTmux {
