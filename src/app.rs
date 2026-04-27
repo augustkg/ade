@@ -369,18 +369,58 @@ impl App {
     }
 
     pub fn refresh(&mut self) {
+        // Drop any in-flight background refresh — the worker keeps running
+        // but its result will be discarded. We want the user's `r` to feel
+        // immediate, not "wait for the previous tick to finish".
+        self.pending_refresh = None;
+        let result = refresh_all(&self.config);
+        self.apply_refresh_result(result);
+        self.last_refresh_started = Instant::now();
+        // Manual refresh resets the per-row action toggle. Background ticks
+        // do not — preserving whatever action the user has cycled to.
+        self.selected_action = SessionAction::Enter;
+    }
+
+    /// Apply a refresh result (from sync or background) to App state.
+    /// Snapshots current expansion state first so user toggles aren't lost.
+    fn apply_refresh_result(&mut self, result: RefreshResult) {
         for (k, v) in self.tree.expanded_snapshot() {
             self.expanded_memory.insert(k, v);
         }
-
-        let result = refresh_all(&self.config);
+        self.host_hooks = result.remote_hooks;
+        self.local_hooks_installed = result.local_hooks_installed;
+        let current_session = result.current_session;
         self.tree = Tree::build(result.per_machine, result.errors, &self.expanded_memory);
+        self.tree.current_session = current_session;
 
         let n = self.tree.visible_rows().len().max(1);
         if self.selected_index >= n {
             self.selected_index = n - 1;
         }
-        self.selected_action = SessionAction::Enter;
+    }
+
+    /// Called once per event-loop iteration. Applies a finished background
+    /// refresh and schedules a new one when the interval has elapsed.
+    /// Non-blocking: if the worker is still running, just leaves it alone.
+    pub fn tick(&mut self) {
+        if let Some(handle) = self.pending_refresh.take() {
+            if handle.is_finished() {
+                if let Ok(result) = handle.join() {
+                    self.apply_refresh_result(result);
+                }
+            } else {
+                self.pending_refresh = Some(handle);
+            }
+        }
+
+        if self.pending_refresh.is_none()
+            && self.last_refresh_started.elapsed() >= AUTO_REFRESH_INTERVAL
+        {
+            let config = self.config.clone();
+            self.pending_refresh =
+                Some(std::thread::spawn(move || refresh_all(&config)));
+            self.last_refresh_started = Instant::now();
+        }
     }
 
     pub fn current_row(&self) -> Option<Row> {
