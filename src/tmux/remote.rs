@@ -47,7 +47,7 @@ const REMOTE_LIST_CMD: &str = concat!(
     "  printf '\\n---ADE-STATUS-END---\\n'; ",
     "done; ",
     "echo '---ADE-HOOKS---'; ",
-    "if grep -q ade-status-marker \"$HOME\"/.claude/settings.local.json 2>/dev/null; then echo OK; else echo MISSING; fi"
+    "if grep -q ade-status-marker \"$HOME\"/.claude/settings.json 2>/dev/null; then echo OK; else echo MISSING; fi"
 );
 
 fn shell_safe(s: &str) -> bool {
