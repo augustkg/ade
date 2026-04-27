@@ -1,15 +1,23 @@
 use std::collections::HashMap;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::cwd;
 use crate::hosts::{Config, Host, HostKind};
 use crate::install_hooks;
 use crate::model::{Machine, Row, Tree};
-use crate::refresh::refresh_all;
+use crate::refresh::{refresh_all, RefreshResult};
 use crate::text_field::TextField;
 use crate::tmux::{self, TmuxBackend};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// How often the TUI fires a background refresh while idle. Local backend is
+/// cheap; remote backends are spawned in parallel threads and bounded by the
+/// per-host SSH ConnectTimeout. Tuning point if it ever feels janky.
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum NoticeKind {
     Info,
     Success,
@@ -23,6 +31,7 @@ pub struct Notice {
     pub text: String,
 }
 
+#[allow(dead_code)]
 impl Notice {
     pub fn success(text: impl Into<String>) -> Self {
         Notice {
@@ -296,6 +305,23 @@ pub struct App {
     pub error_message: Option<String>,
     pub expanded_memory: HashMap<String, bool>,
     pub config: Config,
+    /// Per-host hook install state, populated each refresh from the SSH
+    /// query. `Some(true)` = installed, `Some(false)` = missing, `None` =
+    /// unreachable / couldn't determine.
+    pub host_hooks: HashMap<String, Option<bool>>,
+    /// Same idea for the local machine — checked on every refresh by
+    /// reading `~/.claude/settings.local.json`.
+    pub local_hooks_installed: bool,
+    /// Transient banner shown at the top of the Hosts screen (install /
+    /// retry results). Cleared on the next keypress in HostsList.
+    pub hosts_notice: Option<Notice>,
+    /// Background refresh worker, if one is in flight. The TUI never blocks
+    /// on this — `tick()` polls `is_finished()` and applies the result when
+    /// ready. Only one runs at a time; manual `r` cancels by dropping it.
+    pending_refresh: Option<JoinHandle<RefreshResult>>,
+    /// When the most recent refresh (sync or background) was *started*. Used
+    /// by `tick()` to decide when the next background refresh is due.
+    last_refresh_started: Instant,
 }
 
 impl Default for App {
@@ -319,6 +345,11 @@ impl App {
             error_message: parse_warning,
             expanded_memory: HashMap::new(),
             config,
+            host_hooks: HashMap::new(),
+            local_hooks_installed: false,
+            hosts_notice: None,
+            pending_refresh: None,
+            last_refresh_started: Instant::now(),
         };
         app.refresh();
         app
@@ -559,6 +590,10 @@ impl App {
                 };
                 match self.selected_action {
                     SessionAction::Enter => {
+                        // The same-session-no-op case is handled in
+                        // main.rs::attach: it just returns early so ADE quits
+                        // and the user stays in the session they were in,
+                        // which is exactly what they wanted.
                         self.action = AppAction::AttachSession {
                             name: session.raw_name,
                             machine: session.machine,
@@ -902,7 +937,17 @@ impl App {
     // --- Hosts management ---
 
     fn handle_hosts_list_key(&mut self, key: KeyEvent) {
+        // Any keypress inside the Hosts screen dismisses a stale install
+        // notice from a previous action.
+        self.hosts_notice = None;
+
         let n = self.config.hosts.len();
+        let selected_host_name: Option<String> = if let AppState::HostsList { selected } = self.state {
+            self.config.hosts.get(selected).map(|h| h.name.clone())
+        } else {
+            None
+        };
+
         let AppState::HostsList { ref mut selected } = self.state else {
             return;
         };
@@ -943,7 +988,39 @@ impl App {
                     });
                 }
             }
+            KeyCode::Char('i') => {
+                if let Some(name) = selected_host_name {
+                    self.install_remote_hooks(&name);
+                }
+            }
+            KeyCode::Char('L') => {
+                self.install_local_hooks();
+            }
             _ => {}
+        }
+    }
+
+    fn install_remote_hooks(&mut self, host_name: &str) {
+        match install_hooks::install_remote(&self.config, host_name) {
+            Ok(msg) => {
+                self.hosts_notice = Some(Notice::success(msg));
+                self.refresh();
+            }
+            Err(e) => {
+                self.hosts_notice = Some(Notice::error(format!("{}: {}", host_name, e)));
+            }
+        }
+    }
+
+    fn install_local_hooks(&mut self) {
+        match install_hooks::install_local() {
+            Ok(msg) => {
+                self.hosts_notice = Some(Notice::success(msg));
+                self.refresh();
+            }
+            Err(e) => {
+                self.hosts_notice = Some(Notice::error(format!("local: {}", e)));
+            }
         }
     }
 
@@ -963,6 +1040,7 @@ impl App {
             KeyCode::Enter => {
                 if form.is_valid() {
                     let host = form.to_host();
+                    let host_name = host.name.clone();
                     let editing_idx = form.editing_idx;
                     // Save-then-commit: mutate a clone, write to disk first,
                     // and only swap into self.config if both succeed. Keeps
@@ -974,7 +1052,19 @@ impl App {
                     {
                         Ok(()) => {
                             self.config = tentative;
+                            // Auto-install ADE hooks on the new/edited host
+                            // so live status detection just works. Result
+                            // surfaces in the hosts screen banner.
+                            let install_result =
+                                install_hooks::install_remote(&self.config, &host_name);
                             self.refresh();
+                            self.hosts_notice = match install_result {
+                                Ok(msg) => Some(Notice::success(msg)),
+                                Err(e) => Some(Notice::warning(format!(
+                                    "saved {} — hooks not installed: {}. Press i to retry.",
+                                    host_name, e
+                                ))),
+                            };
                             let new_selected = editing_idx
                                 .unwrap_or_else(|| self.config.hosts.len().saturating_sub(1));
                             self.state = AppState::HostsList {

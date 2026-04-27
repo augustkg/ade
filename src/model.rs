@@ -105,6 +105,11 @@ pub struct Tree {
     pub folders: Vec<Folder>,
     pub loose: Vec<usize>,
     pub errors: Vec<(Machine, String)>,
+    /// When ADE is launched from inside tmux, the name of the local session
+    /// the user is currently in. Used by the UI to mark that row with a
+    /// subtle ` · here ` chip so the user can see at a glance which session
+    /// they're already attached to. `None` outside tmux.
+    pub current_session: Option<String>,
 }
 
 impl Tree {
@@ -164,6 +169,7 @@ impl Tree {
             folders,
             loose,
             errors,
+            current_session: None, // populated by App after build
         }
     }
 
