@@ -408,6 +408,11 @@ fn run(terminal: &mut DefaultTerminal) -> Result<Option<AppAction>> {
     let mut app = App::new();
 
     loop {
+        // Apply any finished background refresh and schedule a new one if
+        // due. Non-blocking — the actual SSH/process calls happen on a
+        // worker thread.
+        app.tick();
+
         terminal.draw(|frame| ui::render(frame, &app))?;
 
         if event::poll(Duration::from_millis(100))? {
