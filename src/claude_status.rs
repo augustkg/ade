@@ -8,7 +8,7 @@
 //! ADE reads these files during refresh and joins by tmux `pane_id` so it can
 //! tell whether a Claude pane is currently busy or sitting idle at the prompt.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -78,6 +78,52 @@ pub fn parse_remote_statuses(text: &str) -> HashMap<String, ClaudeState> {
         let body: String = lines.collect::<Vec<_>>().join("\n");
         if let Some(state) = parse_status_body(&body) {
             out.insert(pane_id.trim().to_string(), state);
+        }
+    }
+    out
+}
+
+/// Given the output of `ps -A -o pid,ppid,comm` and a list of pane root pids,
+/// return the subset of those root pids whose process subtree contains any
+/// process named `claude`.
+///
+/// Catches Claude even when it's not the pane's foreground process — e.g. a
+/// shell wrapper is the immediate child and Claude is a grandchild, or the
+/// user has temporarily backgrounded Claude under a build/REPL.
+pub fn find_claude_pane_pids(pane_pids: &[u32], ps_text: &str) -> HashSet<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut comm_by_pid: HashMap<u32, String> = HashMap::new();
+
+    for line in ps_text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(ppid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let comm = parts.next().unwrap_or("");
+        comm_by_pid.insert(pid, comm.to_string());
+        children.entry(ppid).or_default().push(pid);
+    }
+
+    let mut out = HashSet::new();
+    for &root in pane_pids {
+        let mut stack = vec![root];
+        // Per-root visited set guards against pathological `ps_text` (esp.
+        // from a remote we don't fully trust) that could otherwise loop.
+        let mut visited: HashSet<u32> = HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !visited.insert(cur) {
+                continue;
+            }
+            if comm_by_pid.get(&cur).map(|c| c == "claude").unwrap_or(false) {
+                out.insert(root);
+                break;
+            }
+            if let Some(kids) = children.get(&cur) {
+                stack.extend_from_slice(kids);
+            }
         }
     }
     out

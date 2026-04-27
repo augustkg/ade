@@ -80,36 +80,45 @@ pub(crate) fn parse_session_line(line: &str) -> Option<Session> {
     }
 }
 
-/// Parse a single line of `tmux list-panes -a -F '#{session_name}\t#{pane_current_command}\t#{pane_id}'`
-/// into `(session_name, pane_current_command, pane_id)`.
-pub(crate) fn parse_pane_line(line: &str) -> Option<(String, String, String)> {
-    let parts: Vec<&str> = line.splitn(3, '\t').collect();
-    if parts.len() != 3 {
+/// Parse a single line of `tmux list-panes -a -F '#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}'`
+/// into `(session_name, pane_current_command, pane_id, pane_pid)`.
+pub(crate) fn parse_pane_line(line: &str) -> Option<(String, String, String, u32)> {
+    let parts: Vec<&str> = line.splitn(4, '\t').collect();
+    if parts.len() != 4 {
         return None;
     }
     let session = parts[0];
     let cmd = parts[1];
     let pane_id = parts[2];
+    let pane_pid: u32 = parts[3].parse().ok()?;
     if session.is_empty() || pane_id.is_empty() {
         return None;
     }
-    Some((session.to_string(), cmd.to_string(), pane_id.to_string()))
+    Some((
+        session.to_string(),
+        cmd.to_string(),
+        pane_id.to_string(),
+        pane_pid,
+    ))
 }
 
 /// Join `list-panes -a` output with the per-pane status map and return a map
-/// of `session_name → ClaudeState`. A session with at least one Working pane
-/// rolls up to Working; otherwise Idle if any pane runs claude; otherwise
-/// the session is omitted from the output.
+/// of `session_name → ClaudeState`. A pane is considered to be running Claude
+/// if either `pane_current_command` is `claude` OR `pane_pid` is in the
+/// descendant set built from a `ps` walk (catches shell-wrapped or
+/// background-launched Claude processes). Roll-up: Working > Idle.
 pub(crate) fn map_claude_states(
     panes_text: &str,
     statuses: &std::collections::HashMap<String, ClaudeState>,
+    claude_pane_pids: &std::collections::HashSet<u32>,
 ) -> std::collections::HashMap<String, ClaudeState> {
     let mut out: std::collections::HashMap<String, ClaudeState> = std::collections::HashMap::new();
     for line in panes_text.lines() {
-        let Some((session, cmd, pane_id)) = parse_pane_line(line) else {
+        let Some((session, cmd, pane_id, pane_pid)) = parse_pane_line(line) else {
             continue;
         };
-        if cmd != "claude" {
+        let is_claude = cmd == "claude" || claude_pane_pids.contains(&pane_pid);
+        if !is_claude {
             continue;
         }
         // Default to Idle when no status file exists yet (hooks not installed
