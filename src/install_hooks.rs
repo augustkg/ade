@@ -1,6 +1,10 @@
 //! `ade install-hooks` implementation: idempotently merges ADE's
-//! UserPromptSubmit + Stop hook entries into `~/.claude/settings.local.json`,
-//! either locally or on a configured remote host via SSH.
+//! UserPromptSubmit + Stop hook entries into `~/.claude/settings.json`,
+//! either locally or on a configured remote host via SSH. Also cleans up
+//! stale entries from the legacy `~/.claude/settings.local.json` path,
+//! which Claude Code does not actually load (only `~/.claude/settings.json`,
+//! `.claude/settings.json`, and `.claude/settings.local.json` are loaded —
+//! verified against Claude binary 2.1.119 and the official hooks docs).
 
 use std::fs;
 use std::path::PathBuf;
@@ -14,12 +18,12 @@ use crate::hosts::{Config, Host};
 /// already-installed hook and avoid appending duplicates on repeat installs.
 const MARKER: &str = "ade-status-marker";
 
-const WORKING_CMD: &str = r#"true ade-status-marker; [ -z "${TMUX_PANE:-}" ] || (mkdir -p "$HOME/.cache/ade/claude-status" && printf '{"state":"working","at":"%s"}' "$(date -u +%FT%TZ)" > "$HOME/.cache/ade/claude-status/${TMUX_PANE}.json")"#;
+const WORKING_CMD: &str = r#"true ade-status-marker; PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"; [ -z "$PANE" ] || (mkdir -p "$HOME/.cache/ade/claude-status" && printf '{"state":"working","at":"%s"}' "$(date -u +%FT%TZ)" > "$HOME/.cache/ade/claude-status/${PANE}.json")"#;
 
-const IDLE_CMD: &str = r#"true ade-status-marker; [ -z "${TMUX_PANE:-}" ] || (mkdir -p "$HOME/.cache/ade/claude-status" && printf '{"state":"idle","at":"%s"}' "$(date -u +%FT%TZ)" > "$HOME/.cache/ade/claude-status/${TMUX_PANE}.json")"#;
+const IDLE_CMD: &str = r#"true ade-status-marker; PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"; [ -z "$PANE" ] || (mkdir -p "$HOME/.cache/ade/claude-status" && printf '{"state":"idle","at":"%s"}' "$(date -u +%FT%TZ)" > "$HOME/.cache/ade/claude-status/${PANE}.json")"#;
 
 /// Check whether ADE's status hooks are already present in the local
-/// `~/.claude/settings.local.json`. Returns `true` if our marker is found.
+/// `~/.claude/settings.json`. Returns `true` if our marker is found.
 /// Failure to read is treated as "not installed".
 pub fn is_installed_local() -> bool {
     let Some(path) = local_settings_path() else {
@@ -36,18 +40,35 @@ pub fn install_local() -> Result<String, String> {
     let path = local_settings_path().ok_or_else(|| "no $HOME set".to_string())?;
     let existing = read_settings_local(&path)?;
     let (updated, action) = merge_hooks(existing);
-    if action.is_noop() {
-        return Ok(format!(
+    let install_msg = if action.is_noop() {
+        format!(
             "hooks already installed at {} — nothing to do",
             path.display()
-        ));
-    }
-    write_atomic(&path, &updated)?;
-    Ok(format!(
-        "installed ADE hooks at {} ({})",
-        path.display(),
-        action.summary()
-    ))
+        )
+    } else {
+        write_atomic(&path, &updated)?;
+        format!(
+            "installed ADE hooks at {} ({})",
+            path.display(),
+            action.summary()
+        )
+    };
+
+    // Migrate any stragglers from the legacy ~/.claude/settings.local.json
+    // path. Claude Code doesn't actually load that file, so any ADE marker
+    // entries there are dead — remove them so they don't confuse future
+    // diagnostics.
+    let cleanup_msg = match cleanup_old_local_path() {
+        Ok(0) => String::new(),
+        Ok(n) => format!(
+            "; also removed {} stale ADE entr{} from legacy ~/.claude/settings.local.json",
+            n,
+            if n == 1 { "y" } else { "ies" }
+        ),
+        Err(e) => format!("; warning: failed to clean legacy path: {}", e),
+    };
+
+    Ok(format!("{}{}", install_msg, cleanup_msg))
 }
 
 pub fn install_remote(config: &Config, host_name: &str) -> Result<String, String> {
@@ -60,7 +81,7 @@ pub fn install_remote(config: &Config, host_name: &str) -> Result<String, String
         json!({})
     } else {
         serde_json::from_str(&existing_text)
-            .map_err(|e| format!("parse remote settings.local.json: {}", e))?
+            .map_err(|e| format!("parse remote settings.json: {}", e))?
     };
 
     let (updated, action) = merge_hooks(existing);
@@ -82,25 +103,52 @@ pub fn install_remote(config: &Config, host_name: &str) -> Result<String, String
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventChange {
+    Added,
+    Updated,
+    NoOp,
+}
+
 #[derive(Debug, Default)]
 struct InstallAction {
-    user_prompt_submit_added: bool,
-    stop_added: bool,
+    user_prompt_submit: Option<EventChange>,
+    stop: Option<EventChange>,
 }
 
 impl InstallAction {
     fn is_noop(&self) -> bool {
-        !self.user_prompt_submit_added && !self.stop_added
+        let ups_noop = matches!(self.user_prompt_submit, None | Some(EventChange::NoOp));
+        let stop_noop = matches!(self.stop, None | Some(EventChange::NoOp));
+        ups_noop && stop_noop
     }
     fn summary(&self) -> String {
-        let mut parts = Vec::new();
-        if self.user_prompt_submit_added {
-            parts.push("UserPromptSubmit");
+        let mut added: Vec<&str> = Vec::new();
+        let mut updated: Vec<&str> = Vec::new();
+        if matches!(self.user_prompt_submit, Some(EventChange::Added)) {
+            added.push("UserPromptSubmit");
         }
-        if self.stop_added {
-            parts.push("Stop");
+        if matches!(self.stop, Some(EventChange::Added)) {
+            added.push("Stop");
         }
-        format!("added: {}", parts.join(", "))
+        if matches!(self.user_prompt_submit, Some(EventChange::Updated)) {
+            updated.push("UserPromptSubmit");
+        }
+        if matches!(self.stop, Some(EventChange::Updated)) {
+            updated.push("Stop");
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if !added.is_empty() {
+            parts.push(format!("added: {}", added.join(", ")));
+        }
+        if !updated.is_empty() {
+            parts.push(format!("updated: {}", updated.join(", ")));
+        }
+        if parts.is_empty() {
+            "no changes".to_string()
+        } else {
+            parts.join("; ")
+        }
     }
 }
 
@@ -120,22 +168,26 @@ fn merge_hooks(mut settings: Value) -> (Value, InstallAction) {
         *hooks = json!({});
     }
 
-    action.user_prompt_submit_added =
-        ensure_event(hooks.as_object_mut().unwrap(), "UserPromptSubmit", WORKING_CMD);
-    action.stop_added =
-        ensure_event(hooks.as_object_mut().unwrap(), "Stop", IDLE_CMD);
+    action.user_prompt_submit = Some(ensure_event(
+        hooks.as_object_mut().unwrap(),
+        "UserPromptSubmit",
+        WORKING_CMD,
+    ));
+    action.stop = Some(ensure_event(hooks.as_object_mut().unwrap(), "Stop", IDLE_CMD));
 
     (settings, action)
 }
 
-/// Append our hook entry to the given event's array if no existing entry
-/// already carries our marker. Returns `true` if we appended, `false` if
-/// nothing needed to change.
+/// Ensure the given event's array contains the canonical ADE entry with the
+/// expected `command` string. Returns `Added` if no marker entry existed,
+/// `Updated` if a stale ADE entry was replaced (different command), or `NoOp`
+/// if the existing ADE entry already matched. Non-ADE entries are never
+/// touched.
 fn ensure_event(
     hooks_obj: &mut serde_json::Map<String, Value>,
     event: &str,
     command: &str,
-) -> bool {
+) -> EventChange {
     let arr = hooks_obj
         .entry(event.to_string())
         .or_insert_with(|| json!([]));
@@ -144,37 +196,120 @@ fn ensure_event(
     }
     let arr = arr.as_array_mut().unwrap();
 
-    if event_already_has_marker(arr) {
-        return false;
-    }
-
-    arr.push(json!({
+    let canonical = json!({
         "hooks": [
             { "type": "command", "command": command }
         ]
-    }));
-    true
+    });
+
+    match find_marker_entry(arr) {
+        Some(idx) => {
+            if arr[idx] == canonical {
+                EventChange::NoOp
+            } else {
+                arr[idx] = canonical;
+                EventChange::Updated
+            }
+        }
+        None => {
+            arr.push(canonical);
+            EventChange::Added
+        }
+    }
 }
 
-fn event_already_has_marker(arr: &[Value]) -> bool {
-    for entry in arr {
+/// Find the index of the first entry whose nested `hooks[].command` contains
+/// our marker — i.e., the ADE-owned entry that we may need to update.
+fn find_marker_entry(arr: &[Value]) -> Option<usize> {
+    for (i, entry) in arr.iter().enumerate() {
         let Some(inner) = entry.get("hooks").and_then(|h| h.as_array()) else {
             continue;
         };
         for h in inner {
             if let Some(cmd) = h.get("command").and_then(|c| c.as_str()) {
                 if cmd.contains(MARKER) {
-                    return true;
+                    return Some(i);
                 }
             }
         }
     }
-    false
+    None
 }
 
 fn local_settings_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(home.join(".claude").join("settings.json"))
+}
+
+/// Legacy path ADE used to write to before we discovered Claude Code does
+/// not load `~/.claude/settings.local.json`. Used only for cleanup —
+/// `cleanup_old_local_path` removes our marker entries from this file so
+/// users don't accumulate dead hook config in two places.
+fn legacy_local_settings_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
     Some(home.join(".claude").join("settings.local.json"))
+}
+
+/// Remove any ADE-marker-bearing entries from the legacy
+/// `~/.claude/settings.local.json` file. Preserves all non-ADE entries
+/// (other tools may have hooks there). Returns the number of entries
+/// removed (0 if the file doesn't exist, has no ADE entries, or HOME isn't
+/// set). Failure to write is surfaced as Err — callers may choose to log
+/// rather than fail the whole install.
+fn cleanup_old_local_path() -> Result<usize, String> {
+    let Some(path) = legacy_local_settings_path() else {
+        return Ok(0);
+    };
+    if !path.exists() {
+        return Ok(0);
+    }
+    let body = fs::read_to_string(&path)
+        .map_err(|e| format!("read legacy settings: {}", e))?;
+    if body.trim().is_empty() {
+        return Ok(0);
+    }
+    let mut value: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("parse legacy settings: {}", e))?;
+
+    let removed = strip_ade_entries(&mut value);
+    if removed == 0 {
+        return Ok(0);
+    }
+    write_atomic(&path, &value)?;
+    Ok(removed)
+}
+
+/// Remove every nested entry whose `command` contains MARKER from any of
+/// the configured event arrays. Returns the count of removed entries.
+fn strip_ade_entries(value: &mut Value) -> usize {
+    let Some(hooks) = value.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for event_name in ["UserPromptSubmit", "Stop"].iter() {
+        let Some(arr_val) = hooks.get_mut(*event_name) else {
+            continue;
+        };
+        let Some(arr) = arr_val.as_array_mut() else {
+            continue;
+        };
+        let before = arr.len();
+        arr.retain(|entry| {
+            let Some(inner) = entry.get("hooks").and_then(|h| h.as_array()) else {
+                return true;
+            };
+            for h in inner {
+                if let Some(cmd) = h.get("command").and_then(|c| c.as_str()) {
+                    if cmd.contains(MARKER) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+        removed += before - arr.len();
+    }
+    removed
 }
 
 fn read_settings_local(path: &PathBuf) -> Result<Value, String> {
@@ -221,7 +356,7 @@ fn ssh_read_settings(host: &Host) -> Result<String, String> {
         cmd.arg(a);
     }
     cmd.arg(&host.target);
-    cmd.arg("cat ~/.claude/settings.local.json 2>/dev/null || true");
+    cmd.arg("cat ~/.claude/settings.json 2>/dev/null || true");
     let out = cmd.output().map_err(|e| format!("ssh failed: {}", e))?;
     if !out.status.success() && out.status.code() != Some(0) {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -234,7 +369,7 @@ fn ssh_write_settings(host: &Host, body: &str) -> Result<(), String> {
     // Stream the new content over stdin to a remote shell that writes it via
     // a temp file and then atomically renames into place. No need for `jq`
     // or any remote tooling beyond a POSIX shell.
-    let remote_cmd = "mkdir -p ~/.claude && cat > ~/.claude/settings.local.json.tmp && mv ~/.claude/settings.local.json.tmp ~/.claude/settings.local.json";
+    let remote_cmd = "mkdir -p ~/.claude && cat > ~/.claude/settings.json.tmp && mv ~/.claude/settings.json.tmp ~/.claude/settings.json";
 
     let mut cmd = Command::new("ssh");
     cmd.args(SSH_OPTS);
