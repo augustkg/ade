@@ -1,11 +1,12 @@
-use super::{map_claude_states, parse_session_line, Session, TmuxBackend};
+use super::{map_claude_states, parse_pane_line, parse_session_line, Session, TmuxBackend};
 use crate::claude_status;
 use std::process::Command;
 
 pub struct LocalTmux;
 
 const LIST_FORMAT: &str = "#{session_name}\t#{session_windows}\t#{session_attached}";
-const PANE_FORMAT: &str = "#{session_name}\t#{pane_current_command}\t#{pane_id}";
+const PANE_FORMAT: &str =
+    "#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}";
 
 impl TmuxBackend for LocalTmux {
     fn list_sessions(&self) -> Result<Vec<Session>, String> {
@@ -24,7 +25,7 @@ impl TmuxBackend for LocalTmux {
         };
 
         // Best-effort claude detection: failure is silent so the session
-        // list still renders even if `list-panes` misbehaves.
+        // list still renders even if `list-panes` or `ps` misbehaves.
         let panes_text = Command::new("tmux")
             .args(["list-panes", "-a", "-F", PANE_FORMAT])
             .output()
@@ -33,8 +34,23 @@ impl TmuxBackend for LocalTmux {
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default();
 
+        let ps_text = Command::new("ps")
+            .args(["-A", "-o", "pid,ppid,comm"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+
+        let pane_pids: Vec<u32> = panes_text
+            .lines()
+            .filter_map(parse_pane_line)
+            .map(|(_, _, _, pid)| pid)
+            .collect();
+        let claude_pane_pids = claude_status::find_claude_pane_pids(&pane_pids, &ps_text);
+
         let statuses = claude_status::read_local_statuses();
-        let claude_by_session = map_claude_states(&panes_text, &statuses);
+        let claude_by_session = map_claude_states(&panes_text, &statuses, &claude_pane_pids);
 
         for s in &mut sessions {
             if let Some(state) = claude_by_session.get(&s.name) {

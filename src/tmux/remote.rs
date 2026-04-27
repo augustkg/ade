@@ -1,4 +1,4 @@
-use super::{map_claude_states, parse_session_line, Session, TmuxBackend};
+use super::{map_claude_states, parse_pane_line, parse_session_line, Session, TmuxBackend};
 use crate::claude_status;
 use crate::hosts::Host;
 use std::process::Command;
@@ -24,17 +24,21 @@ const SSH_OPTS: &[&str] = &[
     "StrictHostKeyChecking=accept-new",
 ];
 
-/// Combined query: sessions, then panes (with pane_id), then per-pane status
-/// files (one per claude pane), then the hooks-installed marker check —
-/// each section separated by a sentinel. One SSH round-trip total.
+/// Combined query: sessions, then panes (with pane_id + pane_pid), then a
+/// `ps` snapshot for descendant-walk Claude detection, then per-pane status
+/// files, then the hooks-installed marker check — each section separated by
+/// a sentinel. One SSH round-trip total.
 const PANE_SENTINEL: &str = "---ADE-PANES---";
+const PS_SENTINEL: &str = "---ADE-PS---";
 const STATUS_SENTINEL: &str = "---ADE-STATUS---";
 const HOOKS_SENTINEL: &str = "---ADE-HOOKS---";
 
 const REMOTE_LIST_CMD: &str = concat!(
     "tmux list-sessions -F '#{session_name}\t#{session_windows}\t#{session_attached}' 2>/dev/null; ",
     "echo '---ADE-PANES---'; ",
-    "tmux list-panes -a -F '#{session_name}\t#{pane_current_command}\t#{pane_id}' 2>/dev/null; ",
+    "tmux list-panes -a -F '#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}' 2>/dev/null; ",
+    "echo '---ADE-PS---'; ",
+    "ps -A -o pid,ppid,comm 2>/dev/null; ",
     "echo '---ADE-STATUS---'; ",
     "for f in \"$HOME\"/.cache/ade/claude-status/*.json; do ",
     "  [ -f \"$f\" ] || continue; ",
@@ -89,6 +93,9 @@ impl RemoteTmux {
                     .split_once(PANE_SENTINEL)
                     .unwrap_or((stdout.as_ref(), ""));
                 let (panes_part, rest) = rest
+                    .split_once(PS_SENTINEL)
+                    .unwrap_or((rest, ""));
+                let (ps_part, rest) = rest
                     .split_once(STATUS_SENTINEL)
                     .unwrap_or((rest, ""));
                 let (status_part, hooks_part) = rest
@@ -100,7 +107,15 @@ impl RemoteTmux {
                     .filter_map(parse_session_line)
                     .collect();
                 let statuses = claude_status::parse_remote_statuses(status_part);
-                let claude_by_session = map_claude_states(panes_part, &statuses);
+                let pane_pids: Vec<u32> = panes_part
+                    .lines()
+                    .filter_map(parse_pane_line)
+                    .map(|(_, _, _, pid)| pid)
+                    .collect();
+                let claude_pane_pids =
+                    claude_status::find_claude_pane_pids(&pane_pids, ps_part);
+                let claude_by_session =
+                    map_claude_states(panes_part, &statuses, &claude_pane_pids);
                 for s in &mut sessions {
                     if let Some(state) = claude_by_session.get(&s.name) {
                         s.claude = Some(*state);
