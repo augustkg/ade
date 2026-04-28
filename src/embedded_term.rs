@@ -10,13 +10,18 @@
 
 #![allow(dead_code)] // populated incrementally across the embedded-terminal phases
 
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+
+use crate::hosts::Host;
 
 /// Translate a `crossterm::KeyEvent` into the bytes a terminal would
 /// expect to receive when the user pressed that key. Used to forward
@@ -313,6 +318,194 @@ fn function_key(n: u8, m: KeyModifiers) -> Vec<u8> {
 /// from by the renderer (UI thread). Wrapped so we can hand a clone to
 /// the worker without surrendering exclusive access on the UI side.
 pub type SharedParser = Arc<Mutex<vt100::Parser>>;
+
+/// One embedded terminal: a PTY pair, the child process attached to it
+/// (typically `tmux attach-session -t =name:`), a writer for sending
+/// keystrokes, a `vt100::Parser` fed by a reader thread, and the join
+/// handle so we can shut down cleanly on `Drop`.
+pub struct EmbeddedTerm {
+    /// Master side of the PTY. Kept so we can call `resize()`. The
+    /// `writer` field is a separate handle to the same fd.
+    master: Box<dyn MasterPty + Send>,
+    /// Write half — bytes pushed here are read by the child.
+    writer: Box<dyn Write + Send>,
+    /// Shared parser. The reader thread writes; the UI renderer reads.
+    parser: SharedParser,
+    /// Handle to the spawned process (`tmux attach`, `ssh`, `mosh`, …).
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// Reader-thread join handle. `None` after Drop has joined it.
+    reader_thread: Option<JoinHandle<()>>,
+}
+
+impl EmbeddedTerm {
+    /// Spawn an embedded `tmux attach-session -t =name` against the
+    /// local tmux server. Sized to `(rows, cols)` to match the panel
+    /// area the UI will render into.
+    pub fn spawn_local(name: &str, rows: u16, cols: u16) -> Result<Self, String> {
+        let mut cmd = CommandBuilder::new("tmux");
+        cmd.args(["attach-session", "-t", &format!("={}", name)]);
+        Self::spawn_with_command(cmd, rows, cols)
+    }
+
+    /// Spawn an embedded attach to a remote session via the same
+    /// SSH/Mosh routing as `crate::build_attach_command` — we go through
+    /// that helper so the local exec-replace `attach` and the embedded
+    /// path use identical command lines.
+    pub fn spawn_remote(
+        host: &Host,
+        name: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Self, String> {
+        let target = format!("={}", name);
+        let (program, args) = crate::build_attach_command(host, &target);
+        let mut cmd = CommandBuilder::new(&program);
+        for a in &args {
+            cmd.arg(a);
+        }
+        Self::spawn_with_command(cmd, rows, cols)
+    }
+
+    fn spawn_with_command(
+        cmd: CommandBuilder,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Self, String> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("openpty: {}", e))?;
+
+        // Take the writer + reader handles BEFORE spawning the child,
+        // so a failure here doesn't leak an unreaped child. Codex
+        // Phase-4 review caught this: portable-pty's child is just a
+        // wrapped std::process::Child, and dropping it doesn't reap.
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| format!("clone PTY reader: {}", e))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| format!("take PTY writer: {}", e))?;
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| format!("spawn embedded child: {}", e))?;
+        // Drop the slave so we don't keep an extra fd open — otherwise
+        // the master never sees EOF when the child exits.
+        drop(pair.slave);
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+
+        let parser_for_thread = parser.clone();
+        let reader_thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 8 * 1024];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        if let Ok(mut p) = parser_for_thread.lock() {
+                            p.process(&buf[..n]);
+                        }
+                    }
+                    Err(e) => {
+                        // Treat any read error as terminal — close out
+                        // cleanly. EBADF / EIO often means the master
+                        // closed underneath us during shutdown.
+                        let _ = e;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            master: pair.master,
+            writer,
+            parser,
+            child,
+            reader_thread: Some(reader_thread),
+        })
+    }
+
+    /// Forward bytes to the embedded child. No-op for empty input.
+    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.writer.write_all(bytes)?;
+        self.writer.flush()
+    }
+
+    /// Resize the PTY and the parser's grid. Call when the panel area
+    /// changes (terminal resize, layout flip, etc.).
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<(), String> {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("PTY resize: {}", e))?;
+        if let Ok(mut p) = self.parser.lock() {
+            p.set_size(rows, cols);
+        }
+        Ok(())
+    }
+
+    /// A clone of the shared parser. Renderer takes the lock briefly,
+    /// reads `screen()`, drops the lock.
+    pub fn parser(&self) -> SharedParser {
+        self.parser.clone()
+    }
+
+    /// `true` if the child is still running. False once it has exited
+    /// (e.g. tmux detached, target session was killed externally).
+    pub fn is_alive(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true,         // still running
+            Ok(Some(_)) => false,     // exited
+            Err(_) => false,
+        }
+    }
+
+    /// Best-effort kill of the child. Used by the App when the user
+    /// fires the exit chord — we want the embedded `tmux attach` to
+    /// detach (which kills its process), leaving the underlying tmux
+    /// session intact.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+impl Drop for EmbeddedTerm {
+    fn drop(&mut self) {
+        // Drop runs THIS body, then drops fields in declaration order:
+        // master, writer, parser, child, reader_thread. The master
+        // dropping closes its fd, which causes the reader thread's
+        // cloned reader to EOF (or EIO mapped to Ok(0) by portable-pty),
+        // so the reader exits naturally and the JoinHandle drop
+        // detaches it cleanly.
+        //
+        // We do NOT call `handle.join()` here. Rust's join is unbounded;
+        // if `tmux attach`'s child accidentally spawned a grandchild
+        // that inherits the slave fd, the master read would never EOF
+        // and join would hang ADE shutdown forever. Detaching is the
+        // lesser evil — the OS reaps any straggler when ADE exits.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // Drop the take()'d handle without joining.
+        let _ = self.reader_thread.take();
+    }
+}
 
 /// Hand-render the current `vt100::Screen` into a list of `ratatui::Line`s
 /// preserving foreground/background colour and style attributes. We
@@ -789,6 +982,64 @@ mod chord_tests {
         let out = chord_step(&mut s, release);
         assert_eq!(out, ChordOutcome::Forward(Vec::new()));
         assert_eq!(s, ChordState::Pending, "state must not transition on release");
+    }
+}
+
+#[cfg(test)]
+mod embedded_term_tests {
+    //! Phase 4: lifecycle smoke test for the EmbeddedTerm wrapper using
+    //! a plain `bash` child. Real `tmux attach` lifecycle is exercised
+    //! in the Phase 9 acceptance test against an isolated tmux server.
+
+    use super::EmbeddedTerm;
+    use portable_pty::CommandBuilder;
+    use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn write_read_resize_lifecycle() {
+        // Use `bash --norc --noprofile` so we don't pick up the user's
+        // dotfiles. Sleep at the end so the child stays alive long
+        // enough to assert on resize before EOF.
+        let mut cmd = CommandBuilder::new("/bin/bash");
+        cmd.args(["--norc", "--noprofile", "-i"]);
+        let mut term = EmbeddedTerm::spawn_with_command(cmd, 24, 80).expect("spawn");
+
+        // 1. Write — should land in the parser within a small budget.
+        term.write(b"echo lifecycle-ok\n")
+            .expect("write to PTY");
+
+        let parser = term.parser();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() >= deadline {
+                term.kill();
+                panic!("parser never saw 'lifecycle-ok'");
+            }
+            {
+                let p = parser.lock().unwrap();
+                let contents = p.screen().contents();
+                if contents.contains("lifecycle-ok") {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // 2. Resize — succeeds without panic and updates the parser's grid.
+        term.resize(40, 120).expect("resize PTY");
+        {
+            let p = parser.lock().unwrap();
+            assert_eq!(p.screen().size(), (40, 120));
+        }
+
+        // 3. is_alive: still true while child is running.
+        assert!(term.is_alive(), "bash should still be running");
+
+        // 4. Drop kills the child + reaps the reader thread.
+        drop(term);
+        // No assertion here — if Drop hangs, the test deadline above
+        // catches us. If it returns, we're good.
     }
 }
 

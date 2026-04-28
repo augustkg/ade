@@ -330,7 +330,7 @@ fn chrono_now() -> String {
 
 /// The remote command to run on the destination host. Always pre-quoted for
 /// the *remote* shell so any special chars in `target` are literal.
-fn remote_attach_cmd(target: &str) -> String {
+pub(crate) fn remote_attach_cmd(target: &str) -> String {
     format!("tmux attach -t {}", hosts::shell_quote(target))
 }
 
@@ -344,7 +344,10 @@ fn remote_attach_cmd(target: &str) -> String {
 /// Mosh by contrast forwards the remote argv directly via execvp on the remote
 /// host (no remote shell), so each arg goes through byte-for-byte: we pass them
 /// separately and never quote.
-fn build_attach_command(host: &Host, target: &str) -> (String, Vec<String>) {
+///
+/// Reused by `embedded_term::EmbeddedTerm::spawn_remote` so the embedded
+/// PTY follows the same SSH/Mosh routing as the regular full-attach path.
+pub(crate) fn build_attach_command(host: &Host, target: &str) -> (String, Vec<String>) {
     match host.kind {
         HostKind::Ssh => {
             let mut args: Vec<String> = host.ssh_args.clone();
