@@ -11,12 +11,23 @@ use serde::{Deserialize, Serialize};
 pub struct State {
     #[serde(default)]
     pub tmux_install_nudge: NudgeState,
+    #[serde(default)]
+    pub folders: FoldersState,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NudgeState {
     #[serde(default)]
     pub dismissed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FoldersState {
+    /// Folder prefixes the user has explicitly collapsed. Folders not
+    /// listed here default to expanded — matching the in-tree default at
+    /// `src/model.rs::Tree::group`.
+    #[serde(default)]
+    pub closed: Vec<String>,
 }
 
 impl State {
@@ -53,5 +64,41 @@ impl State {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".config"));
         Some(xdg.join("ade").join("state.toml"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_folders_section_defaults_to_empty() {
+        // Existing state.toml files (written before the folders feature
+        // landed) only have [tmux_install_nudge]. Loading must succeed and
+        // produce an empty FoldersState.
+        let body = "[tmux_install_nudge]\ndismissed = true\n";
+        let state: State = toml::from_str(body).unwrap();
+        assert!(state.tmux_install_nudge.dismissed);
+        assert!(state.folders.closed.is_empty());
+    }
+
+    #[test]
+    fn round_trip_preserves_closed_folders() {
+        let mut original = State::default();
+        original.tmux_install_nudge.dismissed = true;
+        original.folders.closed = vec!["infra".to_string(), "work".to_string()];
+
+        let serialized = toml::to_string_pretty(&original).unwrap();
+        let restored: State = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(restored.tmux_install_nudge.dismissed, true);
+        assert_eq!(restored.folders.closed, vec!["infra".to_string(), "work".to_string()]);
+    }
+
+    #[test]
+    fn empty_input_yields_default() {
+        let state: State = toml::from_str("").unwrap();
+        assert!(!state.tmux_install_nudge.dismissed);
+        assert!(state.folders.closed.is_empty());
     }
 }

@@ -343,6 +343,10 @@ impl App {
     pub fn new() -> Self {
         let (config, parse_warning) = Config::load();
         let persisted = State::load();
+        let mut expanded_memory: HashMap<String, bool> = HashMap::new();
+        for prefix in &persisted.folders.closed {
+            expanded_memory.insert(prefix.clone(), false);
+        }
         let mut app = Self {
             state: AppState::Tree,
             focus_area: FocusArea::SessionList,
@@ -353,7 +357,7 @@ impl App {
             should_quit: false,
             action: AppAction::None,
             error_message: parse_warning,
-            expanded_memory: HashMap::new(),
+            expanded_memory,
             config,
             host_hooks: HashMap::new(),
             local_hooks_installed: false,
@@ -365,6 +369,32 @@ impl App {
         };
         app.refresh();
         app
+    }
+
+    /// Save the set of collapsed folder prefixes to
+    /// `~/.config/ade/state.toml`. Best-effort — a transient I/O error must
+    /// not block the UI.
+    ///
+    /// Uses **merge** semantics rather than overwrite-from-snapshot: start
+    /// from the on-disk `closed` set, then apply only what we can directly
+    /// observe in the current tree. Folders we can't see (e.g. a remote
+    /// host is unreachable, so `refresh::refresh_all` omitted its sessions
+    /// from `per_machine` — see `src/refresh.rs:50-66`) keep their
+    /// previously-recorded preference. Dead keys accumulate slowly on
+    /// permanent dissolve, but that's a few bytes and self-corrects the
+    /// next time the prefix is used.
+    ///
+    /// Cross-process limitation: two concurrent ADE instances can race on
+    /// the read-modify-write here (and on the fixed `state.toml.tmp`
+    /// path). For small UI preferences with single-instance-typical usage,
+    /// this is acceptable; not worth the complexity of file locking.
+    fn persist_folder_expansion(&self) {
+        let mut state = State::load();
+        state.folders.closed = compute_closed_list(
+            &state.folders.closed,
+            self.tree.expanded_snapshot(),
+        );
+        let _ = state.save();
     }
 
     fn backend(&self, m: &Machine) -> Option<Box<dyn TmuxBackend>> {
@@ -528,6 +558,7 @@ impl App {
             KeyCode::Char('o') | KeyCode::Char(' ') => {
                 if let Some(Row::Folder(idx)) = self.current_row() {
                     self.tree.toggle_folder(idx);
+                    self.persist_folder_expansion();
                 }
             }
             KeyCode::Enter => {
@@ -659,7 +690,10 @@ impl App {
     fn activate_current(&mut self) {
         match self.current_row() {
             Some(Row::Folder(idx)) => match self.selected_action {
-                SessionAction::Enter => self.tree.toggle_folder(idx),
+                SessionAction::Enter => {
+                    self.tree.toggle_folder(idx);
+                    self.persist_folder_expansion();
+                }
                 SessionAction::Rename => self.start_rename_selected(),
                 SessionAction::Delete => self.start_delete_selected(),
             },
@@ -1259,4 +1293,75 @@ fn cycle_machine(current: &mut Machine, machines: &[Machine], forward: bool) {
         (idx + machines.len() - 1) % machines.len()
     };
     *current = machines[new_idx].clone();
+}
+
+/// Merge an on-disk `closed` list with a freshly-observed expansion
+/// snapshot to produce the next persisted closed list. Pure function so
+/// it's covered by unit tests without needing an `App`.
+///
+/// Semantic: prefixes the snapshot doesn't mention are *preserved* from
+/// the previous list. For prefixes the snapshot does mention, the
+/// snapshot is authoritative — collapsed → present, expanded → absent.
+/// Result is sorted for stable diffs.
+fn compute_closed_list(prev_closed: &[String], snapshot: HashMap<String, bool>) -> Vec<String> {
+    let mut closed: std::collections::HashSet<String> = prev_closed.iter().cloned().collect();
+    for (prefix, expanded) in snapshot {
+        if expanded {
+            closed.remove(&prefix);
+        } else {
+            closed.insert(prefix);
+        }
+    }
+    let mut out: Vec<String> = closed.into_iter().collect();
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(pairs: &[(&str, bool)]) -> HashMap<String, bool> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect()
+    }
+
+    #[test]
+    fn compute_closed_list_inserts_collapsed_visible_folders() {
+        let out = compute_closed_list(&[], snap(&[("work", false), ("infra", true)]));
+        assert_eq!(out, vec!["work".to_string()]);
+    }
+
+    #[test]
+    fn compute_closed_list_removes_expanded_visible_folders() {
+        let prev = vec!["work".to_string(), "infra".to_string()];
+        let out = compute_closed_list(&prev, snap(&[("work", true)]));
+        // `infra` not in snapshot → preserved. `work` expanded → removed.
+        assert_eq!(out, vec!["infra".to_string()]);
+    }
+
+    #[test]
+    fn compute_closed_list_preserves_unobserved_prefixes() {
+        // The bug Codex flagged: a remote host is unreachable, its folder
+        // is collapsed in the user's preference, snapshot doesn't include
+        // it. We must NOT drop it just because the user toggled some
+        // other folder.
+        let prev = vec!["infra".to_string()];
+        let out = compute_closed_list(&prev, snap(&[("work", false)]));
+        let mut expected = vec!["infra".to_string(), "work".to_string()];
+        expected.sort();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn compute_closed_list_output_is_sorted() {
+        let prev = vec!["zeta".to_string(), "alpha".to_string()];
+        let out = compute_closed_list(&prev, snap(&[("mu", false)]));
+        assert_eq!(
+            out,
+            vec!["alpha".to_string(), "mu".to_string(), "zeta".to_string()]
+        );
+    }
 }
