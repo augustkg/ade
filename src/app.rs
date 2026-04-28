@@ -1,9 +1,10 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::cwd;
-use crate::embedded_term::{chord_step, ChordOutcome, ChordState, EmbeddedTerm};
+use crate::embedded_term::{chord_step, translate_mouse, ChordOutcome, ChordState, EmbeddedTerm};
 use crate::hosts::{Config, Host, HostKind};
 use crate::install_hooks;
 use crate::install_tmux::InstallStatus;
@@ -337,6 +338,13 @@ pub struct App {
     /// Exit-chord state machine. Lives on App so it persists across
     /// keystrokes inside one embedded session and resets on exit.
     pub embedded_chord: ChordState,
+    /// The right-pane rect (x, y, w, h) the renderer drew the embedded
+    /// terminal into on the most recent frame. `Cell` interior
+    /// mutability is used because `render` takes `&App`. Mouse events
+    /// hit the App with frame-local coords; we use this rect to decide
+    /// whether a mouse event lands inside the embedded pane and to
+    /// translate frame coords to pane-local coords before forwarding.
+    pub embedded_panel_rect: Cell<Option<(u16, u16, u16, u16)>>,
     /// Transient banner shown at the top of the Hosts screen (install /
     /// retry results). Cleared on the next keypress in HostsList.
     pub hosts_notice: Option<Notice>,
@@ -383,6 +391,7 @@ impl App {
             preview_pane: PreviewPane::new(),
             embedded_term: None,
             embedded_chord: ChordState::Idle,
+            embedded_panel_rect: Cell::new(None),
             hosts_notice: None,
             pending_refresh: None,
             last_refresh_started: Instant::now(),
@@ -573,6 +582,28 @@ impl App {
             AppState::Confirming(_) => self.handle_confirming_key(key),
             AppState::HostsList { .. } => self.handle_hosts_list_key(key),
             AppState::HostForm(_) => self.handle_host_form_key(key),
+        }
+    }
+
+    /// Forward a mouse event to the embedded PTY *only* when the click
+    /// landed inside the embedded panel rect that the renderer last
+    /// drew. Outside the panel (i.e. on the tree side) the event is
+    /// dropped — we don't currently handle mouse on the tree, and we
+    /// definitely don't want stray clicks to reach the embedded
+    /// session.
+    pub fn handle_mouse(&mut self, event: crossterm::event::MouseEvent) {
+        let Some(rect) = self.embedded_panel_rect.get() else {
+            return;
+        };
+        let bytes = translate_mouse(event, rect);
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(et) = self.embedded_term.as_mut() {
+            if let Err(e) = et.write(&bytes) {
+                self.error_message = Some(format!("embedded mouse write: {}", e));
+                self.exit_embedded();
+            }
         }
     }
 

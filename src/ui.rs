@@ -412,6 +412,12 @@ fn indent_for(in_folder: bool) -> &'static str {
 fn render_preview_pane(frame: &mut Frame, area: Rect, app: &App) {
     let embedded = app.embedded_active();
     let chord_pending = app.embedded_chord_pending();
+    // Reset every frame; render_embedded_grid sets it back when
+    // embedded is active. Keeps the panel-rect tracker accurate per
+    // frame without a separate clear-on-exit hook.
+    if !embedded {
+        app.embedded_panel_rect.set(None);
+    }
     let title = match app.preview_target() {
         Some(ref key) if embedded => format!(" embedded · {} ", key.name),
         Some(ref key) => format!(" preview · {} ", key.name),
@@ -476,15 +482,23 @@ fn render_preview_pane(frame: &mut Frame, area: Rect, app: &App) {
 /// Render the live vt100 grid of the embedded PTY into `area`. Also
 /// resizes the embedded term to match the visible area on the way out
 /// — the placeholder dimensions we used at spawn time get refined to
-/// the actual rect the layout produced.
+/// the actual rect the layout produced — and records the rect on the
+/// App so mouse events can be filtered to "inside the embedded pane
+/// only" (Phase 7).
 fn render_embedded_grid(frame: &mut Frame, area: Rect, app: &App) {
+    // Record the rect for the mouse handler regardless of whether the
+    // PTY is alive — if it ever races to None mid-frame, the mouse
+    // path uses .embedded_term.is_some() before forwarding anyway.
+    app.embedded_panel_rect
+        .set(Some((area.x, area.y, area.width, area.height)));
+
     let Some(et) = app.embedded_term.as_ref() else {
         return;
     };
     let parser = et.parser();
     // Ensure the PTY's reported size matches the rendered area. resize()
-    // is cheap (an ioctl + parser size update) and idempotent — calling
-    // every frame is fine.
+    // is gated internally on size-change so the per-frame call here is
+    // cheap when nothing changed.
     let (rows, cols) = (area.height, area.width);
     if rows > 0 && cols > 0 {
         let _ = et.resize(rows, cols);

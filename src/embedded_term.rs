@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -162,6 +162,68 @@ fn csi_tilde_or_modified(m: KeyModifiers, n: u8) -> Vec<u8> {
         format!("\x1b[{}~", n).into_bytes()
     } else {
         format!("\x1b[{};{}~", n, mod_code).into_bytes()
+    }
+}
+
+/// Translate a `crossterm::MouseEvent` whose coords are in *frame*-local
+/// space (where (0,0) is the top-left of the entire ADE TUI) into the
+/// SGR-1006 mouse escape sequence the embedded terminal expects, with
+/// coords adjusted into *pane*-local space (1-based).
+///
+/// Format: `ESC [ < <code> ; <col> ; <row> M|m`
+///   - `M` for press / drag / motion
+///   - `m` for release
+///   - Button codes:
+///       0 left, 1 middle, 2 right
+///       +4 shift, +8 alt, +16 ctrl
+///       +32 motion (drag with button, or no-button move)
+///       64/65/66/67 wheel up/down/left/right
+///
+/// Returns an empty Vec if the event is outside `pane_rect` (so the
+/// caller can ignore mouse traffic that wandered onto the tree side).
+pub fn translate_mouse(
+    event: MouseEvent,
+    pane_rect: (u16, u16, u16, u16),
+) -> Vec<u8> {
+    let (px, py, pw, ph) = pane_rect;
+    if event.column < px
+        || event.row < py
+        || event.column >= px.saturating_add(pw)
+        || event.row >= py.saturating_add(ph)
+    {
+        return Vec::new();
+    }
+    // Pane-local, 1-based.
+    let col = event.column - px + 1;
+    let row = event.row - py + 1;
+
+    let (mut code, action) = match event.kind {
+        MouseEventKind::Down(b) => (mouse_button_code(b), 'M'),
+        MouseEventKind::Up(b) => (mouse_button_code(b), 'm'),
+        MouseEventKind::Drag(b) => (mouse_button_code(b) + 32, 'M'),
+        MouseEventKind::Moved => (35, 'M'), // 32 + 3 (no-button motion)
+        MouseEventKind::ScrollUp => (64, 'M'),
+        MouseEventKind::ScrollDown => (65, 'M'),
+        MouseEventKind::ScrollLeft => (66, 'M'),
+        MouseEventKind::ScrollRight => (67, 'M'),
+    };
+    if event.modifiers.contains(KeyModifiers::SHIFT) {
+        code |= 4;
+    }
+    if event.modifiers.contains(KeyModifiers::ALT) {
+        code |= 8;
+    }
+    if event.modifiers.contains(KeyModifiers::CONTROL) {
+        code |= 16;
+    }
+    format!("\x1b[<{};{};{}{}", code, col, row, action).into_bytes()
+}
+
+fn mouse_button_code(b: MouseButton) -> u32 {
+    match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
     }
 }
 
@@ -319,6 +381,36 @@ fn function_key(n: u8, m: KeyModifiers) -> Vec<u8> {
 /// the worker without surrendering exclusive access on the UI side.
 pub type SharedParser = Arc<Mutex<vt100::Parser>>;
 
+/// RAII guard for terminal mouse capture. Constructed when entering
+/// embedded mode; on Drop it disables mouse capture so the user gets
+/// their normal terminal scroll/selection back.
+///
+/// Tied to `EmbeddedTerm`'s lifetime — enabling capture only while
+/// embedded fixes two issues Codex flagged in Phase 7 review:
+///  - global capture made tree/preview-mode scroll feel broken
+///  - panicking while embedded would have left the terminal in
+///    capture mode (Drop runs during unwind)
+struct MouseCaptureGuard;
+
+impl MouseCaptureGuard {
+    fn enable() -> Self {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::EnableMouseCapture
+        );
+        Self
+    }
+}
+
+impl Drop for MouseCaptureGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture
+        );
+    }
+}
+
 /// One embedded terminal: a PTY pair, the child process attached to it
 /// (typically `tmux attach-session -t =name:`), a writer for sending
 /// keystrokes, a `vt100::Parser` fed by a reader thread, and the join
@@ -340,6 +432,12 @@ pub struct EmbeddedTerm {
     /// changed (otherwise vt100::Parser::set_size walks all rows on
     /// every same-size call). Wrapped so resize() can stay `&self`.
     last_size: Mutex<(u16, u16)>,
+    /// Mouse-capture is enabled for the duration of an embedded
+    /// session and disabled (via Drop) when the session ends —
+    /// including on panic. Field declared *before* `reader_thread`
+    /// in declaration order is unimportant; what matters is that
+    /// it drops with the rest of the struct.
+    _mouse_capture: MouseCaptureGuard,
 }
 
 impl EmbeddedTerm {
@@ -438,6 +536,7 @@ impl EmbeddedTerm {
             child,
             reader_thread: Some(reader_thread),
             last_size: Mutex::new((rows, cols)),
+            _mouse_capture: MouseCaptureGuard::enable(),
         })
     }
 
@@ -849,6 +948,99 @@ mod key_translate_tests {
             translate_key(ev(KeyCode::Char('é'), KeyModifiers::NONE)),
             "é".as_bytes()
         );
+    }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::translate_mouse;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    fn pane() -> (u16, u16, u16, u16) {
+        // Right panel at x=40, y=3, 60 wide, 24 tall.
+        (40, 3, 60, 24)
+    }
+
+    fn me(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn click_inside_pane_translates_with_local_coords() {
+        // Left-click at frame (40, 3) → pane-local (1, 1) (1-based).
+        let bytes =
+            translate_mouse(me(MouseEventKind::Down(MouseButton::Left), 40, 3), pane());
+        assert_eq!(bytes, b"\x1b[<0;1;1M");
+    }
+
+    #[test]
+    fn click_outside_pane_returns_empty() {
+        // Frame coord (10, 10) is on the tree side; we don't forward.
+        let bytes =
+            translate_mouse(me(MouseEventKind::Down(MouseButton::Left), 10, 10), pane());
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn release_uses_lowercase_m() {
+        let bytes =
+            translate_mouse(me(MouseEventKind::Up(MouseButton::Left), 50, 5), pane());
+        assert_eq!(bytes, b"\x1b[<0;11;3m");
+    }
+
+    #[test]
+    fn drag_adds_motion_bit() {
+        // Drag(left) = 0 + 32 = 32, suffix M.
+        let bytes =
+            translate_mouse(me(MouseEventKind::Drag(MouseButton::Left), 45, 5), pane());
+        assert_eq!(bytes, b"\x1b[<32;6;3M");
+    }
+
+    #[test]
+    fn scroll_up_is_code_64() {
+        let bytes = translate_mouse(me(MouseEventKind::ScrollUp, 70, 10), pane());
+        assert_eq!(bytes, b"\x1b[<64;31;8M");
+    }
+
+    #[test]
+    fn scroll_down_is_code_65() {
+        let bytes = translate_mouse(me(MouseEventKind::ScrollDown, 70, 10), pane());
+        assert_eq!(bytes, b"\x1b[<65;31;8M");
+    }
+
+    #[test]
+    fn shift_modifier_adds_4() {
+        let mut e = me(MouseEventKind::Down(MouseButton::Left), 41, 4);
+        e.modifiers = KeyModifiers::SHIFT;
+        let bytes = translate_mouse(e, pane());
+        // Code 0 + 4 (shift) = 4
+        assert_eq!(bytes, b"\x1b[<4;2;2M");
+    }
+
+    #[test]
+    fn ctrl_scroll_for_zoom_apps() {
+        let mut e = me(MouseEventKind::ScrollUp, 50, 8);
+        e.modifiers = KeyModifiers::CONTROL;
+        let bytes = translate_mouse(e, pane());
+        // 64 + 16 = 80
+        assert_eq!(bytes, b"\x1b[<80;11;6M");
+    }
+
+    #[test]
+    fn boundary_right_edge_is_outside() {
+        // Pane spans columns 40..=99 (40 + 60 = 100 exclusive).
+        // Column 99 is in. Column 100 is not.
+        let inside =
+            translate_mouse(me(MouseEventKind::Down(MouseButton::Left), 99, 3), pane());
+        assert!(!inside.is_empty());
+        let outside =
+            translate_mouse(me(MouseEventKind::Down(MouseButton::Left), 100, 3), pane());
+        assert!(outside.is_empty());
     }
 }
 
