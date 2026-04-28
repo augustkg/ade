@@ -36,7 +36,18 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_tree(frame, chunks[1], app);
     }
 
-    render_help_bar(frame, chunks[2], app);
+    if app.should_show_tmux_nudge() {
+        let footer = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(chunks[2]);
+        render_tmux_nudge(frame, footer[0]);
+        render_help_bar(frame, footer[2], app);
+    } else {
+        render_help_bar(frame, chunks[2], app);
+    }
 
     if let AppState::CreatingSession(ref form) = app.state {
         render_create_modal(frame, app, form);
@@ -562,6 +573,35 @@ fn render_notice_banner(frame: &mut Frame, area: Rect, notice: &Notice) {
             notice.text.clone(),
             Style::default().fg(theme::TEXT),
         ),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_tmux_nudge(frame: &mut Frame, area: Rect) {
+    let line = Line::from(vec![
+        Span::styled(
+            " Tip ",
+            Style::default()
+                .fg(theme::BASE)
+                .bg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "Tmux clipboard not configured — run ",
+            Style::default().fg(theme::TEXT),
+        ),
+        Span::styled(
+            "ade install-tmux-config",
+            Style::default()
+                .fg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " for drag-select-to-copy.  ",
+            Style::default().fg(theme::TEXT),
+        ),
+        Span::styled("(x to dismiss)", Style::default().fg(theme::OVERLAY2)),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }

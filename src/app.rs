@@ -5,8 +5,10 @@ use std::time::{Duration, Instant};
 use crate::cwd;
 use crate::hosts::{Config, Host, HostKind};
 use crate::install_hooks;
+use crate::install_tmux::InstallStatus;
 use crate::model::{Machine, Row, Tree};
 use crate::refresh::{refresh_all, RefreshResult};
+use crate::state::State;
 use crate::text_field::TextField;
 use crate::tmux::{self, TmuxBackend};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -312,6 +314,13 @@ pub struct App {
     /// Same idea for the local machine — checked on every refresh by
     /// reading `~/.claude/settings.local.json`.
     pub local_hooks_installed: bool,
+    /// Install state of ADE's tmux clipboard config locally. Drives the
+    /// in-TUI nudge that points users at `ade install-tmux-config`.
+    pub local_tmux_config_status: InstallStatus,
+    /// True if the user has dismissed the "tmux clipboard not configured"
+    /// nudge. Loaded from `~/.config/ade/state.toml` on launch and persisted
+    /// when the user presses `x`.
+    pub tmux_nudge_dismissed: bool,
     /// Transient banner shown at the top of the Hosts screen (install /
     /// retry results). Cleared on the next keypress in HostsList.
     pub hosts_notice: Option<Notice>,
@@ -333,6 +342,7 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         let (config, parse_warning) = Config::load();
+        let persisted = State::load();
         let mut app = Self {
             state: AppState::Tree,
             focus_area: FocusArea::SessionList,
@@ -347,6 +357,8 @@ impl App {
             config,
             host_hooks: HashMap::new(),
             local_hooks_installed: false,
+            local_tmux_config_status: InstallStatus::Missing,
+            tmux_nudge_dismissed: persisted.tmux_install_nudge.dismissed,
             hosts_notice: None,
             pending_refresh: None,
             last_refresh_started: Instant::now(),
@@ -389,6 +401,7 @@ impl App {
         }
         self.host_hooks = result.remote_hooks;
         self.local_hooks_installed = result.local_hooks_installed;
+        self.local_tmux_config_status = result.local_tmux_config_status;
         let current_session = result.current_session;
         self.tree = Tree::build(result.per_machine, result.errors, &self.expanded_memory);
         self.tree.current_session = current_session;
@@ -425,6 +438,28 @@ impl App {
 
     pub fn current_row(&self) -> Option<Row> {
         self.tree.visible_rows().get(self.selected_index).copied()
+    }
+
+    /// True when the in-TUI "tmux clipboard not configured" nudge should be
+    /// rendered. Only shown when ADE is running inside tmux (otherwise the
+    /// fix isn't relevant), the marker is missing locally, the user hasn't
+    /// already dismissed it, and we're in the main tree state — so the `x`
+    /// dismissal binding is always reachable when the nudge is visible
+    /// rather than being shadowed by a modal's own keymap.
+    pub fn should_show_tmux_nudge(&self) -> bool {
+        !self.tmux_nudge_dismissed
+            && matches!(self.state, AppState::Tree)
+            && tmux::is_inside_tmux()
+            && matches!(self.local_tmux_config_status, InstallStatus::Missing)
+    }
+
+    /// Persist the dismissal so we don't re-pester after restart. State
+    /// persistence is best-effort — failing to save doesn't block the UI.
+    fn dismiss_tmux_nudge(&mut self) {
+        self.tmux_nudge_dismissed = true;
+        let mut state = State::load();
+        state.tmux_install_nudge.dismissed = true;
+        let _ = state.save();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -527,6 +562,11 @@ impl App {
             KeyCode::Char('d') => self.start_delete_selected(),
             KeyCode::Char('H') => {
                 self.state = AppState::HostsList { selected: 0 };
+            }
+            KeyCode::Char('x') => {
+                if self.should_show_tmux_nudge() {
+                    self.dismiss_tmux_nudge();
+                }
             }
             _ => {}
         }
@@ -1097,9 +1137,28 @@ impl App {
                             // surfaces in the hosts screen banner.
                             let install_result =
                                 install_hooks::install_remote(&self.config, &host_name);
+                            // Only nudge tmux-config install for new mosh
+                            // hosts — that's the configuration where OSC 52
+                            // gets dropped in transit. SSH passes bytes
+                            // unchanged.
+                            let new_mosh = editing_idx.is_none()
+                                && self
+                                    .config
+                                    .host_by_name(&host_name)
+                                    .map(|h| matches!(h.kind, HostKind::Mosh))
+                                    .unwrap_or(false);
                             self.refresh();
                             self.hosts_notice = match install_result {
-                                Ok(msg) => Some(Notice::success(msg)),
+                                Ok(mut msg) => {
+                                    if new_mosh {
+                                        msg.push_str(&format!(
+                                            ". Tip: `ade install-tmux-config --host {}` \
+                                             to set up clipboard there.",
+                                            host_name
+                                        ));
+                                    }
+                                    Some(Notice::success(msg))
+                                }
                                 Err(e) => Some(Notice::warning(format!(
                                     "saved {} — hooks not installed: {}. Press i to retry.",
                                     host_name, e
