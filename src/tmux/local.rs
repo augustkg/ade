@@ -127,10 +127,14 @@ impl TmuxBackend for LocalTmux {
 /// Capture the visible content of a session's active pane *with* ANSI
 /// escape sequences so the renderer can preserve color and styling.
 ///
-/// `=name` makes the target match exact (no glob). Errors on tmux spawn
+/// Target is `=name:` — the trailing colon is required: `capture-pane`
+/// resolves a *pane* target, not a session target, and `=name` (without
+/// the colon) trips the parser into "can't find pane" rather than
+/// matching the session. The colon means "session=name exactly, default
+/// window and pane," which is what we want. Errors on tmux spawn
 /// failure or non-zero exit (e.g. session vanished).
 pub fn capture_pane(name: &str) -> Result<String, String> {
-    let target = format!("={}", name);
+    let target = format!("={}:", name);
     let out = Command::new("tmux")
         .args(["capture-pane", "-e", "-p", "-t", &target])
         .output()

@@ -172,11 +172,17 @@ impl RemoteTmux {
     /// Capture the active pane of a remote session with ANSI escapes,
     /// for the ambient preview pane. One SSH round-trip; expected to be
     /// called at most every few hundred ms per host.
+    ///
+    /// Target is `=name:` (trailing colon required) — `capture-pane`
+    /// resolves a pane target, and `=name` without the colon trips
+    /// tmux's parser into "can't find pane" rather than matching the
+    /// session. The colon means "session=name exactly, default window
+    /// and pane".
     pub fn capture_pane(&self, name: &str) -> Result<String, String> {
         if !shell_safe(name) {
             return Err("invalid session name".to_string());
         }
-        let cmd = format!("tmux capture-pane -e -p -t '={}'", name);
+        let cmd = format!("tmux capture-pane -e -p -t '={}:'", name);
         let out = self.ssh(&cmd)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
