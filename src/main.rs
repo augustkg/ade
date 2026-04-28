@@ -13,6 +13,7 @@ mod preview_pane;
 mod refresh;
 mod ssh_io;
 mod state;
+mod term_title;
 #[cfg(test)]
 mod test_harness;
 mod text_field;
@@ -63,12 +64,18 @@ fn main() -> Result<()> {
 
     match result {
         Ok(Some(AppAction::AttachSession { name, machine })) => {
-            // Re-load config from disk so any host edits made during the TUI session apply.
+            // Don't clear the title here: attach() exec-replaces into tmux,
+            // and tmux's `set-titles` (with @ade-title plumbed through the
+            // managed config) takes over with our `folder/session | host`
+            // string. Clearing first would briefly flash an empty title.
             let (config, _warning) = Config::load();
             attach(&name, &machine, &config);
         }
-        Ok(_) => {}
+        Ok(_) => {
+            term_title::clear();
+        }
         Err(e) => {
+            term_title::clear();
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
@@ -304,8 +311,10 @@ fn attach(name: &str, machine: &Machine, config: &Config) {
                         return;
                     }
                 }
+                set_session_title_option(name, machine);
                 run_status("tmux", &["switch-client", "-t", &target]);
             } else {
+                set_session_title_option(name, machine);
                 exec_replace("tmux", &["attach-session", "-t", &target]);
             }
         }
@@ -327,6 +336,44 @@ fn attach(name: &str, machine: &Machine, config: &Config) {
             let _ = inside; // remote attach path no longer branches on inside-tmux
         }
     }
+}
+
+/// Plant `@ade-title` on the target tmux session so the managed
+/// `set-titles-string` resolves to ADE's `folder/session | host` format
+/// after attach. Best-effort — failures are swallowed (the worst case is a
+/// stale or generic terminal title; not worth aborting attach for).
+///
+/// `set-option -t` resolves its argument as a target-pane, which makes the
+/// `=name` exact-match prefix that the rest of ADE uses error out with
+/// "no such session". Bare prefix-match would also misfire when one session
+/// name is a prefix of another (e.g. `work` and `work/web`). So we enumerate
+/// `list-sessions` ourselves, exact-match in Rust, and pass the resolved
+/// `$id` to `set-option`.
+fn set_session_title_option(name: &str, machine: &Machine) {
+    let Some(session_id) = lookup_session_id(name) else { return };
+    let title = term_title::for_session_name(name, machine.title_label());
+    let _ = std::process::Command::new("tmux")
+        .args(["set-option", "-t", &session_id, "@ade-title", &title])
+        .output();
+}
+
+fn lookup_session_id(name: &str) -> Option<String> {
+    let out = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}\t#{session_id}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some((n, id)) = line.split_once('\t') {
+            if n == name {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn chrono_now() -> String {
@@ -521,6 +568,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<Option<AppAction>> {
         app.tick();
 
         terminal.draw(|frame| ui::render(frame, &app))?;
+        term_title::set(&app.tab_title());
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
