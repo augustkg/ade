@@ -233,15 +233,29 @@ fn mouse_button_code(b: MouseButton) -> u32 {
 /// the embedded session itself uses. Bare Esc breaks vim; bare Tab is
 /// the entry key. The classic approach is a tmux-style prefix chord:
 ///
-///   `Ctrl+\` then `q`  →  exit embedded mode
-///   `Ctrl+\` then any other key  →  forward buffered prefix + key
-///   `Ctrl+\` then `Ctrl+\`  →  forward exactly one literal prefix
-///                              (escape hatch for sessions that use
-///                              Ctrl+\ for their own purposes)
+///   `Ctrl+Space` then `q`  →  exit embedded mode
+///   `Ctrl+Space` then any other key  →  forward buffered prefix + key
+///   `Ctrl+Space` then `Ctrl+Space`  →  forward exactly one literal
+///                                       prefix (escape hatch for
+///                                       sessions that use NUL for
+///                                       their own purposes)
 ///
-/// `Ctrl+\` is a sane choice because almost no shell or TUI binds it
-/// (bash treats it as SIGQUIT *only* on terminals where INTR/QUIT keys
-/// are routed by termios; inside tmux it's typically free).
+/// `Ctrl+Space` is a deliberate choice over `Ctrl+\` (the previous
+/// default). The backslash key on Danish, German, Norwegian, French
+/// and many other layouts sits behind AltGr, which makes `Ctrl+\`
+/// effectively unreachable for non-US users. `Ctrl+Space` lives in
+/// the same place on every keyboard and has minimal collision with
+/// shells / TUIs (bash readline binds it to `set-mark` in emacs mode;
+/// vim autocomplete plugins occasionally use it). Crossterm reports
+/// the keystroke as `Char(' ') + CONTROL` and the translator at
+/// `ctrl_special(' ')` already maps it to byte `0x00`.
+///
+/// **Caveat:** `Ctrl+Space` is sometimes intercepted *before* it
+/// reaches ADE — macOS uses it as the default input-source switcher,
+/// and CJK IMEs on Linux/Windows often bind it to IME toggle. If a
+/// user reports the chord doesn't fire, the first thing to check is
+/// whether their OS / input method is grabbing the key (System
+/// Settings → Keyboard → Shortcuts → Input Sources on macOS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChordState {
     Idle,
@@ -277,11 +291,11 @@ impl ChordOutcome {
     }
 }
 
-/// The exit-chord prefix as a byte. Anything that translates to this
-/// byte (whether the "logical" `Char('\\') + CONTROL` form or the raw
-/// `Char('4') + CONTROL` form crossterm emits) is treated as the chord
-/// prefix.
-pub const CHORD_PREFIX_BYTE: u8 = 0x1c;
+/// The exit-chord prefix as a byte. Currently `Ctrl+Space` (NUL).
+/// Anything that translates to this byte is treated as the chord
+/// prefix — that's `Char(' ') + CONTROL` and `Char('@') + CONTROL`,
+/// both routed through `ctrl_special` to `0x00`.
+pub const CHORD_PREFIX_BYTE: u8 = 0x00;
 
 /// Drive the chord state machine with one event. Returns the outcome.
 /// The caller is responsible for actually writing the bytes to the PTY
@@ -289,10 +303,11 @@ pub const CHORD_PREFIX_BYTE: u8 = 0x1c;
 ///
 /// Only `KeyEventKind::Press` events are honoured. Repeat/Release events
 /// (which crossterm's enhanced keyboard protocols can synthesise) are
-/// no-ops here: a Release for `Ctrl+\` while `Pending` would otherwise
-/// erroneously fire the prefix-passthrough path. The TUI's main event
-/// loop already filters to Press today, but enforcing the contract at
-/// the function boundary keeps it correct under future protocol changes.
+/// no-ops here: a Release for `Ctrl+Space` while `Pending` would
+/// otherwise erroneously fire the prefix-passthrough path. The TUI's
+/// main event loop already filters to Press today, but enforcing the
+/// contract at the function boundary keeps it correct under future
+/// protocol changes.
 pub fn chord_step(state: &mut ChordState, event: KeyEvent) -> ChordOutcome {
     use crossterm::event::KeyEventKind;
     if event.kind != KeyEventKind::Press {
@@ -320,9 +335,9 @@ pub fn chord_step(state: &mut ChordState, event: KeyEvent) -> ChordOutcome {
             {
                 return ChordOutcome::Exit;
             }
-            // Chord-prefix passthrough: Ctrl+\ Ctrl+\ → send exactly one
-            // literal Ctrl+\ byte (the buffered one), discarding the
-            // second so we don't double-emit.
+            // Chord-prefix passthrough: Ctrl+Space Ctrl+Space → send
+            // exactly one literal NUL byte (the buffered one),
+            // discarding the second so we don't double-emit.
             if translated == [CHORD_PREFIX_BYTE] {
                 return ChordOutcome::Forward(vec![CHORD_PREFIX_BYTE]);
             }
@@ -1067,23 +1082,29 @@ mod chord_tests {
     }
 
     #[test]
-    fn idle_ctrl_backslash_logical_enters_pending() {
+    fn idle_ctrl_space_enters_pending() {
+        // The chord prefix is `Ctrl+Space` (Danish-keyboard friendly,
+        // replacing the older `Ctrl+\` default). crossterm reports
+        // this as `Char(' ') + CONTROL`; the translator at
+        // `ctrl_special(' ')` maps it to `0x00`, our prefix byte.
         let mut s = ChordState::Idle;
         let out = chord_step(
             &mut s,
-            ev(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            ev(KeyCode::Char(' '), KeyModifiers::CONTROL),
         );
         assert_eq!(out, ChordOutcome::Forward(Vec::new()));
         assert_eq!(s, ChordState::Pending);
     }
 
     #[test]
-    fn idle_ctrl_backslash_raw_form_enters_pending() {
-        // The crossterm-actually-emits form. This is what fires at runtime.
+    fn idle_ctrl_at_also_enters_pending() {
+        // `Ctrl+@` is the alt name for the same byte (0x00) — some
+        // keyboards / shells synthesise it instead of `Ctrl+Space`.
+        // Both paths must arm the chord.
         let mut s = ChordState::Idle;
         let out = chord_step(
             &mut s,
-            ev(KeyCode::Char('4'), KeyModifiers::CONTROL),
+            ev(KeyCode::Char('@'), KeyModifiers::CONTROL),
         );
         assert_eq!(out, ChordOutcome::Forward(Vec::new()));
         assert_eq!(s, ChordState::Pending);
@@ -1122,13 +1143,13 @@ mod chord_tests {
     }
 
     #[test]
-    fn pending_ctrl_backslash_passes_one_literal_prefix() {
+    fn pending_ctrl_space_passes_one_literal_prefix() {
         // Escape hatch: chord-prefix-prefix sends exactly one literal
-        // prefix byte to the embedded session, not two.
+        // prefix byte (NUL, 0x00) to the embedded session, not two.
         let mut s = ChordState::Pending;
         let out = chord_step(
             &mut s,
-            ev(KeyCode::Char('4'), KeyModifiers::CONTROL),
+            ev(KeyCode::Char(' '), KeyModifiers::CONTROL),
         );
         assert_eq!(
             out,
@@ -1139,8 +1160,9 @@ mod chord_tests {
 
     #[test]
     fn pending_other_key_forwards_buffered_plus_new() {
-        // E.g. user pressed Ctrl+\ then 'a' (changed mind, didn't want
-        // to exit). Session should see the prefix it expected plus 'a'.
+        // E.g. user pressed Ctrl+Space then 'a' (changed mind, didn't
+        // want to exit). Session should see the prefix it expected
+        // (the buffered NUL) plus 'a'.
         let mut s = ChordState::Pending;
         let out = chord_step(&mut s, ev(KeyCode::Char('a'), KeyModifiers::NONE));
         assert_eq!(
@@ -1162,10 +1184,10 @@ mod chord_tests {
     #[test]
     fn full_chord_idle_to_pending_to_exit() {
         let mut s = ChordState::Idle;
-        // Ctrl+\
+        // Ctrl+Space
         let _ = chord_step(
             &mut s,
-            ev(KeyCode::Char('4'), KeyModifiers::CONTROL),
+            ev(KeyCode::Char(' '), KeyModifiers::CONTROL),
         );
         assert_eq!(s, ChordState::Pending);
         // q
@@ -1176,13 +1198,13 @@ mod chord_tests {
 
     #[test]
     fn release_event_while_pending_is_a_noop() {
-        // Codex Phase-3 review: a Release event for Ctrl+\ while in
-        // Pending must NOT be treated as a chord-prefix passthrough,
+        // Codex Phase-3 review: a Release event for Ctrl+Space while
+        // in Pending must NOT be treated as a chord-prefix passthrough,
         // or holding-and-releasing the prefix key would emit a literal
-        // 0x1c instead of leaving the chord armed.
+        // NUL instead of leaving the chord armed.
         let mut s = ChordState::Pending;
         let release = KeyEvent {
-            code: KeyCode::Char('4'),
+            code: KeyCode::Char(' '),
             modifiers: KeyModifiers::CONTROL,
             kind: KeyEventKind::Release,
             state: KeyEventState::NONE,
