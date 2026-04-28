@@ -619,8 +619,6 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
             txt(" expand  "),
             key("⏎"),
             txt(" attach  "),
-            key("Tab"),
-            txt(" preview  "),
             key("n"),
             txt(" new  "),
             key("R"),
