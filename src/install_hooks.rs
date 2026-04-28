@@ -110,33 +110,53 @@ enum EventChange {
     NoOp,
 }
 
+/// The set of Claude Code hook events ADE owns. Adding a new event is a
+/// single-line change here; `merge_hooks` iterates this list and the
+/// summary/no-op logic falls out automatically. `IDLE_CMD` is reused for
+/// every "turn ended" variant — its body ignores stdin, so the differing
+/// payloads of Stop vs StopFailure vs SessionEnd are harmless.
+///
+/// - `UserPromptSubmit` → working (user submitted a prompt)
+/// - `Stop` → idle (turn finished normally)
+/// - `StopFailure` → idle (turn failed with API error: rate_limit,
+///   authentication_failed, server_error, etc. — `Stop` does not fire here)
+/// - `SessionEnd` → idle (session exited normally: /clear, /resume, plain
+///   exit. Does NOT cover `kill -9` — see process-aliveness follow-up)
+const HOOK_EVENTS: &[(&str, &str)] = &[
+    ("UserPromptSubmit", WORKING_CMD),
+    ("Stop", IDLE_CMD),
+    ("StopFailure", IDLE_CMD),
+    ("SessionEnd", IDLE_CMD),
+];
+
 #[derive(Debug, Default)]
 struct InstallAction {
-    user_prompt_submit: Option<EventChange>,
-    stop: Option<EventChange>,
+    /// One entry per event in `HOOK_EVENTS`, recorded in iteration order.
+    events: Vec<(&'static str, EventChange)>,
 }
 
 impl InstallAction {
+    fn record(&mut self, event: &'static str, change: EventChange) {
+        self.events.push((event, change));
+    }
     fn is_noop(&self) -> bool {
-        let ups_noop = matches!(self.user_prompt_submit, None | Some(EventChange::NoOp));
-        let stop_noop = matches!(self.stop, None | Some(EventChange::NoOp));
-        ups_noop && stop_noop
+        self.events
+            .iter()
+            .all(|(_, c)| matches!(c, EventChange::NoOp))
     }
     fn summary(&self) -> String {
-        let mut added: Vec<&str> = Vec::new();
-        let mut updated: Vec<&str> = Vec::new();
-        if matches!(self.user_prompt_submit, Some(EventChange::Added)) {
-            added.push("UserPromptSubmit");
-        }
-        if matches!(self.stop, Some(EventChange::Added)) {
-            added.push("Stop");
-        }
-        if matches!(self.user_prompt_submit, Some(EventChange::Updated)) {
-            updated.push("UserPromptSubmit");
-        }
-        if matches!(self.stop, Some(EventChange::Updated)) {
-            updated.push("Stop");
-        }
+        let added: Vec<&str> = self
+            .events
+            .iter()
+            .filter(|(_, c)| matches!(c, EventChange::Added))
+            .map(|(n, _)| *n)
+            .collect();
+        let updated: Vec<&str> = self
+            .events
+            .iter()
+            .filter(|(_, c)| matches!(c, EventChange::Updated))
+            .map(|(n, _)| *n)
+            .collect();
         let mut parts: Vec<String> = Vec::new();
         if !added.is_empty() {
             parts.push(format!("added: {}", added.join(", ")));
@@ -168,12 +188,11 @@ fn merge_hooks(mut settings: Value) -> (Value, InstallAction) {
         *hooks = json!({});
     }
 
-    action.user_prompt_submit = Some(ensure_event(
-        hooks.as_object_mut().unwrap(),
-        "UserPromptSubmit",
-        WORKING_CMD,
-    ));
-    action.stop = Some(ensure_event(hooks.as_object_mut().unwrap(), "Stop", IDLE_CMD));
+    let hooks_obj = hooks.as_object_mut().unwrap();
+    for (event_name, command) in HOOK_EVENTS {
+        let change = ensure_event(hooks_obj, event_name, command);
+        action.record(event_name, change);
+    }
 
     (settings, action)
 }
@@ -279,17 +298,16 @@ fn cleanup_old_local_path() -> Result<usize, String> {
     Ok(removed)
 }
 
-/// Remove every nested entry whose `command` contains MARKER from any of
-/// the configured event arrays. Returns the count of removed entries.
+/// Remove every nested entry whose `command` contains MARKER from any
+/// hook event array, regardless of event name. Iterates the entire `hooks`
+/// object so we also clean up stragglers from future ADE versions if the
+/// user downgrades. Returns the count of removed entries.
 fn strip_ade_entries(value: &mut Value) -> usize {
     let Some(hooks) = value.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
         return 0;
     };
     let mut removed = 0;
-    for event_name in ["UserPromptSubmit", "Stop"].iter() {
-        let Some(arr_val) = hooks.get_mut(*event_name) else {
-            continue;
-        };
+    for (_event_name, arr_val) in hooks.iter_mut() {
         let Some(arr) = arr_val.as_array_mut() else {
             continue;
         };
