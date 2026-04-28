@@ -733,7 +733,7 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(vec![
                 Span::raw(" "),
                 Span::styled(
-                    "Ctrl+\\ armed",
+                    "Ctrl+Space armed",
                     Style::default()
                         .fg(theme::MAUVE)
                         .add_modifier(Modifier::BOLD),
@@ -741,16 +741,16 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
                 txt(" · "),
                 key("q"),
                 txt(" exit  "),
-                key("Ctrl+\\"),
+                key("Ctrl+Space"),
                 txt(" send literal  any other key passes through"),
             ])
         } else {
             Line::from(vec![
                 Span::raw(" "),
-                key("Ctrl+\\ q"),
+                key("Ctrl+Space q"),
                 txt(" exit embedded  "),
-                key("Ctrl+\\ Ctrl+\\"),
-                txt(" send literal Ctrl+\\"),
+                key("Ctrl+Space Ctrl+Space"),
+                txt(" send literal NUL"),
             ])
         };
         frame.render_widget(Paragraph::new(line), area);
