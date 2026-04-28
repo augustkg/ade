@@ -49,6 +49,11 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let mut terminal = ratatui::init();
+    // Mouse capture is *not* enabled here. It's scoped to the
+    // duration of an embedded session via `EmbeddedTerm`'s
+    // `MouseCaptureGuard` — enabling it globally would swallow
+    // the user's normal terminal scroll / Cmd+drag selection
+    // while they're just browsing the tree.
     let result = run(&mut terminal);
     ratatui::restore();
 
@@ -514,10 +519,16 @@ fn run(terminal: &mut DefaultTerminal) -> Result<Option<AppAction>> {
         terminal.draw(|frame| ui::render(frame, &app))?;
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key);
                 }
+                Event::Mouse(mouse) => {
+                    // Mouse forwarding only matters in embedded mode;
+                    // App::handle_mouse no-ops outside the panel.
+                    app.handle_mouse(mouse);
+                }
+                _ => {}
             }
         }
 
