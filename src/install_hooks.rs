@@ -8,11 +8,11 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
 
 use crate::hosts::{Config, Host};
+use crate::ssh_io;
 
 /// Marker substring embedded in our hook commands so we can recognise an
 /// already-installed hook and avoid appending duplicates on repeat installs.
@@ -358,29 +358,8 @@ fn write_atomic(path: &PathBuf, value: &Value) -> Result<(), String> {
     Ok(())
 }
 
-const SSH_OPTS: &[&str] = &[
-    "-o",
-    "ConnectTimeout=5",
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "StrictHostKeyChecking=accept-new",
-];
-
 fn ssh_read_settings(host: &Host) -> Result<String, String> {
-    let mut cmd = Command::new("ssh");
-    cmd.args(SSH_OPTS);
-    for a in &host.ssh_args {
-        cmd.arg(a);
-    }
-    cmd.arg(&host.target);
-    cmd.arg("cat ~/.claude/settings.json 2>/dev/null || true");
-    let out = cmd.output().map_err(|e| format!("ssh failed: {}", e))?;
-    if !out.status.success() && out.status.code() != Some(0) {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("ssh read failed: {}", stderr.trim()));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    ssh_io::run(host, "cat ~/.claude/settings.json 2>/dev/null || true")
 }
 
 fn ssh_write_settings(host: &Host, body: &str) -> Result<(), String> {
@@ -388,35 +367,5 @@ fn ssh_write_settings(host: &Host, body: &str) -> Result<(), String> {
     // a temp file and then atomically renames into place. No need for `jq`
     // or any remote tooling beyond a POSIX shell.
     let remote_cmd = "mkdir -p ~/.claude && cat > ~/.claude/settings.json.tmp && mv ~/.claude/settings.json.tmp ~/.claude/settings.json";
-
-    let mut cmd = Command::new("ssh");
-    cmd.args(SSH_OPTS);
-    for a in &host.ssh_args {
-        cmd.arg(a);
-    }
-    cmd.arg(&host.target);
-    cmd.arg(remote_cmd);
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(|e| format!("ssh spawn: {}", e))?;
-    {
-        use std::io::Write;
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "no ssh stdin".to_string())?;
-        stdin
-            .write_all(body.as_bytes())
-            .map_err(|e| format!("ssh write: {}", e))?;
-    }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("ssh wait: {}", e))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("ssh write failed: {}", stderr.trim()));
-    }
-    Ok(())
+    ssh_io::run_with_stdin(host, remote_cmd, body.as_bytes()).map(|_| ())
 }

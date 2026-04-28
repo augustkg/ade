@@ -3,6 +3,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::hosts::Config;
 use crate::install_hooks;
+use crate::install_tmux::{self, InstallStatus};
 use crate::model::Machine;
 use crate::tmux::remote::{RemoteRefresh, RemoteTmux};
 use crate::tmux::{self, Session, TmuxBackend};
@@ -17,6 +18,9 @@ pub struct RefreshResult {
     /// True if the local `~/.claude/settings.local.json` contains ADE's
     /// hook marker. Cheap to compute (single file read).
     pub local_hooks_installed: bool,
+    /// Local install state of the ADE-managed tmux clipboard config. Drives
+    /// the in-TUI nudge that points users at `ade install-tmux-config`.
+    pub local_tmux_config_status: InstallStatus,
     /// Name of the local tmux session the user's current client is viewing,
     /// if ADE was launched from inside tmux. Used for the `· here` marker.
     pub current_session: Option<String>,
@@ -70,6 +74,8 @@ pub fn refresh_all(config: &Config) -> RefreshResult {
         errors,
         remote_hooks,
         local_hooks_installed: install_hooks::is_installed_local(),
+        local_tmux_config_status: install_tmux::detect_local_status()
+            .unwrap_or(InstallStatus::Missing),
         current_session: tmux::current_session(),
     }
 }
