@@ -139,6 +139,45 @@ fn parse_status_body(body: &str) -> Option<ClaudeState> {
     }
 }
 
+/// On refresh, any pane that no longer has Claude in its process tree but
+/// still has a `state=working` status file on disk is "orphaned" — Claude
+/// died (kill -9, crash, SSH drop, anything that fires no terminal hook)
+/// without writing idle. Demote the file so a future Claude relaunched in
+/// the same tmux pane doesn't inherit the stale working state.
+///
+/// Returns the count of files demoted. Caller MUST gate this on a
+/// successful `ps` snapshot — if the descendant set is empty because `ps`
+/// failed (not because Claude is actually gone), every pane would look
+/// orphaned and we'd false-demote every working chip.
+pub fn demote_orphan_working_files<I>(
+    panes: I,
+    claude_pane_pids: &HashSet<u32>,
+    statuses: &HashMap<String, ClaudeState>,
+) -> usize
+where
+    I: IntoIterator<Item = (String, String, u32)>,
+{
+    let dir = match status_dir() {
+        Some(d) => d,
+        None => return 0,
+    };
+    let mut demoted = 0;
+    for (cmd, pane_id, pane_pid) in panes {
+        let is_claude = cmd == "claude" || claude_pane_pids.contains(&pane_pid);
+        if is_claude {
+            continue;
+        }
+        if matches!(statuses.get(&pane_id), Some(ClaudeState::Working)) {
+            let path = dir.join(format!("{}.json", pane_id));
+            // Minimal idle payload — `at` is decorative (parser ignores it).
+            if std::fs::write(&path, br#"{"state":"idle"}"#).is_ok() {
+                demoted += 1;
+            }
+        }
+    }
+    demoted
+}
+
 fn status_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     Some(home.join(".cache").join("ade").join("claude-status"))
