@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod acceptance;
 mod app;
 mod claude_status;
 mod cwd;
@@ -11,6 +13,8 @@ mod preview_pane;
 mod refresh;
 mod ssh_io;
 mod state;
+#[cfg(test)]
+mod test_harness;
 mod text_field;
 mod theme;
 mod tmux;
