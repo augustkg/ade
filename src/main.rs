@@ -516,35 +516,6 @@ fn run(terminal: &mut DefaultTerminal) -> Result<Option<AppAction>> {
             }
         }
 
-        // Preview hop: drain `pending_preview` here, in the run loop, so
-        // ADE's process and alt-screen survive the switch. Returning out
-        // of `run()` for this would hit `ratatui::restore()` in `main()`
-        // and tear the alt-screen down — exactly what we DON'T want for
-        // a non-destructive hop.
-        if let Some((name, _machine)) = app.pending_preview.take() {
-            match tmux::switch_client(&name) {
-                Ok(()) => {
-                    // Only persist `shown = true` if the hint actually
-                    // displayed; otherwise we'd silently skip the toast
-                    // forever after a transient `display-message` failure.
-                    if !app.preview_hint_shown
-                        && tmux::display_message(
-                            "ade: prefix+L returns here · this hint shows once",
-                        )
-                        .is_ok()
-                    {
-                        app.preview_hint_shown = true;
-                        let mut persisted = state::State::load();
-                        persisted.preview_hint.shown = true;
-                        let _ = persisted.save();
-                    }
-                }
-                Err(e) => {
-                    app.error_message = Some(format!("preview failed: {}", e));
-                }
-            }
-        }
-
         if app.should_quit {
             return Ok(Some(AppAction::Quit));
         }

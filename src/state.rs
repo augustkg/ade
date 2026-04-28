@@ -13,8 +13,6 @@ pub struct State {
     pub tmux_install_nudge: NudgeState,
     #[serde(default)]
     pub folders: FoldersState,
-    #[serde(default)]
-    pub preview_hint: PreviewHintState,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -30,15 +28,6 @@ pub struct FoldersState {
     /// `src/model.rs::Tree::group`.
     #[serde(default)]
     pub closed: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PreviewHintState {
-    /// Set to `true` after ADE has emitted the one-time
-    /// `tmux display-message "prefix+L returns to ADE"` toast on a
-    /// preview-mode hop. Gated so we don't repeat the hint on every Tab.
-    #[serde(default)]
-    pub shown: bool,
 }
 
 impl State {
@@ -98,21 +87,12 @@ mod tests {
         let mut original = State::default();
         original.tmux_install_nudge.dismissed = true;
         original.folders.closed = vec!["infra".to_string(), "work".to_string()];
-        original.preview_hint.shown = true;
 
         let serialized = toml::to_string_pretty(&original).unwrap();
         let restored: State = toml::from_str(&serialized).unwrap();
 
         assert_eq!(restored.tmux_install_nudge.dismissed, true);
         assert_eq!(restored.folders.closed, vec!["infra".to_string(), "work".to_string()]);
-        assert_eq!(restored.preview_hint.shown, true);
-    }
-
-    #[test]
-    fn missing_preview_hint_section_defaults() {
-        let body = "[tmux_install_nudge]\ndismissed = true\n[folders]\nclosed = [\"work\"]\n";
-        let state: State = toml::from_str(body).unwrap();
-        assert!(!state.preview_hint.shown);
     }
 
     #[test]
