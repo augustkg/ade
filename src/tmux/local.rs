@@ -34,13 +34,19 @@ impl TmuxBackend for LocalTmux {
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default();
 
-        let ps_text = Command::new("ps")
+        // Track ps success explicitly: an empty ps_text would otherwise
+        // make `find_claude_pane_pids` return an empty set, which makes
+        // every pane look "orphaned" — and that would let the demotion
+        // pass below false-demote every working chip.
+        let (ps_text, ps_succeeded) = match Command::new("ps")
             .args(["-A", "-o", "pid,ppid,comm"])
             .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
+        {
+            Ok(out) if out.status.success() => {
+                (String::from_utf8_lossy(&out.stdout).into_owned(), true)
+            }
+            _ => (String::new(), false),
+        };
 
         let pane_pids: Vec<u32> = panes_text
             .lines()
@@ -57,6 +63,22 @@ impl TmuxBackend for LocalTmux {
                 s.claude = Some(*state);
             }
         }
+
+        // Catch panes whose Claude died without firing Stop / StopFailure /
+        // SessionEnd (kill -9, crash, SSH drop). The hook chain can't help
+        // here — only a process-aliveness check can. Skip if `ps` failed.
+        if ps_succeeded {
+            let panes_iter = panes_text
+                .lines()
+                .filter_map(parse_pane_line)
+                .map(|(_, cmd, pid, ppid)| (cmd, pid, ppid));
+            claude_status::demote_orphan_working_files(
+                panes_iter,
+                &claude_pane_pids,
+                &statuses,
+            );
+        }
+
         Ok(sessions)
     }
 
