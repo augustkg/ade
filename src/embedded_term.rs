@@ -160,6 +160,115 @@ fn csi_tilde_or_modified(m: KeyModifiers, n: u8) -> Vec<u8> {
     }
 }
 
+/// State machine for the embedded-mode exit chord.
+///
+/// We need a way to leave embedded mode without conflicting with keys
+/// the embedded session itself uses. Bare Esc breaks vim; bare Tab is
+/// the entry key. The classic approach is a tmux-style prefix chord:
+///
+///   `Ctrl+\` then `q`  →  exit embedded mode
+///   `Ctrl+\` then any other key  →  forward buffered prefix + key
+///   `Ctrl+\` then `Ctrl+\`  →  forward exactly one literal prefix
+///                              (escape hatch for sessions that use
+///                              Ctrl+\ for their own purposes)
+///
+/// `Ctrl+\` is a sane choice because almost no shell or TUI binds it
+/// (bash treats it as SIGQUIT *only* on terminals where INTR/QUIT keys
+/// are routed by termios; inside tmux it's typically free).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChordState {
+    Idle,
+    Pending,
+}
+
+impl ChordState {
+    pub fn new() -> Self {
+        ChordState::Idle
+    }
+}
+
+impl Default for ChordState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Outcome of feeding one `KeyEvent` into the chord state machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChordOutcome {
+    /// Forward these bytes to the PTY (could be empty if a state
+    /// transition consumed the event without producing data).
+    Forward(Vec<u8>),
+    /// Exit embedded mode. The caller should detach the PTY and
+    /// return focus to the tree.
+    Exit,
+}
+
+impl ChordOutcome {
+    pub fn forward_bytes(b: Vec<u8>) -> Self {
+        ChordOutcome::Forward(b)
+    }
+}
+
+/// The exit-chord prefix as a byte. Anything that translates to this
+/// byte (whether the "logical" `Char('\\') + CONTROL` form or the raw
+/// `Char('4') + CONTROL` form crossterm emits) is treated as the chord
+/// prefix.
+pub const CHORD_PREFIX_BYTE: u8 = 0x1c;
+
+/// Drive the chord state machine with one event. Returns the outcome.
+/// The caller is responsible for actually writing the bytes to the PTY
+/// or exiting embedded mode.
+///
+/// Only `KeyEventKind::Press` events are honoured. Repeat/Release events
+/// (which crossterm's enhanced keyboard protocols can synthesise) are
+/// no-ops here: a Release for `Ctrl+\` while `Pending` would otherwise
+/// erroneously fire the prefix-passthrough path. The TUI's main event
+/// loop already filters to Press today, but enforcing the contract at
+/// the function boundary keeps it correct under future protocol changes.
+pub fn chord_step(state: &mut ChordState, event: KeyEvent) -> ChordOutcome {
+    use crossterm::event::KeyEventKind;
+    if event.kind != KeyEventKind::Press {
+        return ChordOutcome::Forward(Vec::new());
+    }
+    let translated = translate_key(event);
+
+    match *state {
+        ChordState::Idle => {
+            if translated == [CHORD_PREFIX_BYTE] {
+                *state = ChordState::Pending;
+                ChordOutcome::Forward(Vec::new())
+            } else {
+                ChordOutcome::Forward(translated)
+            }
+        }
+        ChordState::Pending => {
+            // Anything that emerges from Pending puts us back in Idle.
+            *state = ChordState::Idle;
+            // `q` is the exit verb. Plain 'q' / 'Q' with no modifiers
+            // (or just SHIFT) — Ctrl+q etc. should pass through.
+            if matches!(event.code, KeyCode::Char('q' | 'Q'))
+                && !event.modifiers.contains(KeyModifiers::CONTROL)
+                && !event.modifiers.contains(KeyModifiers::ALT)
+            {
+                return ChordOutcome::Exit;
+            }
+            // Chord-prefix passthrough: Ctrl+\ Ctrl+\ → send exactly one
+            // literal Ctrl+\ byte (the buffered one), discarding the
+            // second so we don't double-emit.
+            if translated == [CHORD_PREFIX_BYTE] {
+                return ChordOutcome::Forward(vec![CHORD_PREFIX_BYTE]);
+            }
+            // Generic case: emit the buffered prefix THEN the key bytes.
+            // The session sees the chord prefix it would have got, plus
+            // whatever the user actually typed next.
+            let mut out = vec![CHORD_PREFIX_BYTE];
+            out.extend(translated);
+            ChordOutcome::Forward(out)
+        }
+    }
+}
+
 fn function_key(n: u8, m: KeyModifiers) -> Vec<u8> {
     let mod_code = xterm_modifier(m);
     // F1–F4 use SS3 ("\x1bO<letter>"); F5–F12 use CSI <code>~.
@@ -531,6 +640,155 @@ mod key_translate_tests {
             translate_key(ev(KeyCode::Char('é'), KeyModifiers::NONE)),
             "é".as_bytes()
         );
+    }
+}
+
+#[cfg(test)]
+mod chord_tests {
+    use super::{chord_step, ChordOutcome, ChordState, CHORD_PREFIX_BYTE};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn ev(code: KeyCode, m: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: m,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn idle_plain_key_forwards_translation() {
+        let mut s = ChordState::Idle;
+        let out = chord_step(&mut s, ev(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(out, ChordOutcome::Forward(b"a".to_vec()));
+        assert_eq!(s, ChordState::Idle);
+    }
+
+    #[test]
+    fn idle_ctrl_backslash_logical_enters_pending() {
+        let mut s = ChordState::Idle;
+        let out = chord_step(
+            &mut s,
+            ev(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(out, ChordOutcome::Forward(Vec::new()));
+        assert_eq!(s, ChordState::Pending);
+    }
+
+    #[test]
+    fn idle_ctrl_backslash_raw_form_enters_pending() {
+        // The crossterm-actually-emits form. This is what fires at runtime.
+        let mut s = ChordState::Idle;
+        let out = chord_step(
+            &mut s,
+            ev(KeyCode::Char('4'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(out, ChordOutcome::Forward(Vec::new()));
+        assert_eq!(s, ChordState::Pending);
+    }
+
+    #[test]
+    fn pending_q_exits() {
+        let mut s = ChordState::Pending;
+        let out = chord_step(&mut s, ev(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(out, ChordOutcome::Exit);
+        assert_eq!(s, ChordState::Idle);
+    }
+
+    #[test]
+    fn pending_capital_q_also_exits() {
+        // SHIFT+q is fine — it's still a "q" with the user's intent.
+        let mut s = ChordState::Pending;
+        let out = chord_step(
+            &mut s,
+            ev(KeyCode::Char('Q'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(out, ChordOutcome::Exit);
+    }
+
+    #[test]
+    fn pending_ctrl_q_does_not_exit_passes_through() {
+        // Ctrl+q in shells = XON/restart-output. Don't hijack it.
+        let mut s = ChordState::Pending;
+        let out = chord_step(
+            &mut s,
+            ev(KeyCode::Char('q'), KeyModifiers::CONTROL),
+        );
+        // Buffered prefix + Ctrl+q (0x11)
+        assert_eq!(out, ChordOutcome::Forward(vec![CHORD_PREFIX_BYTE, 0x11]));
+        assert_eq!(s, ChordState::Idle);
+    }
+
+    #[test]
+    fn pending_ctrl_backslash_passes_one_literal_prefix() {
+        // Escape hatch: chord-prefix-prefix sends exactly one literal
+        // prefix byte to the embedded session, not two.
+        let mut s = ChordState::Pending;
+        let out = chord_step(
+            &mut s,
+            ev(KeyCode::Char('4'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            out,
+            ChordOutcome::Forward(vec![CHORD_PREFIX_BYTE])
+        );
+        assert_eq!(s, ChordState::Idle);
+    }
+
+    #[test]
+    fn pending_other_key_forwards_buffered_plus_new() {
+        // E.g. user pressed Ctrl+\ then 'a' (changed mind, didn't want
+        // to exit). Session should see the prefix it expected plus 'a'.
+        let mut s = ChordState::Pending;
+        let out = chord_step(&mut s, ev(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(
+            out,
+            ChordOutcome::Forward(vec![CHORD_PREFIX_BYTE, b'a'])
+        );
+        assert_eq!(s, ChordState::Idle);
+    }
+
+    #[test]
+    fn idle_esc_passes_through_does_not_exit() {
+        // Critical: bare Esc must not exit — vim needs Esc.
+        let mut s = ChordState::Idle;
+        let out = chord_step(&mut s, ev(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(out, ChordOutcome::Forward(vec![0x1b]));
+        assert_eq!(s, ChordState::Idle);
+    }
+
+    #[test]
+    fn full_chord_idle_to_pending_to_exit() {
+        let mut s = ChordState::Idle;
+        // Ctrl+\
+        let _ = chord_step(
+            &mut s,
+            ev(KeyCode::Char('4'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(s, ChordState::Pending);
+        // q
+        let out = chord_step(&mut s, ev(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(out, ChordOutcome::Exit);
+        assert_eq!(s, ChordState::Idle);
+    }
+
+    #[test]
+    fn release_event_while_pending_is_a_noop() {
+        // Codex Phase-3 review: a Release event for Ctrl+\ while in
+        // Pending must NOT be treated as a chord-prefix passthrough,
+        // or holding-and-releasing the prefix key would emit a literal
+        // 0x1c instead of leaving the chord armed.
+        let mut s = ChordState::Pending;
+        let release = KeyEvent {
+            code: KeyCode::Char('4'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        };
+        let out = chord_step(&mut s, release);
+        assert_eq!(out, ChordOutcome::Forward(Vec::new()));
+        assert_eq!(s, ChordState::Pending, "state must not transition on release");
     }
 }
 
