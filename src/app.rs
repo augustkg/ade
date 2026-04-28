@@ -1,8 +1,10 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::cwd;
+use crate::embedded_term::{chord_step, translate_mouse, ChordOutcome, ChordState, EmbeddedTerm};
 use crate::hosts::{Config, Host, HostKind};
 use crate::install_hooks;
 use crate::install_tmux::InstallStatus;
@@ -328,6 +330,21 @@ pub struct App {
     /// Cache + worker pool for the preview pane. Populated only when
     /// `preview_pane_enabled` is true.
     pub preview_pane: PreviewPane,
+    /// `Some` while the user has Tab'd into a session. The PTY is
+    /// alive and the right panel renders its vt100 grid instead of the
+    /// ambient snapshot. Mutated only on Tab (enter), the exit chord
+    /// (`Ctrl+\` then `q`), or detection that the child has died.
+    pub embedded_term: Option<EmbeddedTerm>,
+    /// Exit-chord state machine. Lives on App so it persists across
+    /// keystrokes inside one embedded session and resets on exit.
+    pub embedded_chord: ChordState,
+    /// The right-pane rect (x, y, w, h) the renderer drew the embedded
+    /// terminal into on the most recent frame. `Cell` interior
+    /// mutability is used because `render` takes `&App`. Mouse events
+    /// hit the App with frame-local coords; we use this rect to decide
+    /// whether a mouse event lands inside the embedded pane and to
+    /// translate frame coords to pane-local coords before forwarding.
+    pub embedded_panel_rect: Cell<Option<(u16, u16, u16, u16)>>,
     /// Transient banner shown at the top of the Hosts screen (install /
     /// retry results). Cleared on the next keypress in HostsList.
     pub hosts_notice: Option<Notice>,
@@ -372,6 +389,9 @@ impl App {
             tmux_nudge_dismissed: persisted.tmux_install_nudge.dismissed,
             preview_pane_enabled: persisted.preview_pane.enabled,
             preview_pane: PreviewPane::new(),
+            embedded_term: None,
+            embedded_chord: ChordState::Idle,
+            embedded_panel_rect: Cell::new(None),
             hosts_notice: None,
             pending_refresh: None,
             last_refresh_started: Instant::now(),
@@ -467,10 +487,23 @@ impl App {
 
         // Preview pane lives on its own short cadence (~500ms) keyed by
         // the highlighted session, separate from the 2s session-list
-        // refresh. Skip work entirely when the pane is off.
-        if self.preview_pane_enabled {
+        // refresh. Skip work entirely when the pane is off — and also
+        // when we're embedded, since the right panel renders the live
+        // PTY grid in that case (no need to keep snapshotting).
+        if self.preview_pane_enabled && self.embedded_term.is_none() {
             let target = self.preview_target();
             self.preview_pane.tick(target.as_ref(), &self.config.hosts);
+        }
+
+        // Detect a dead embedded child (target session killed externally,
+        // mosh/ssh dropped, etc.) and exit cleanly back to the tree.
+        let embedded_dead = self
+            .embedded_term
+            .as_mut()
+            .map(|et| !et.is_alive())
+            .unwrap_or(false);
+        if embedded_dead {
+            self.exit_embedded();
         }
 
         if self.pending_refresh.is_none()
@@ -535,6 +568,12 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.error_message = None;
+        // While in embedded mode, the entire keymap is shadowed: keys
+        // either flow to the embedded child via the chord state machine
+        // or trigger the exit chord. Tree/host/modal keymaps don't run.
+        if self.embedded_term.is_some() {
+            return self.handle_embedded_key(key);
+        }
         match &self.state {
             AppState::Tree => self.handle_tree_key(key),
             AppState::CreatingSession(_) => self.handle_creating_session_key(key),
@@ -544,6 +583,127 @@ impl App {
             AppState::HostsList { .. } => self.handle_hosts_list_key(key),
             AppState::HostForm(_) => self.handle_host_form_key(key),
         }
+    }
+
+    /// Forward a mouse event to the embedded PTY *only* when the click
+    /// landed inside the embedded panel rect that the renderer last
+    /// drew. Outside the panel (i.e. on the tree side) the event is
+    /// dropped — we don't currently handle mouse on the tree, and we
+    /// definitely don't want stray clicks to reach the embedded
+    /// session.
+    pub fn handle_mouse(&mut self, event: crossterm::event::MouseEvent) {
+        let Some(rect) = self.embedded_panel_rect.get() else {
+            return;
+        };
+        let bytes = translate_mouse(event, rect);
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(et) = self.embedded_term.as_mut() {
+            if let Err(e) = et.write(&bytes) {
+                self.error_message = Some(format!("embedded mouse write: {}", e));
+                self.exit_embedded();
+            }
+        }
+    }
+
+    /// Drive the chord state machine and forward keystrokes to the
+    /// embedded PTY. Called only while `embedded_term` is `Some`.
+    fn handle_embedded_key(&mut self, key: KeyEvent) {
+        let outcome = chord_step(&mut self.embedded_chord, key);
+        match outcome {
+            ChordOutcome::Forward(bytes) => {
+                if let Some(et) = self.embedded_term.as_mut() {
+                    if let Err(e) = et.write(&bytes) {
+                        // Write failure usually means the PTY closed
+                        // underneath us. Bail out cleanly so the user
+                        // gets back to the tree.
+                        self.error_message = Some(format!("embedded write: {}", e));
+                        self.exit_embedded();
+                    }
+                }
+            }
+            ChordOutcome::Exit => self.exit_embedded(),
+        }
+    }
+
+    /// Try to enter embedded mode against the currently-highlighted
+    /// session. No-op in any case where the focus or row isn't right
+    /// (folder rows, NewSession placeholder, no preview pane enabled,
+    /// etc.). Errors during PTY/child spawn surface via `error_message`.
+    fn try_enter_embedded(&mut self) {
+        if !self.preview_pane_enabled {
+            // Codex Phase-5 UX nit: silent no-op was hard to discover.
+            // Surface a short hint so first-time Tab presses don't
+            // look broken when the panel hasn't been turned on yet.
+            self.error_message =
+                Some("Enable the preview pane with `p` first, then Tab to enter.".to_string());
+            return;
+        }
+        if self.focus_area != FocusArea::SessionList {
+            return;
+        }
+        let Some(Row::Session(idx)) = self.current_row() else {
+            return;
+        };
+        let Some(session) = self.tree.session(idx) else {
+            return;
+        };
+        let name = session.raw_name.clone();
+        let machine = session.machine.clone();
+
+        // Placeholder size — UI's first frame after entering embedded
+        // immediately calls `resize()` with the actual rect dimensions.
+        let result = match machine {
+            Machine::Local => EmbeddedTerm::spawn_local(&name, 24, 80),
+            Machine::Remote(host_name) => match self
+                .config
+                .host_by_name(&host_name)
+                .cloned()
+            {
+                Some(host) => EmbeddedTerm::spawn_remote(&host, &name, 24, 80),
+                None => Err(format!("host '{}' not found in config", host_name)),
+            },
+        };
+
+        match result {
+            Ok(et) => {
+                self.embedded_term = Some(et);
+                self.embedded_chord = ChordState::Idle;
+            }
+            Err(e) => {
+                self.error_message = Some(format!("embedded: {}", e));
+            }
+        }
+    }
+
+    /// Tear down the embedded session and return focus to the tree.
+    /// Idempotent: calling when not embedded is a no-op. Called by:
+    /// the exit chord, write-failure detection in `handle_embedded_key`,
+    /// and child-death detection in `tick`.
+    fn exit_embedded(&mut self) {
+        if let Some(mut et) = self.embedded_term.take() {
+            et.kill();
+            // EmbeddedTerm::Drop handles the wait + reader detach.
+            drop(et);
+        }
+        self.embedded_chord = ChordState::Idle;
+    }
+
+    /// Returns the embedded session's PTY size if active, useful for
+    /// the renderer to decide whether to call `resize()` on layout
+    /// changes.
+    pub fn embedded_active(&self) -> bool {
+        self.embedded_term.is_some()
+    }
+
+    /// `true` while the exit-chord prefix has been pressed but the
+    /// next key hasn't arrived. The renderer uses this to switch the
+    /// embedded-pane border to mauve and the help-bar copy to a
+    /// "chord armed" variant — Codex Phase-6 review pointed out that
+    /// without a UI cue, the modal-ish state would feel surprising.
+    pub fn embedded_chord_pending(&self) -> bool {
+        matches!(self.embedded_chord, ChordState::Pending)
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) {
@@ -642,6 +802,9 @@ impl App {
             }
             KeyCode::Char('p') => {
                 self.toggle_preview_pane();
+            }
+            KeyCode::Tab => {
+                self.try_enter_embedded();
             }
             _ => {}
         }

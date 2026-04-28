@@ -1,7 +1,10 @@
+#[cfg(test)]
+mod acceptance;
 mod app;
 mod claude_status;
 mod cwd;
 mod debug;
+mod embedded_term;
 mod hosts;
 mod install_hooks;
 mod install_tmux;
@@ -10,6 +13,8 @@ mod preview_pane;
 mod refresh;
 mod ssh_io;
 mod state;
+#[cfg(test)]
+mod test_harness;
 mod text_field;
 mod theme;
 mod tmux;
@@ -48,6 +53,11 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let mut terminal = ratatui::init();
+    // Mouse capture is *not* enabled here. It's scoped to the
+    // duration of an embedded session via `EmbeddedTerm`'s
+    // `MouseCaptureGuard` — enabling it globally would swallow
+    // the user's normal terminal scroll / Cmd+drag selection
+    // while they're just browsing the tree.
     let result = run(&mut terminal);
     ratatui::restore();
 
@@ -329,7 +339,7 @@ fn chrono_now() -> String {
 
 /// The remote command to run on the destination host. Always pre-quoted for
 /// the *remote* shell so any special chars in `target` are literal.
-fn remote_attach_cmd(target: &str) -> String {
+pub(crate) fn remote_attach_cmd(target: &str) -> String {
     format!("tmux attach -t {}", hosts::shell_quote(target))
 }
 
@@ -343,7 +353,10 @@ fn remote_attach_cmd(target: &str) -> String {
 /// Mosh by contrast forwards the remote argv directly via execvp on the remote
 /// host (no remote shell), so each arg goes through byte-for-byte: we pass them
 /// separately and never quote.
-fn build_attach_command(host: &Host, target: &str) -> (String, Vec<String>) {
+///
+/// Reused by `embedded_term::EmbeddedTerm::spawn_remote` so the embedded
+/// PTY follows the same SSH/Mosh routing as the regular full-attach path.
+pub(crate) fn build_attach_command(host: &Host, target: &str) -> (String, Vec<String>) {
     match host.kind {
         HostKind::Ssh => {
             let mut args: Vec<String> = host.ssh_args.clone();
@@ -510,10 +523,16 @@ fn run(terminal: &mut DefaultTerminal) -> Result<Option<AppAction>> {
         terminal.draw(|frame| ui::render(frame, &app))?;
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key);
                 }
+                Event::Mouse(mouse) => {
+                    // Mouse forwarding only matters in embedded mode;
+                    // App::handle_mouse no-ops outside the panel.
+                    app.handle_mouse(mouse);
+                }
+                _ => {}
             }
         }
 
