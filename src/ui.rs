@@ -1,3 +1,4 @@
+use ansi_to_tui::IntoText;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -32,6 +33,12 @@ pub fn render(frame: &mut Frame, app: &App) {
     );
     if in_hosts_view {
         render_hosts_list(frame, chunks[1], app);
+    } else if app.preview_pane_enabled {
+        // 50/50 split: tree on the left, ambient preview pane on the right.
+        let body = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[1]);
+        render_tree(frame, body[0], app);
+        render_preview_pane(frame, body[1], app);
     } else {
         render_tree(frame, chunks[1], app);
     }
@@ -399,6 +406,51 @@ fn indent_for(in_folder: bool) -> &'static str {
     }
 }
 
+fn render_preview_pane(frame: &mut Frame, area: Rect, app: &App) {
+    let title = match app.preview_target() {
+        Some(ref key) => format!(" preview · {} ", key.name),
+        None => " preview ".to_string(),
+    };
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme::SURFACE1))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Each arm renders its own Paragraph so we don't have to unify the
+    // `Text` type across `ansi_to_tui` (returns `ratatui_core::Text`) and
+    // direct ratatui::text::Text construction. `Paragraph::new` accepts
+    // `Into<Text>` for both flavours.
+    let placeholder = |frame: &mut Frame, msg: &str| {
+        frame.render_widget(
+            Paragraph::new(msg.to_string()).style(Style::default().fg(theme::OVERLAY1)),
+            inner,
+        );
+    };
+    match app.preview_target() {
+        None => placeholder(frame, "Move the cursor to a session row to preview it here."),
+        Some(ref key) => match app.preview_pane.get(key) {
+            None => placeholder(frame, "Loading preview…"),
+            Some(capture) => match &capture.body {
+                Ok(ansi) => match ansi.as_bytes().into_text() {
+                    Ok(text) => frame.render_widget(Paragraph::new(text), inner),
+                    Err(_) => frame.render_widget(
+                        Paragraph::new(ansi.clone()).style(Style::default().fg(theme::TEXT)),
+                        inner,
+                    ),
+                },
+                Err(e) => placeholder(frame, &format!("preview unavailable: {}", e)),
+            },
+        },
+    }
+}
+
 fn render_hosts_list(frame: &mut Frame, area: Rect, app: &App) {
     // Vertical split: optional 2-row banner (hosts_notice), the list itself,
     // and a 1-row footer for local-machine hook status.
@@ -619,8 +671,8 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
             txt(" expand  "),
             key("⏎"),
             txt(" attach  "),
-            key("Tab"),
-            txt(" preview  "),
+            key("p"),
+            txt(" preview-pane  "),
             key("n"),
             txt(" new  "),
             key("R"),
