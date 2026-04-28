@@ -168,6 +168,28 @@ impl TmuxBackend for RemoteTmux {
     }
 }
 
+impl RemoteTmux {
+    /// Capture the active pane of a remote session with ANSI escapes,
+    /// for the ambient preview pane. One SSH round-trip; expected to be
+    /// called at most every few hundred ms per host.
+    pub fn capture_pane(&self, name: &str) -> Result<String, String> {
+        if !shell_safe(name) {
+            return Err("invalid session name".to_string());
+        }
+        let cmd = format!("tmux capture-pane -e -p -t '={}'", name);
+        let out = self.ssh(&cmd)?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(stderr
+                .lines()
+                .next()
+                .unwrap_or("remote capture-pane failed")
+                .to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
 fn check_status(out: std::process::Output) -> Result<(), String> {
     if out.status.success() {
         return Ok(());
