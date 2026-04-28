@@ -335,6 +335,11 @@ pub struct EmbeddedTerm {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Reader-thread join handle. `None` after Drop has joined it.
     reader_thread: Option<JoinHandle<()>>,
+    /// Last size we resized the PTY to. The renderer calls `resize()`
+    /// every frame; this lets us short-circuit when the size hasn't
+    /// changed (otherwise vt100::Parser::set_size walks all rows on
+    /// every same-size call). Wrapped so resize() can stay `&self`.
+    last_size: Mutex<(u16, u16)>,
 }
 
 impl EmbeddedTerm {
@@ -432,6 +437,7 @@ impl EmbeddedTerm {
             parser,
             child,
             reader_thread: Some(reader_thread),
+            last_size: Mutex::new((rows, cols)),
         })
     }
 
@@ -446,7 +452,17 @@ impl EmbeddedTerm {
 
     /// Resize the PTY and the parser's grid. Call when the panel area
     /// changes (terminal resize, layout flip, etc.).
+    ///
+    /// Same-size calls short-circuit: the renderer calls this every
+    /// frame and `vt100::Parser::set_size` would otherwise walk every
+    /// row on each call (Codex Phase-6 review).
     pub fn resize(&self, rows: u16, cols: u16) -> Result<(), String> {
+        if let Ok(mut last) = self.last_size.lock() {
+            if *last == (rows, cols) {
+                return Ok(());
+            }
+            *last = (rows, cols);
+        }
         self.master
             .resize(PtySize {
                 rows,

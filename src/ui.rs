@@ -34,8 +34,11 @@ pub fn render(frame: &mut Frame, app: &App) {
     if in_hosts_view {
         render_hosts_list(frame, chunks[1], app);
     } else if app.preview_pane_enabled {
-        // 50/50 split: tree on the left, ambient preview pane on the right.
-        let body = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        // 40/60 split: tree on the left at 40%, preview pane on the
+        // right at 60%. The preview gets the larger share because it's
+        // either the live tmux snapshot (read-only) or — when the user
+        // has Tab'd in — the interactive embedded terminal.
+        let body = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(chunks[1]);
         render_tree(frame, body[0], app);
         render_preview_pane(frame, body[1], app);
@@ -407,13 +410,27 @@ fn indent_for(in_folder: bool) -> &'static str {
 }
 
 fn render_preview_pane(frame: &mut Frame, area: Rect, app: &App) {
+    let embedded = app.embedded_active();
+    let chord_pending = app.embedded_chord_pending();
     let title = match app.preview_target() {
+        Some(ref key) if embedded => format!(" embedded · {} ", key.name),
         Some(ref key) => format!(" preview · {} ", key.name),
         None => " preview ".to_string(),
     };
+    // Border colour signals what the pane is doing:
+    //   peach   = embedded (user keystrokes flow here)
+    //   mauve   = embedded + chord prefix armed (next key is the chord)
+    //   surface = ambient snapshot
+    let border_color = if embedded && chord_pending {
+        theme::MAUVE
+    } else if embedded {
+        theme::PEACH
+    } else {
+        theme::SURFACE1
+    };
     let block = Block::default()
         .borders(Borders::LEFT)
-        .border_style(Style::default().fg(theme::SURFACE1))
+        .border_style(Style::default().fg(border_color))
         .title(Span::styled(
             title,
             Style::default()
@@ -422,6 +439,11 @@ fn render_preview_pane(frame: &mut Frame, area: Rect, app: &App) {
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    if embedded {
+        render_embedded_grid(frame, inner, app);
+        return;
+    }
 
     // Each arm renders its own Paragraph so we don't have to unify the
     // `Text` type across `ansi_to_tui` (returns `ratatui_core::Text`) and
@@ -449,6 +471,31 @@ fn render_preview_pane(frame: &mut Frame, area: Rect, app: &App) {
             },
         },
     }
+}
+
+/// Render the live vt100 grid of the embedded PTY into `area`. Also
+/// resizes the embedded term to match the visible area on the way out
+/// — the placeholder dimensions we used at spawn time get refined to
+/// the actual rect the layout produced.
+fn render_embedded_grid(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(et) = app.embedded_term.as_ref() else {
+        return;
+    };
+    let parser = et.parser();
+    // Ensure the PTY's reported size matches the rendered area. resize()
+    // is cheap (an ioctl + parser size update) and idempotent — calling
+    // every frame is fine.
+    let (rows, cols) = (area.height, area.width);
+    if rows > 0 && cols > 0 {
+        let _ = et.resize(rows, cols);
+    }
+    // Hand-rendered grid → ratatui Lines. Built in Phase 1; no new code
+    // here, just consume.
+    let lines = match parser.lock() {
+        Ok(p) => crate::embedded_term::screen_to_lines(p.screen()),
+        Err(_) => Vec::new(),
+    };
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_hosts_list(frame: &mut Frame, area: Rect, app: &App) {
@@ -662,6 +709,40 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
     let key = |s: &'static str| Span::styled(s, Style::default().fg(theme::PEACH));
     let txt = |s: &'static str| Span::styled(s, Style::default().fg(theme::OVERLAY2));
 
+    // Embedded mode shadows the entire keymap — show the only two
+    // shortcuts that matter while the PTY is taking input. When the
+    // chord prefix is armed, show a louder hint so the user knows
+    // their next key is going through the chord layer (matches the
+    // mauve border in render_preview_pane).
+    if app.embedded_active() {
+        let line = if app.embedded_chord_pending() {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    "Ctrl+\\ armed",
+                    Style::default()
+                        .fg(theme::MAUVE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                txt(" · "),
+                key("q"),
+                txt(" exit  "),
+                key("Ctrl+\\"),
+                txt(" send literal  any other key passes through"),
+            ])
+        } else {
+            Line::from(vec![
+                Span::raw(" "),
+                key("Ctrl+\\ q"),
+                txt(" exit embedded  "),
+                key("Ctrl+\\ Ctrl+\\"),
+                txt(" send literal Ctrl+\\"),
+            ])
+        };
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     let help_text = match app.state {
         AppState::Tree => vec![
             Span::raw(" "),
@@ -671,6 +752,8 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
             txt(" expand  "),
             key("⏎"),
             txt(" attach  "),
+            key("Tab"),
+            txt(" embed  "),
             key("p"),
             txt(" preview-pane  "),
             key("n"),

@@ -666,6 +666,15 @@ impl App {
         self.embedded_term.is_some()
     }
 
+    /// `true` while the exit-chord prefix has been pressed but the
+    /// next key hasn't arrived. The renderer uses this to switch the
+    /// embedded-pane border to mauve and the help-bar copy to a
+    /// "chord armed" variant — Codex Phase-6 review pointed out that
+    /// without a UI cue, the modal-ish state would feel surprising.
+    pub fn embedded_chord_pending(&self) -> bool {
+        matches!(self.embedded_chord, ChordState::Pending)
+    }
+
     fn handle_tree_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
