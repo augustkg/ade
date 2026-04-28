@@ -17,6 +17,15 @@ impl Machine {
             Machine::Remote(name) => name.as_str(),
         }
     }
+
+    /// Lowercase variant used in the terminal-tab title (`folder/session | host`).
+    /// Distinct from `label()` so UI capitalization isn't coupled to title style.
+    pub fn title_label(&self) -> &str {
+        match self {
+            Machine::Local => "local",
+            Machine::Remote(name) => name.as_str(),
+        }
+    }
 }
 
 impl Ord for Machine {

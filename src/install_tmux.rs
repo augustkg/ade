@@ -27,12 +27,12 @@ pub const MARKER: &str = "ade-tmux-marker";
 /// is what we grep for on subsequent runs.
 const SOURCE_LINE: &str = "source-file -q ~/.config/ade/tmux.conf  # ade-tmux-marker";
 
-/// Canonical contents of `~/.config/ade/tmux.conf`. Bumping `v1` invalidates
-/// existing installs (they'll be detected as stale and overwritten on the
-/// next `install`).
+/// Canonical contents of `~/.config/ade/tmux.conf`. Bumping the version
+/// (`v1`, `v2`, …) invalidates existing installs — they'll be detected as
+/// stale and overwritten on the next `install`.
 const MANAGED_BODY: &str = "\
 # Managed by ADE — do not edit. Run `ade install-tmux-config --uninstall` to remove.
-# ade-tmux-managed v1
+# ade-tmux-managed v3
 
 # Mouse drag-select-to-copy + OSC 52 clipboard, with the mosh-friendly Ms
 # override so the escape sequence survives mosh 1.4.0's strict parser.
@@ -43,6 +43,20 @@ set -as terminal-overrides ',*:Ms=\\E]52;c%p1%s;%p2%s\\007'
 
 bind-key -T copy-mode-vi y send-keys -X copy-pipe-and-cancel
 bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel
+
+# Window name follows the per-pane title (#T). ADE writes its current
+# selection there via OSC 0; tmux's default would otherwise show
+# `pane_current_command` (always `ade` while the TUI is running).
+set-window-option -g automatic-rename-format '#T'
+
+# Outer terminal tab title persists ADE's `folder/session | host` after attach.
+# ADE plants the string in `@ade-title` on the target session before
+# exec'ing into `tmux attach-session` / `switch-client`; tmux then emits OSC
+# 0 with that string continuously, overriding any foreground-job tracking
+# the host terminal does. Falls back to the window name when @ade-title is
+# unset (e.g. attaching outside ADE).
+set-option -g set-titles on
+set-option -g set-titles-string '#{?#{@ade-title},#{@ade-title},#W}'
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
