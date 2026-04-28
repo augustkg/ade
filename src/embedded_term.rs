@@ -12,10 +12,193 @@
 
 use std::sync::{Arc, Mutex};
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+
+/// Translate a `crossterm::KeyEvent` into the bytes a terminal would
+/// expect to receive when the user pressed that key. Used to forward
+/// keystrokes from ADE's outer event loop into the embedded PTY while
+/// the right panel is focused.
+///
+/// Coverage:
+/// - Printable chars (UTF-8).
+/// - Ctrl-letter (a–z, A–Z) → control codes 0x01..0x1a.
+/// - Ctrl with `@`, `[`, `\`, `]`, `^`, `_` → 0x00, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f.
+/// - Alt-X → ESC prefix + the bytes for X (xterm's "meta as ESC" mode).
+/// - Tab (HT), BackTab (CSI Z), Enter (CR), Backspace (DEL = 0x7f), Esc.
+/// - Arrows + Home / End / PageUp / PageDown / Insert / Delete with
+///   optional modifiers, encoded as `CSI 1 ; <mod> <letter>` per xterm.
+/// - Function keys F1–F12.
+///
+/// Returns an empty vec for keys we don't recognise (e.g. Caps Lock,
+/// media keys) so the caller can ignore unhandled events without panic.
+pub fn translate_key(event: KeyEvent) -> Vec<u8> {
+    let m = event.modifiers;
+    match event.code {
+        KeyCode::Char(c) => translate_char(c, m),
+        KeyCode::Enter => prefix_alt(m, b"\r".to_vec()),
+        KeyCode::Tab => prefix_alt(m, b"\t".to_vec()),
+        KeyCode::BackTab => prefix_alt(m, b"\x1b[Z".to_vec()),
+        KeyCode::Backspace => prefix_alt(m, b"\x7f".to_vec()),
+        KeyCode::Esc => prefix_alt(m, b"\x1b".to_vec()),
+        KeyCode::Up => csi_arrow_or_modified(m, b'A'),
+        KeyCode::Down => csi_arrow_or_modified(m, b'B'),
+        KeyCode::Right => csi_arrow_or_modified(m, b'C'),
+        KeyCode::Left => csi_arrow_or_modified(m, b'D'),
+        KeyCode::Home => csi_arrow_or_modified(m, b'H'),
+        KeyCode::End => csi_arrow_or_modified(m, b'F'),
+        KeyCode::PageUp => csi_tilde_or_modified(m, 5),
+        KeyCode::PageDown => csi_tilde_or_modified(m, 6),
+        KeyCode::Insert => csi_tilde_or_modified(m, 2),
+        KeyCode::Delete => csi_tilde_or_modified(m, 3),
+        KeyCode::F(n) => function_key(n, m),
+        _ => Vec::new(),
+    }
+}
+
+fn translate_char(c: char, m: KeyModifiers) -> Vec<u8> {
+    // Ctrl-letter: A–Z, a–z. Mask off the high bits so 'a'/'A' → 0x01.
+    if m.contains(KeyModifiers::CONTROL) {
+        // Ctrl + special char fallbacks.
+        if let Some(b) = ctrl_special(c) {
+            return prefix_alt_extra(m, vec![b]);
+        }
+        if c.is_ascii_alphabetic() {
+            let b = (c.to_ascii_uppercase() as u8) & 0x1f;
+            return prefix_alt_extra(m, vec![b]);
+        }
+        // Other Ctrl combos (e.g. Ctrl+1) — fall through to plain char.
+    }
+
+    let mut bytes = c.to_string().into_bytes();
+    if m.contains(KeyModifiers::ALT) {
+        let mut out = Vec::with_capacity(bytes.len() + 1);
+        out.push(0x1b);
+        out.append(&mut bytes);
+        return out;
+    }
+    bytes
+}
+
+fn ctrl_special(c: char) -> Option<u8> {
+    // Two flavours of representation are mapped here:
+    //
+    // (a) The "logical" form (`'@'`, `'['`, `'\\'`, `']'`, `'^'`, `'_'`,
+    //     `'?'`, `' '`) — what an application would synthesize if it
+    //     constructed a `KeyEvent { code: Char('\\'), modifiers: CTRL }`.
+    //
+    // (b) The "raw" form (`'4'`, `'5'`, `'6'`, `'7'`) — what crossterm's
+    //     own legacy-mode parser emits for incoming control bytes
+    //     `0x1c..0x1f`. See the parser in
+    //     `crossterm-0.28.1/src/event/sys/unix/parse.rs` (the
+    //     `c @ b'\x1C'..=b'\x1F'` arm reports `Char((c - 0x1c) + b'4')
+    //     + CONTROL`). Without (b), real keyboard `Ctrl+\` never
+    //     produces 0x1c and the embedded-mode exit chord can't fire.
+    match c {
+        '@' | ' ' => Some(0x00), // Ctrl+@ and Ctrl+space both → NUL
+        '[' => Some(0x1b),
+        '\\' | '4' => Some(0x1c),
+        ']' | '5' => Some(0x1d),
+        '^' | '6' => Some(0x1e),
+        '_' | '?' | '7' => Some(0x1f),
+        _ => None,
+    }
+}
+
+fn prefix_alt(m: KeyModifiers, mut bytes: Vec<u8>) -> Vec<u8> {
+    if m.contains(KeyModifiers::ALT) {
+        let mut out = Vec::with_capacity(bytes.len() + 1);
+        out.push(0x1b);
+        out.append(&mut bytes);
+        out
+    } else {
+        bytes
+    }
+}
+
+fn prefix_alt_extra(m: KeyModifiers, bytes: Vec<u8>) -> Vec<u8> {
+    // For Ctrl-combos that also have Alt: prepend ESC to the control byte.
+    prefix_alt(m, bytes)
+}
+
+/// xterm modifier code per the standard:
+///   shift = 1, alt = 2, ctrl = 4 → bitmask + 1.
+/// No modifier → 1, which most parsers treat as "no modifier".
+fn xterm_modifier(m: KeyModifiers) -> u8 {
+    let mut bits: u8 = 0;
+    if m.contains(KeyModifiers::SHIFT) {
+        bits |= 1;
+    }
+    if m.contains(KeyModifiers::ALT) {
+        bits |= 2;
+    }
+    if m.contains(KeyModifiers::CONTROL) {
+        bits |= 4;
+    }
+    1 + bits
+}
+
+fn csi_arrow_or_modified(m: KeyModifiers, letter: u8) -> Vec<u8> {
+    let mod_code = xterm_modifier(m);
+    if mod_code == 1 {
+        vec![0x1b, b'[', letter]
+    } else {
+        // CSI 1 ; <mod> <letter>
+        format!("\x1b[1;{}{}", mod_code, letter as char).into_bytes()
+    }
+}
+
+fn csi_tilde_or_modified(m: KeyModifiers, n: u8) -> Vec<u8> {
+    let mod_code = xterm_modifier(m);
+    if mod_code == 1 {
+        format!("\x1b[{}~", n).into_bytes()
+    } else {
+        format!("\x1b[{};{}~", n, mod_code).into_bytes()
+    }
+}
+
+fn function_key(n: u8, m: KeyModifiers) -> Vec<u8> {
+    let mod_code = xterm_modifier(m);
+    // F1–F4 use SS3 ("\x1bO<letter>"); F5–F12 use CSI <code>~.
+    let unmodified: Vec<u8> = match n {
+        1 => b"\x1bOP".to_vec(),
+        2 => b"\x1bOQ".to_vec(),
+        3 => b"\x1bOR".to_vec(),
+        4 => b"\x1bOS".to_vec(),
+        5 => b"\x1b[15~".to_vec(),
+        6 => b"\x1b[17~".to_vec(),
+        7 => b"\x1b[18~".to_vec(),
+        8 => b"\x1b[19~".to_vec(),
+        9 => b"\x1b[20~".to_vec(),
+        10 => b"\x1b[21~".to_vec(),
+        11 => b"\x1b[23~".to_vec(),
+        12 => b"\x1b[24~".to_vec(),
+        _ => return Vec::new(),
+    };
+    if mod_code == 1 {
+        return unmodified;
+    }
+    // For modified F-keys, xterm uses the "1;<mod>" form for F1–F4 and a
+    // "<code>;<mod>~" form for F5+. Translate accordingly.
+    match n {
+        1 => format!("\x1b[1;{}P", mod_code).into_bytes(),
+        2 => format!("\x1b[1;{}Q", mod_code).into_bytes(),
+        3 => format!("\x1b[1;{}R", mod_code).into_bytes(),
+        4 => format!("\x1b[1;{}S", mod_code).into_bytes(),
+        5 => format!("\x1b[15;{}~", mod_code).into_bytes(),
+        6 => format!("\x1b[17;{}~", mod_code).into_bytes(),
+        7 => format!("\x1b[18;{}~", mod_code).into_bytes(),
+        8 => format!("\x1b[19;{}~", mod_code).into_bytes(),
+        9 => format!("\x1b[20;{}~", mod_code).into_bytes(),
+        10 => format!("\x1b[21;{}~", mod_code).into_bytes(),
+        11 => format!("\x1b[23;{}~", mod_code).into_bytes(),
+        12 => format!("\x1b[24;{}~", mod_code).into_bytes(),
+        _ => Vec::new(),
+    }
+}
 
 /// Shared `vt100::Parser` — written to by the reader thread and read
 /// from by the renderer (UI thread). Wrapped so we can hand a clone to
@@ -116,6 +299,238 @@ fn vt_to_ratatui_color(c: vt100::Color) -> Option<Color> {
         vt100::Color::Idx(15) => Some(Color::White),
         vt100::Color::Idx(n) => Some(Color::Indexed(n)),
         vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+    }
+}
+
+#[cfg(test)]
+mod key_translate_tests {
+    use super::translate_key;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn ev(code: KeyCode, m: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: m,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn plain_char_a() {
+        assert_eq!(translate_key(ev(KeyCode::Char('a'), KeyModifiers::NONE)), b"a");
+    }
+
+    #[test]
+    fn shift_char_uppercase() {
+        // crossterm gives us the shifted char already, so 'A' goes through as-is.
+        assert_eq!(
+            translate_key(ev(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            b"A"
+        );
+    }
+
+    #[test]
+    fn ctrl_letter_a_to_soh() {
+        assert_eq!(
+            translate_key(ev(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            &[0x01]
+        );
+    }
+
+    #[test]
+    fn ctrl_letter_c_to_etx() {
+        assert_eq!(
+            translate_key(ev(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            &[0x03]
+        );
+    }
+
+    #[test]
+    fn ctrl_letter_works_for_uppercase_too() {
+        // Some terminals report Ctrl+C as ('C', SHIFT|CONTROL); we treat
+        // alphabetic case identically.
+        assert_eq!(
+            translate_key(ev(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            &[0x03]
+        );
+    }
+
+    #[test]
+    fn ctrl_backslash_to_fs_logical_form() {
+        // The exit-chord prefix in its "logical" form, i.e. when a
+        // KeyEvent is constructed with `Char('\\')` and CONTROL.
+        assert_eq!(
+            translate_key(ev(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
+            &[0x1c]
+        );
+    }
+
+    #[test]
+    fn ctrl_backslash_to_fs_raw_form() {
+        // What crossterm's parser actually produces for the user
+        // physically pressing Ctrl+\ on the keyboard. This is the
+        // codepath the exit chord depends on at runtime; without this
+        // mapping, real Ctrl+\ would emit literal "4".
+        assert_eq!(
+            translate_key(ev(KeyCode::Char('4'), KeyModifiers::CONTROL)),
+            &[0x1c]
+        );
+    }
+
+    #[test]
+    fn ctrl_left_bracket_to_esc() {
+        assert_eq!(
+            translate_key(ev(KeyCode::Char('['), KeyModifiers::CONTROL)),
+            &[0x1b]
+        );
+    }
+
+    #[test]
+    fn ctrl_raw_forms_for_1c_through_1f() {
+        // Codex review: crossterm 0.28 reports incoming bytes 0x1c..0x1f
+        // as Char('4')..Char('7') + CONTROL. Cover all four to guard
+        // against regression.
+        assert_eq!(
+            translate_key(ev(KeyCode::Char('4'), KeyModifiers::CONTROL)),
+            &[0x1c]
+        );
+        assert_eq!(
+            translate_key(ev(KeyCode::Char('5'), KeyModifiers::CONTROL)),
+            &[0x1d]
+        );
+        assert_eq!(
+            translate_key(ev(KeyCode::Char('6'), KeyModifiers::CONTROL)),
+            &[0x1e]
+        );
+        assert_eq!(
+            translate_key(ev(KeyCode::Char('7'), KeyModifiers::CONTROL)),
+            &[0x1f]
+        );
+    }
+
+    #[test]
+    fn alt_a_prepends_esc() {
+        assert_eq!(
+            translate_key(ev(KeyCode::Char('a'), KeyModifiers::ALT)),
+            &[0x1b, b'a']
+        );
+    }
+
+    #[test]
+    fn tab_is_ht() {
+        assert_eq!(translate_key(ev(KeyCode::Tab, KeyModifiers::NONE)), b"\t");
+    }
+
+    #[test]
+    fn backtab_is_csi_z() {
+        assert_eq!(
+            translate_key(ev(KeyCode::BackTab, KeyModifiers::NONE)),
+            b"\x1b[Z"
+        );
+    }
+
+    #[test]
+    fn enter_is_cr() {
+        assert_eq!(translate_key(ev(KeyCode::Enter, KeyModifiers::NONE)), b"\r");
+    }
+
+    #[test]
+    fn backspace_is_del() {
+        assert_eq!(
+            translate_key(ev(KeyCode::Backspace, KeyModifiers::NONE)),
+            &[0x7f]
+        );
+    }
+
+    #[test]
+    fn esc_is_esc() {
+        assert_eq!(translate_key(ev(KeyCode::Esc, KeyModifiers::NONE)), &[0x1b]);
+    }
+
+    #[test]
+    fn arrow_up_unmodified() {
+        assert_eq!(translate_key(ev(KeyCode::Up, KeyModifiers::NONE)), b"\x1b[A");
+    }
+
+    #[test]
+    fn arrow_right_with_ctrl() {
+        // Ctrl = 4 bits → modifier code 5 → CSI 1;5C
+        assert_eq!(
+            translate_key(ev(KeyCode::Right, KeyModifiers::CONTROL)),
+            b"\x1b[1;5C"
+        );
+    }
+
+    #[test]
+    fn arrow_left_with_shift() {
+        // Shift = 1 bit → modifier code 2 → CSI 1;2D
+        assert_eq!(
+            translate_key(ev(KeyCode::Left, KeyModifiers::SHIFT)),
+            b"\x1b[1;2D"
+        );
+    }
+
+    #[test]
+    fn page_up_unmodified() {
+        assert_eq!(
+            translate_key(ev(KeyCode::PageUp, KeyModifiers::NONE)),
+            b"\x1b[5~"
+        );
+    }
+
+    #[test]
+    fn page_down_with_ctrl() {
+        assert_eq!(
+            translate_key(ev(KeyCode::PageDown, KeyModifiers::CONTROL)),
+            b"\x1b[6;5~"
+        );
+    }
+
+    #[test]
+    fn delete_unmodified() {
+        assert_eq!(
+            translate_key(ev(KeyCode::Delete, KeyModifiers::NONE)),
+            b"\x1b[3~"
+        );
+    }
+
+    #[test]
+    fn f1_is_ss3_p() {
+        assert_eq!(translate_key(ev(KeyCode::F(1), KeyModifiers::NONE)), b"\x1bOP");
+    }
+
+    #[test]
+    fn f5_is_csi_15_tilde() {
+        assert_eq!(
+            translate_key(ev(KeyCode::F(5), KeyModifiers::NONE)),
+            b"\x1b[15~"
+        );
+    }
+
+    #[test]
+    fn f12_is_csi_24_tilde() {
+        assert_eq!(
+            translate_key(ev(KeyCode::F(12), KeyModifiers::NONE)),
+            b"\x1b[24~"
+        );
+    }
+
+    #[test]
+    fn unknown_key_returns_empty() {
+        // Capslock/Pause/etc. We don't crash; we just send nothing.
+        assert!(translate_key(ev(KeyCode::CapsLock, KeyModifiers::NONE)).is_empty());
+    }
+
+    #[test]
+    fn unicode_char_is_utf8_encoded() {
+        assert_eq!(
+            translate_key(ev(KeyCode::Char('é'), KeyModifiers::NONE)),
+            "é".as_bytes()
+        );
     }
 }
 
