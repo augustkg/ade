@@ -41,6 +41,12 @@ fn k_ctrl(c: char) -> KeyEvent {
     key_press(KeyCode::Char(c), KeyModifiers::CONTROL)
 }
 
+/// The exit-chord prefix as a synthesized KeyEvent. Ctrl+Space is the
+/// Danish-friendly default; crossterm reports it as Char(' ') + CTRL.
+fn k_ctrl_space() -> KeyEvent {
+    key_press(KeyCode::Char(' '), KeyModifiers::CONTROL)
+}
+
 fn k_enter() -> KeyEvent {
     key_press(KeyCode::Enter, KeyModifiers::NONE)
 }
@@ -230,7 +236,7 @@ fn acceptance_full_embed_lifecycle() {
     );
 
     // ── Phase 6: exit via the chord ───────────────────────────────
-    app.handle_key(k_ctrl('4')); // crossterm form for Ctrl+\
+    app.handle_key(k_ctrl_space()); // Ctrl+Space — the Danish-friendly chord prefix
     assert!(
         app.embedded_chord_pending(),
         "first chord byte should arm the chord state"
@@ -278,7 +284,7 @@ fn acceptance_full_embed_lifecycle() {
         );
 
     // ── Phase 9: cleanup ──────────────────────────────────────────
-    app.handle_key(k_ctrl('4'));
+    app.handle_key(k_ctrl_space());
     app.handle_key(k('q'));
     assert!(!app.embedded_active());
     drop(app);
@@ -349,7 +355,7 @@ fn acceptance_mouse_scroll_enters_copy_mode() {
     );
 
     // Cleanup
-    app.handle_key(k_ctrl('4'));
+    app.handle_key(k_ctrl_space());
     app.handle_key(k('q'));
     drop(app);
     drop(tmux);
