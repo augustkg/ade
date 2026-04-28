@@ -30,6 +30,42 @@ pub fn is_inside_tmux() -> bool {
     std::env::var("TMUX").is_ok() || std::env::var("TMUX_PANE").is_ok()
 }
 
+/// Run `tmux switch-client -t =<name>` to point the current tmux client at
+/// a different session. Used by preview mode to "hop into" a session
+/// without exec-replacing the ADE process — ADE's pane is hidden but
+/// stays alive, and the user returns via the default `prefix + L` binding
+/// (`switch-client -l`). The leading `=` in the target makes the match
+/// exact rather than treating `name` as a glob.
+pub fn switch_client(name: &str) -> Result<(), String> {
+    let target = format!("={}", name);
+    let out = std::process::Command::new("tmux")
+        .args(["switch-client", "-t", &target])
+        .output()
+        .map_err(|e| format!("tmux switch-client failed to spawn: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("tmux switch-client: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+/// `tmux display-message` to flash a small toast in the user's current
+/// tmux client. Used for the one-time "prefix+L returns to ADE" hint
+/// after the first preview hop. Returns `Err` on spawn or non-zero exit
+/// so the caller can avoid persisting the hint-shown flag for a hop the
+/// user never actually saw.
+pub fn display_message(text: &str) -> Result<(), String> {
+    let out = std::process::Command::new("tmux")
+        .args(["display-message", text])
+        .output()
+        .map_err(|e| format!("tmux display-message failed to spawn: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("tmux display-message: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
 /// When ADE is launched from inside tmux, returns the name of the session
 /// the calling pane belongs to. Uses `#{session_name}` — `#{client_session}`
 /// is empty when tmux is invoked as a subprocess (no client context), so
