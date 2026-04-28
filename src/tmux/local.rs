@@ -123,3 +123,21 @@ impl TmuxBackend for LocalTmux {
         }
     }
 }
+
+/// Capture the visible content of a session's active pane *with* ANSI
+/// escape sequences so the renderer can preserve color and styling.
+///
+/// `=name` makes the target match exact (no glob). Errors on tmux spawn
+/// failure or non-zero exit (e.g. session vanished).
+pub fn capture_pane(name: &str) -> Result<String, String> {
+    let target = format!("={}", name);
+    let out = Command::new("tmux")
+        .args(["capture-pane", "-e", "-p", "-t", &target])
+        .output()
+        .map_err(|e| format!("tmux capture-pane failed to spawn: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("tmux capture-pane: {}", stderr.trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}

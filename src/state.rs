@@ -13,6 +13,8 @@ pub struct State {
     pub tmux_install_nudge: NudgeState,
     #[serde(default)]
     pub folders: FoldersState,
+    #[serde(default)]
+    pub preview_pane: PreviewPaneState,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -28,6 +30,15 @@ pub struct FoldersState {
     /// `src/model.rs::Tree::group`.
     #[serde(default)]
     pub closed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PreviewPaneState {
+    /// User's saved preference for the right-side ambient preview panel.
+    /// Default `false` — the panel is opt-in. Toggled via `p` in the tree
+    /// view; the new value is persisted immediately.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl State {
@@ -87,12 +98,21 @@ mod tests {
         let mut original = State::default();
         original.tmux_install_nudge.dismissed = true;
         original.folders.closed = vec!["infra".to_string(), "work".to_string()];
+        original.preview_pane.enabled = true;
 
         let serialized = toml::to_string_pretty(&original).unwrap();
         let restored: State = toml::from_str(&serialized).unwrap();
 
         assert_eq!(restored.tmux_install_nudge.dismissed, true);
         assert_eq!(restored.folders.closed, vec!["infra".to_string(), "work".to_string()]);
+        assert!(restored.preview_pane.enabled);
+    }
+
+    #[test]
+    fn missing_preview_pane_section_defaults() {
+        let body = "[tmux_install_nudge]\ndismissed = true\n[folders]\nclosed = [\"work\"]\n";
+        let state: State = toml::from_str(body).unwrap();
+        assert!(!state.preview_pane.enabled);
     }
 
     #[test]

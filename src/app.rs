@@ -7,6 +7,7 @@ use crate::hosts::{Config, Host, HostKind};
 use crate::install_hooks;
 use crate::install_tmux::InstallStatus;
 use crate::model::{Machine, Row, Tree};
+use crate::preview_pane::{PreviewKey, PreviewPane};
 use crate::refresh::{refresh_all, RefreshResult};
 use crate::state::State;
 use crate::text_field::TextField;
@@ -321,6 +322,12 @@ pub struct App {
     /// nudge. Loaded from `~/.config/ade/state.toml` on launch and persisted
     /// when the user presses `x`.
     pub tmux_nudge_dismissed: bool,
+    /// Whether the right-side ambient preview pane is shown. Toggled with
+    /// `p` in tree state; persisted to `~/.config/ade/state.toml`.
+    pub preview_pane_enabled: bool,
+    /// Cache + worker pool for the preview pane. Populated only when
+    /// `preview_pane_enabled` is true.
+    pub preview_pane: PreviewPane,
     /// Transient banner shown at the top of the Hosts screen (install /
     /// retry results). Cleared on the next keypress in HostsList.
     pub hosts_notice: Option<Notice>,
@@ -363,6 +370,8 @@ impl App {
             local_hooks_installed: false,
             local_tmux_config_status: InstallStatus::Missing,
             tmux_nudge_dismissed: persisted.tmux_install_nudge.dismissed,
+            preview_pane_enabled: persisted.preview_pane.enabled,
+            preview_pane: PreviewPane::new(),
             hosts_notice: None,
             pending_refresh: None,
             last_refresh_started: Instant::now(),
@@ -456,6 +465,14 @@ impl App {
             }
         }
 
+        // Preview pane lives on its own short cadence (~500ms) keyed by
+        // the highlighted session, separate from the 2s session-list
+        // refresh. Skip work entirely when the pane is off.
+        if self.preview_pane_enabled {
+            let target = self.preview_target();
+            self.preview_pane.tick(target.as_ref(), &self.config.hosts);
+        }
+
         if self.pending_refresh.is_none()
             && self.last_refresh_started.elapsed() >= AUTO_REFRESH_INTERVAL
         {
@@ -490,6 +507,30 @@ impl App {
         let mut state = State::load();
         state.tmux_install_nudge.dismissed = true;
         let _ = state.save();
+    }
+
+    /// Toggle the right-side ambient preview pane and persist the new
+    /// value. Default is off; on each toggle we save immediately so the
+    /// preference survives quitting.
+    fn toggle_preview_pane(&mut self) {
+        self.preview_pane_enabled = !self.preview_pane_enabled;
+        let mut state = State::load();
+        state.preview_pane.enabled = self.preview_pane_enabled;
+        let _ = state.save();
+    }
+
+    /// The session currently under the cursor, expressed as a `PreviewKey`,
+    /// or `None` for non-Session rows / no selection. Used by the preview
+    /// pane scheduler in `tick`.
+    pub fn preview_target(&self) -> Option<PreviewKey> {
+        let Row::Session(idx) = self.current_row()? else {
+            return None;
+        };
+        let session = self.tree.session(idx)?;
+        Some(PreviewKey {
+            machine: session.machine.clone(),
+            name: session.raw_name.clone(),
+        })
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -598,6 +639,9 @@ impl App {
                 if self.should_show_tmux_nudge() {
                     self.dismiss_tmux_nudge();
                 }
+            }
+            KeyCode::Char('p') => {
+                self.toggle_preview_pane();
             }
             _ => {}
         }
