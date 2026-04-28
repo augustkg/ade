@@ -4,8 +4,11 @@ mod cwd;
 mod debug;
 mod hosts;
 mod install_hooks;
+mod install_tmux;
 mod model;
 mod refresh;
+mod ssh_io;
+mod state;
 mod text_field;
 mod theme;
 mod tmux;
@@ -31,6 +34,7 @@ fn main() -> Result<()> {
     if argv.len() >= 2 {
         match argv[1].as_str() {
             "install-hooks" => return run_install_hooks(&argv[2..]),
+            "install-tmux-config" => return run_install_tmux(&argv[2..]),
             "debug" => return run_debug(&argv[2..]),
             "--help" | "-h" | "help" => {
                 print_usage();
@@ -67,12 +71,12 @@ fn print_usage() {
         "ade — Agentic Development Environment\n\
          \n\
          Usage:\n\
-         \x20\x20ade                          Launch the TUI\n\
-         \x20\x20ade install-hooks            Install Claude Code status hooks locally\n\
-         \x20\x20ade install-hooks --host H   Install hooks on a configured remote host\n\
-         \x20\x20ade debug claude             Diagnose why ADE does/doesn't see Claude per pane\n\
-         \x20\x20ade debug claude --host H    Same, scoped to one configured host (or 'local')\n\
-         \x20\x20ade help                     Show this message"
+         \x20\x20ade                                    Launch the TUI\n\
+         \x20\x20ade install-hooks [--host H]           Install Claude Code status hooks (local or remote)\n\
+         \x20\x20ade install-tmux-config [--host H]     Install tmux clipboard config (local or remote)\n\
+         \x20\x20ade install-tmux-config --uninstall    Remove the tmux clipboard config\n\
+         \x20\x20ade debug claude [--host H]            Diagnose why ADE does/doesn't see Claude per pane\n\
+         \x20\x20ade help                               Show this message"
     );
 }
 
@@ -143,6 +147,95 @@ fn run_install_hooks(args: &[String]) -> Result<()> {
         Some(name) => {
             let (config, _warning) = Config::load();
             install_hooks::install_remote(&config, &name)
+        }
+    };
+
+    match result {
+        Ok(msg) => {
+            println!("{}", msg);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_install_tmux(args: &[String]) -> Result<()> {
+    let mut host: Option<String> = None;
+    let mut uninstall = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --host requires a value");
+                    std::process::exit(2);
+                }
+                host = Some(args[i].clone());
+            }
+            "--uninstall" => uninstall = true,
+            other => {
+                eprintln!("Error: unknown argument '{}'", other);
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    if uninstall {
+        let result = match host {
+            None => install_tmux::uninstall_local()
+                .map(|r| ("local".to_string(), r.summary())),
+            Some(name) => {
+                let (config, _warning) = Config::load();
+                install_tmux::uninstall_remote(&config, &name)
+                    .map(|r| (name.clone(), r.summary()))
+            }
+        };
+        return match result {
+            Ok((target, msg)) => {
+                println!("{}: {}", target, msg);
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
+    }
+
+    let result = match host {
+        None => install_tmux::install_local().map(|r| {
+            let mut msg = format!("local: {}", r.summary());
+            if r.mouse_off {
+                msg.push_str(
+                    "\nWarning: detected `mouse off` in your tmux config. \
+                     ADE's clipboard config requires `mouse on` for drag-select-to-copy. \
+                     Remove or update that line, then reload tmux.",
+                );
+            }
+            if !r.is_noop() {
+                msg.push_str(
+                    "\nNext: run `tmux source-file ~/.tmux.conf` (or restart tmux) to apply.",
+                );
+            }
+            msg
+        }),
+        Some(name) => {
+            let (config, _warning) = Config::load();
+            install_tmux::install_remote(&config, &name).map(|r| {
+                let mut msg = format!("{}: {}", name, r.summary());
+                if !r.is_noop() {
+                    msg.push_str(
+                        "\nNext: on that host, run `tmux source-file ~/.tmux.conf` \
+                         (or restart tmux) to apply.",
+                    );
+                }
+                msg
+            })
         }
     };
 
