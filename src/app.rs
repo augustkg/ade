@@ -7,6 +7,7 @@ use crate::hosts::{Config, Host, HostKind};
 use crate::install_hooks;
 use crate::install_tmux::InstallStatus;
 use crate::model::{Machine, Row, Tree};
+use crate::preview_pane::{PreviewKey, PreviewPane};
 use crate::refresh::{refresh_all, RefreshResult};
 use crate::state::State;
 use crate::text_field::TextField;
@@ -321,17 +322,12 @@ pub struct App {
     /// nudge. Loaded from `~/.config/ade/state.toml` on launch and persisted
     /// when the user presses `x`.
     pub tmux_nudge_dismissed: bool,
-    /// Set by `preview_current` when Tab on a previewable session row is
-    /// pressed. The main loop in `src/main.rs::run` drains this each tick:
-    /// runs `tmux switch-client`, optionally emits the first-time hint,
-    /// then keeps looping. Must NOT be returned out of `run()` — that would
-    /// hit `ratatui::restore()` and tear down the alt-screen we want
-    /// preserved while ADE is hidden.
-    pub pending_preview: Option<(String, Machine)>,
-    /// Persisted in `~/.config/ade/state.toml`. Once a preview hop has
-    /// flashed the `prefix+L returns to ADE` hint via `tmux display-message`,
-    /// we don't repeat it on subsequent hops.
-    pub preview_hint_shown: bool,
+    /// Whether the right-side ambient preview pane is shown. Toggled with
+    /// `p` in tree state; persisted to `~/.config/ade/state.toml`.
+    pub preview_pane_enabled: bool,
+    /// Cache + worker pool for the preview pane. Populated only when
+    /// `preview_pane_enabled` is true.
+    pub preview_pane: PreviewPane,
     /// Transient banner shown at the top of the Hosts screen (install /
     /// retry results). Cleared on the next keypress in HostsList.
     pub hosts_notice: Option<Notice>,
@@ -374,8 +370,8 @@ impl App {
             local_hooks_installed: false,
             local_tmux_config_status: InstallStatus::Missing,
             tmux_nudge_dismissed: persisted.tmux_install_nudge.dismissed,
-            pending_preview: None,
-            preview_hint_shown: persisted.preview_hint.shown,
+            preview_pane_enabled: persisted.preview_pane.enabled,
+            preview_pane: PreviewPane::new(),
             hosts_notice: None,
             pending_refresh: None,
             last_refresh_started: Instant::now(),
@@ -469,6 +465,14 @@ impl App {
             }
         }
 
+        // Preview pane lives on its own short cadence (~500ms) keyed by
+        // the highlighted session, separate from the 2s session-list
+        // refresh. Skip work entirely when the pane is off.
+        if self.preview_pane_enabled {
+            let target = self.preview_target();
+            self.preview_pane.tick(target.as_ref(), &self.config.hosts);
+        }
+
         if self.pending_refresh.is_none()
             && self.last_refresh_started.elapsed() >= AUTO_REFRESH_INTERVAL
         {
@@ -505,55 +509,28 @@ impl App {
         let _ = state.save();
     }
 
-    /// Called when the user presses Tab on a tree row. Decides whether the
-    /// new "hop into the session non-destructively" preview path applies,
-    /// or whether to fall back to mirroring Enter (full attach).
-    ///
-    /// Preview applies only to **local sessions while ADE is inside tmux**:
-    /// that's the only configuration where `tmux switch-client` works (a
-    /// remote session lives on a different tmux server we can't switch
-    /// the local client to, and outside tmux there's no client to switch).
-    /// In every other case Tab acts like Enter — the user pressed
-    /// something useful, do the obvious useful thing.
-    fn preview_current(&mut self) {
-        let Some(Row::Session(idx)) = self.current_row() else {
-            // Tab on a folder, NewSession row, or no selection: no-op.
-            // Folders already have Enter/o/space for expansion; we don't
-            // overload Tab on them.
-            return;
+    /// Toggle the right-side ambient preview pane and persist the new
+    /// value. Default is off; on each toggle we save immediately so the
+    /// preference survives quitting.
+    fn toggle_preview_pane(&mut self) {
+        self.preview_pane_enabled = !self.preview_pane_enabled;
+        let mut state = State::load();
+        state.preview_pane.enabled = self.preview_pane_enabled;
+        let _ = state.save();
+    }
+
+    /// The session currently under the cursor, expressed as a `PreviewKey`,
+    /// or `None` for non-Session rows / no selection. Used by the preview
+    /// pane scheduler in `tick`.
+    pub fn preview_target(&self) -> Option<PreviewKey> {
+        let Row::Session(idx) = self.current_row()? else {
+            return None;
         };
-        let Some(session) = self.tree.session(idx) else {
-            return;
-        };
-        let name = session.raw_name.clone();
-        let machine = session.machine.clone();
-
-        // Remote target → mirror Enter. ADE will exit and the user will
-        // be inside the remote session via mosh/ssh, like Enter today.
-        if matches!(machine, Machine::Remote(_)) {
-            self.action = AppAction::AttachSession { name, machine };
-            return;
-        }
-
-        // Local target. If ADE isn't inside tmux there's no client to
-        // switch — fall back to the full-attach path. (Q1 answer: "Tab
-        // just works".)
-        if !tmux::is_inside_tmux() {
-            self.action = AppAction::AttachSession { name, machine };
-            return;
-        }
-
-        // Local target, inside tmux: the actual preview path. Same-session
-        // is a notice + stay in ADE — switch-client to the session you're
-        // already in is a silent no-op, so we'd quietly do nothing
-        // otherwise.
-        if tmux::current_session().as_deref() == Some(name.as_str()) {
-            self.error_message =
-                Some(format!("Already in session {} — preview is a no-op here.", name));
-            return;
-        }
-
-        self.pending_preview = Some((name, machine));
+        let session = self.tree.session(idx)?;
+        Some(PreviewKey {
+            machine: session.machine.clone(),
+            name: session.raw_name.clone(),
+        })
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -663,10 +640,8 @@ impl App {
                     self.dismiss_tmux_nudge();
                 }
             }
-            KeyCode::Tab => {
-                if self.focus_area == FocusArea::SessionList {
-                    self.preview_current();
-                }
+            KeyCode::Char('p') => {
+                self.toggle_preview_pane();
             }
             _ => {}
         }
