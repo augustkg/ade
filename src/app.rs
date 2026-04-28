@@ -520,6 +520,28 @@ impl App {
         self.tree.visible_rows().get(self.selected_index).copied()
     }
 
+    /// Title to write to the outer terminal tab. Session rows produce
+    /// `folder/session | host` (or `session | host` for loose sessions);
+    /// every other state collapses to a static `"ade"`.
+    pub fn tab_title(&self) -> String {
+        if self.focus_area == FocusArea::TitleBar
+            || !matches!(self.state, AppState::Tree)
+        {
+            return "ade".to_string();
+        }
+        match self.current_row() {
+            Some(Row::Session(idx)) => match self.tree.session(idx) {
+                Some(s) => crate::term_title::format_session(
+                    s.prefix.as_deref(),
+                    &s.leaf,
+                    s.machine.title_label(),
+                ),
+                None => "ade".to_string(),
+            },
+            _ => "ade".to_string(),
+        }
+    }
+
     /// True when the in-TUI "tmux clipboard not configured" nudge should be
     /// rendered. Only shown when ADE is running inside tmux (otherwise the
     /// fix isn't relevant), the marker is missing locally, the user hasn't
