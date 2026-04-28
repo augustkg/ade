@@ -2,6 +2,7 @@ mod app;
 mod claude_status;
 mod cwd;
 mod debug;
+mod embedded_term;
 mod hosts;
 mod install_hooks;
 mod install_tmux;
