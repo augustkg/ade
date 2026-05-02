@@ -55,7 +55,7 @@ impl TmuxBackend for LocalTmux {
             .collect();
         let claude_pane_pids = claude_status::find_claude_pane_pids(&pane_pids, &ps_text);
 
-        let statuses = claude_status::read_local_statuses();
+        let statuses = claude_status::read_local_statuses_with_working_ttl();
         let claude_by_session = map_claude_states(&panes_text, &statuses, &claude_pane_pids);
 
         for s in &mut sessions {

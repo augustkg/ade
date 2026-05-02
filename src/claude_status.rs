@@ -11,6 +11,23 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
+
+/// Maximum age of a `state=working` cache file before we treat it as stale
+/// and downgrade to `Idle` at read time. The hooks ADE installs include
+/// `Stop`, `StopFailure`, `SessionEnd`, `Notification(idle_prompt)`, and
+/// `SessionStart` — between them, every legitimate idle transition writes
+/// the cache file fresh. A `working` file older than this constant means
+/// every one of those hooks failed to fire (or hasn't been installed yet)
+/// for a session that is no longer actively processing.
+///
+/// Set conservatively to absorb genuinely long turns (large compactions,
+/// long-running tool calls). Tunable here if real users hit it. The TTL is
+/// evaluated against the local file system mtime — local-only by design,
+/// to side-step clock drift between hosts. Remote sessions rely on the
+/// in-process Claude hooks (running with the remote's own clock) for
+/// idle-state cleanup.
+const WORKING_TTL: Duration = Duration::from_secs(4 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ClaudeState {
@@ -48,6 +65,48 @@ pub fn read_local_statuses() -> HashMap<String, ClaudeState> {
         };
         if let Some(state) = parse_status_body(&body) {
             out.insert(pane_id, state);
+        }
+    }
+    out
+}
+
+/// Same as `read_local_statuses` but applies a TTL to `Working` entries.
+///
+/// Reasoning: every legitimate "Claude is now idle" transition triggers one
+/// of our hooks (`Stop`, `StopFailure`, `SessionEnd`,
+/// `Notification(idle_prompt)`, `SessionStart`) which overwrites the cache
+/// file with `state=idle`. A `working` cache file that hasn't been touched
+/// in `WORKING_TTL` means *every* idle hook failed to fire — the most
+/// common cause being that the hooks weren't installed yet when the
+/// in-progress Claude session started, so it can't emit them retroactively.
+/// In that case we'd rather show "no chip" than a stale chip until the
+/// user submits another prompt.
+///
+/// Read-only — never modifies the cache file. The next legitimate hook
+/// firing (or `SessionStart` on Claude relaunch) will overwrite naturally.
+/// Local-only by design: `fs::metadata().modified()` is the local kernel's
+/// view of the local filesystem, with no clock-skew exposure that would
+/// false-demote on a host with a drifting clock.
+pub fn read_local_statuses_with_working_ttl() -> HashMap<String, ClaudeState> {
+    let mut out = read_local_statuses();
+    let Some(dir) = status_dir() else {
+        return out;
+    };
+    let now = SystemTime::now();
+    for (pane_id, state) in out.iter_mut() {
+        if !matches!(state, ClaudeState::Working) {
+            continue;
+        }
+        let path = dir.join(format!("{}.json", pane_id));
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let elapsed = now.duration_since(mtime).unwrap_or(Duration::ZERO);
+        if elapsed > WORKING_TTL {
+            *state = ClaudeState::Idle;
         }
     }
     out
@@ -181,4 +240,94 @@ where
 fn status_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     Some(home.join(".cache").join("ade").join("claude-status"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_status_body_working() {
+        let body = r#"{"state":"working","at":"2026-05-02T12:00:00Z"}"#;
+        assert_eq!(parse_status_body(body), Some(ClaudeState::Working));
+    }
+
+    #[test]
+    fn parse_status_body_idle() {
+        let body = r#"{"state":"idle","at":"2026-05-02T12:00:00Z"}"#;
+        assert_eq!(parse_status_body(body), Some(ClaudeState::Idle));
+    }
+
+    #[test]
+    fn parse_status_body_unknown_state() {
+        let body = r#"{"state":"thinking"}"#;
+        assert_eq!(parse_status_body(body), None);
+    }
+
+    #[test]
+    fn parse_status_body_garbage() {
+        assert_eq!(parse_status_body("not json"), None);
+        assert_eq!(parse_status_body(""), None);
+        assert_eq!(parse_status_body("{}"), None);
+    }
+
+    #[test]
+    fn parse_status_body_ignores_at_field() {
+        // The parser is intentionally agnostic to `at` — TTL is enforced via
+        // `read_local_statuses_with_working_ttl` using the file's mtime, not
+        // the embedded timestamp. This test pins that invariant.
+        let body = r#"{"state":"working","at":"not-a-real-timestamp"}"#;
+        assert_eq!(parse_status_body(body), Some(ClaudeState::Working));
+    }
+
+    #[test]
+    fn find_claude_pane_pids_descendant() {
+        // Pane 100's child 200 is `claude` — pane 100 should be flagged.
+        // Pane 300's tree has no claude — should not be flagged.
+        let ps = "\
+100 1 zsh\n\
+200 100 claude\n\
+300 1 zsh\n\
+400 300 vim\n";
+        let pids = vec![100, 300];
+        let result = find_claude_pane_pids(&pids, ps);
+        assert!(result.contains(&100));
+        assert!(!result.contains(&300));
+    }
+
+    #[test]
+    fn find_claude_pane_pids_handles_pid_cycle() {
+        // Synthetic ps with a parent-child cycle: 100 -> 200 -> 100. The
+        // per-root visited set must short-circuit instead of looping
+        // forever. No claude in this tree — result must be empty.
+        let ps = "\
+100 200 zsh\n\
+200 100 zsh\n";
+        let pids = vec![100];
+        let result = find_claude_pane_pids(&pids, ps);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn find_claude_pane_pids_pane_itself_is_claude() {
+        // The pane root pid IS claude — should be flagged.
+        let ps = "100 1 claude\n";
+        let pids = vec![100];
+        let result = find_claude_pane_pids(&pids, ps);
+        assert!(result.contains(&100));
+    }
+
+    #[test]
+    fn parse_remote_statuses_round_trip() {
+        let text = "\
+%5\n\
+{\"state\":\"working\"}\n\
+---ADE-STATUS-END---\n\
+%17\n\
+{\"state\":\"idle\"}\n\
+---ADE-STATUS-END---\n";
+        let result = parse_remote_statuses(text);
+        assert_eq!(result.get("%5"), Some(&ClaudeState::Working));
+        assert_eq!(result.get("%17"), Some(&ClaudeState::Idle));
+    }
 }
