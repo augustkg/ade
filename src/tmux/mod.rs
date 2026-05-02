@@ -103,10 +103,16 @@ pub(crate) fn parse_pane_line(line: &str) -> Option<(String, String, String, u32
 }
 
 /// Join `list-panes -a` output with the per-pane status map and return a map
-/// of `session_name → ClaudeState`. A pane is considered to be running Claude
-/// if either `pane_current_command` is `claude` OR `pane_pid` is in the
-/// descendant set built from a `ps` walk (catches shell-wrapped or
-/// background-launched Claude processes). Roll-up: Working > Idle.
+/// of `session_name → ClaudeState`. A session is included in the result only
+/// when at least one of its panes is **actively working** — i.e. has a
+/// `claude` process in its descendant tree AND a `state=working` status
+/// file. Idle panes (Claude loaded but waiting at the prompt) and panes
+/// with no status file at all are intentionally skipped, so the `claude`
+/// chip in the UI lights up only while a turn is in progress.
+///
+/// A pane is considered to be running Claude if either `pane_current_command`
+/// is `claude` OR `pane_pid` is in the descendant set built from a `ps`
+/// walk (catches shell-wrapped or background-launched Claude processes).
 pub(crate) fn map_claude_states(
     panes_text: &str,
     statuses: &std::collections::HashMap<String, ClaudeState>,
@@ -121,10 +127,15 @@ pub(crate) fn map_claude_states(
         if !is_claude {
             continue;
         }
-        // Default to Idle when no status file exists yet (hooks not installed
-        // or claude hasn't received its first prompt). Working only when the
-        // hook explicitly recorded it.
-        let state = statuses.get(&pane_id).copied().unwrap_or(ClaudeState::Idle);
+        // Only surface Working. A missing status file (hooks not installed
+        // yet, or hooks installed but no prompt submitted) is treated the
+        // same as Idle: no working signal observed → no chip.
+        let Some(state) = statuses.get(&pane_id).copied() else {
+            continue;
+        };
+        if !matches!(state, ClaudeState::Working) {
+            continue;
+        }
         out.entry(session)
             .and_modify(|cur| {
                 if state > *cur {
