@@ -357,12 +357,15 @@ fn render_session_row(
 }
 
 /// Small ` claude ` chip used on session and folder rows.
-/// - **Working**: peach background, bold dark text — Claude is actively
-///   processing a turn (the `UserPromptSubmit` hook fired and no `Stop`
-///   has fired since).
-/// - **Idle**: subtle gray-overlay background — Claude is loaded in the
-///   pane but waiting at the prompt (or hooks aren't installed and we're
-///   defaulting to idle).
+///
+/// Renders only for `Working` — Claude is actively processing a turn (the
+/// `UserPromptSubmit` hook fired and no `Stop` / `SessionEnd` /
+/// `Notification(idle_prompt)` has fired since). Idle Claude (loaded but
+/// waiting at the prompt) does not render — `tmux::map_claude_states`
+/// already drops Idle upstream, so this match never sees it in practice.
+/// The Idle arm exists only as a typesafety barrier; if a future refactor
+/// leaks an `Idle` here we render nothing — silent suppression beats a
+/// false-positive chip.
 fn claude_chip(state: ClaudeState) -> Span<'static> {
     match state {
         ClaudeState::Working => Span::styled(
@@ -372,12 +375,7 @@ fn claude_chip(state: ClaudeState) -> Span<'static> {
                 .bg(theme::PEACH)
                 .add_modifier(Modifier::BOLD),
         ),
-        ClaudeState::Idle => Span::styled(
-            " claude ",
-            Style::default()
-                .fg(theme::SUBTEXT0)
-                .bg(theme::SURFACE1),
-        ),
+        ClaudeState::Idle => Span::raw(""),
     }
 }
 

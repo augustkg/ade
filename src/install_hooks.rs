@@ -110,6 +110,21 @@ enum EventChange {
     NoOp,
 }
 
+/// One ADE-owned hook entry to install under `hooks.<event>[]` in
+/// `~/.claude/settings.json`. `matcher` is `Some` only for events that
+/// require it per the canonical hook docs at
+/// `https://code.claude.com/docs/en/hooks` — currently `Notification` is
+/// the only one we install with a matcher. For events without a matcher
+/// the canonical entry shape is `{ "hooks": [...] }`; with a matcher it
+/// becomes `{ "matcher": "...", "hooks": [...] }`. `find_marker_entry`
+/// disambiguates so re-installs don't collide across different matchers
+/// on the same event.
+struct HookEvent {
+    event: &'static str,
+    matcher: Option<&'static str>,
+    command: &'static str,
+}
+
 /// The set of Claude Code hook events ADE owns. Adding a new event is a
 /// single-line change here; `merge_hooks` iterates this list and the
 /// summary/no-op logic falls out automatically. `IDLE_CMD` is reused for
@@ -121,12 +136,21 @@ enum EventChange {
 /// - `StopFailure` → idle (turn failed with API error: rate_limit,
 ///   authentication_failed, server_error, etc. — `Stop` does not fire here)
 /// - `SessionEnd` → idle (session exited normally: /clear, /resume, plain
-///   exit. Does NOT cover `kill -9` — see process-aliveness follow-up)
-const HOOK_EVENTS: &[(&str, &str)] = &[
-    ("UserPromptSubmit", WORKING_CMD),
-    ("Stop", IDLE_CMD),
-    ("StopFailure", IDLE_CMD),
-    ("SessionEnd", IDLE_CMD),
+///   exit; see canonical reasons list at the docs URL above)
+/// - `SessionStart` → idle (Claude Code starts a new session or resumes;
+///   overrides any inherited stale `working` from a previous occupant of
+///   this pane id)
+/// - `Notification` matcher `idle_prompt` → idle (Claude is ready for a
+///   new prompt — fires in cases where Stop/StopFailure/SessionEnd may
+///   not, e.g. an interrupted turn that leaves Claude back at the prompt
+///   without a graceful turn-end event)
+const HOOK_EVENTS: &[HookEvent] = &[
+    HookEvent { event: "UserPromptSubmit", matcher: None, command: WORKING_CMD },
+    HookEvent { event: "Stop", matcher: None, command: IDLE_CMD },
+    HookEvent { event: "StopFailure", matcher: None, command: IDLE_CMD },
+    HookEvent { event: "SessionEnd", matcher: None, command: IDLE_CMD },
+    HookEvent { event: "SessionStart", matcher: None, command: IDLE_CMD },
+    HookEvent { event: "Notification", matcher: Some("idle_prompt"), command: IDLE_CMD },
 ];
 
 #[derive(Debug, Default)]
@@ -189,22 +213,26 @@ fn merge_hooks(mut settings: Value) -> (Value, InstallAction) {
     }
 
     let hooks_obj = hooks.as_object_mut().unwrap();
-    for (event_name, command) in HOOK_EVENTS {
-        let change = ensure_event(hooks_obj, event_name, command);
-        action.record(event_name, change);
+    for he in HOOK_EVENTS {
+        let change = ensure_event(hooks_obj, he.event, he.matcher, he.command);
+        action.record(he.event, change);
     }
 
     (settings, action)
 }
 
 /// Ensure the given event's array contains the canonical ADE entry with the
-/// expected `command` string. Returns `Added` if no marker entry existed,
-/// `Updated` if a stale ADE entry was replaced (different command), or `NoOp`
-/// if the existing ADE entry already matched. Non-ADE entries are never
-/// touched.
+/// expected `matcher` and `command`. Returns `Added` if no marker entry
+/// existed for this matcher, `Updated` if a stale ADE entry was replaced,
+/// or `NoOp` if the existing ADE entry already matched. Non-ADE entries
+/// are never touched. Entries on the same event but with different
+/// matchers (e.g. our future `Notification[matcher=foo]` vs an existing
+/// `Notification[matcher=bar]`) are also untouched — `find_marker_entry`
+/// disambiguates by both marker and matcher value.
 fn ensure_event(
     hooks_obj: &mut serde_json::Map<String, Value>,
     event: &str,
+    matcher: Option<&str>,
     command: &str,
 ) -> EventChange {
     let arr = hooks_obj
@@ -215,13 +243,21 @@ fn ensure_event(
     }
     let arr = arr.as_array_mut().unwrap();
 
-    let canonical = json!({
-        "hooks": [
-            { "type": "command", "command": command }
-        ]
-    });
+    let canonical = match matcher {
+        Some(m) => json!({
+            "matcher": m,
+            "hooks": [
+                { "type": "command", "command": command }
+            ]
+        }),
+        None => json!({
+            "hooks": [
+                { "type": "command", "command": command }
+            ]
+        }),
+    };
 
-    match find_marker_entry(arr) {
+    match find_marker_entry(arr, matcher) {
         Some(idx) => {
             if arr[idx] == canonical {
                 EventChange::NoOp
@@ -238,9 +274,22 @@ fn ensure_event(
 }
 
 /// Find the index of the first entry whose nested `hooks[].command` contains
-/// our marker — i.e., the ADE-owned entry that we may need to update.
-fn find_marker_entry(arr: &[Value]) -> Option<usize> {
+/// our marker AND whose `matcher` field equals `matcher` — i.e., the
+/// ADE-owned entry for this specific (event, matcher) tuple. Matching by
+/// matcher is what lets two ADE entries share an event (e.g. a hypothetical
+/// `Notification` with `idle_prompt` and another with `permission_prompt`)
+/// without colliding on re-install.
+fn find_marker_entry(arr: &[Value], matcher: Option<&str>) -> Option<usize> {
     for (i, entry) in arr.iter().enumerate() {
+        let entry_matcher = entry.get("matcher").and_then(|m| m.as_str());
+        let matcher_ok = match (matcher, entry_matcher) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        if !matcher_ok {
+            continue;
+        }
         let Some(inner) = entry.get("hooks").and_then(|h| h.as_array()) else {
             continue;
         };
@@ -368,4 +417,193 @@ fn ssh_write_settings(host: &Host, body: &str) -> Result<(), String> {
     // or any remote tooling beyond a POSIX shell.
     let remote_cmd = "mkdir -p ~/.claude && cat > ~/.claude/settings.json.tmp && mv ~/.claude/settings.json.tmp ~/.claude/settings.json";
     ssh_io::run_with_stdin(host, remote_cmd, body.as_bytes()).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_event_present(
+        settings: &Value,
+        event: &str,
+        expected_matcher: Option<&str>,
+        expected_command_substring: &str,
+    ) {
+        let arr = settings
+            .get("hooks")
+            .and_then(|h| h.get(event))
+            .and_then(|a| a.as_array())
+            .unwrap_or_else(|| panic!("expected hooks.{} array", event));
+        let matched = arr.iter().find(|entry| {
+            let m = entry.get("matcher").and_then(|m| m.as_str());
+            let matcher_ok = match (expected_matcher, m) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            if !matcher_ok {
+                return false;
+            }
+            entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|inner| {
+                    inner.iter().any(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.contains(expected_command_substring))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        });
+        assert!(
+            matched.is_some(),
+            "expected {} entry with matcher {:?} containing {:?}, got: {}",
+            event,
+            expected_matcher,
+            expected_command_substring,
+            serde_json::to_string_pretty(arr).unwrap()
+        );
+    }
+
+    #[test]
+    fn merge_hooks_into_empty_settings_adds_all_events() {
+        let (settings, action) = merge_hooks(json!({}));
+        assert!(!action.is_noop(), "first install should not be noop");
+        // Each ADE-owned event must end up present, with the right matcher
+        // shape per the canonical hook docs.
+        assert_event_present(&settings, "UserPromptSubmit", None, MARKER);
+        assert_event_present(&settings, "Stop", None, MARKER);
+        assert_event_present(&settings, "StopFailure", None, MARKER);
+        assert_event_present(&settings, "SessionEnd", None, MARKER);
+        assert_event_present(&settings, "SessionStart", None, MARKER);
+        assert_event_present(&settings, "Notification", Some("idle_prompt"), MARKER);
+    }
+
+    #[test]
+    fn merge_hooks_is_idempotent() {
+        let (first_pass, _) = merge_hooks(json!({}));
+        let (second_pass, action) = merge_hooks(first_pass.clone());
+        assert!(action.is_noop(), "second pass must be a noop");
+        assert_eq!(
+            first_pass, second_pass,
+            "second-pass JSON must be byte-identical to first-pass"
+        );
+    }
+
+    #[test]
+    fn merge_hooks_preserves_user_notification_with_different_matcher() {
+        // User has their own `Notification[matcher=permission_prompt]` entry
+        // (no ADE marker). ADE installs `Notification[matcher=idle_prompt]`.
+        // Both must coexist after install.
+        let user_entry = json!({
+            "matcher": "permission_prompt",
+            "hooks": [{ "type": "command", "command": "/path/to/user-permission-prompt.sh" }]
+        });
+        let initial = json!({
+            "hooks": {
+                "Notification": [user_entry.clone()]
+            }
+        });
+        let (settings, _) = merge_hooks(initial);
+        let arr = settings
+            .get("hooks")
+            .and_then(|h| h.get("Notification"))
+            .and_then(|a| a.as_array())
+            .unwrap();
+        // User's entry untouched
+        assert!(
+            arr.iter().any(|e| *e == user_entry),
+            "user's permission_prompt entry was disturbed; got: {}",
+            serde_json::to_string_pretty(arr).unwrap()
+        );
+        // ADE's idle_prompt entry added alongside
+        assert_event_present(&settings, "Notification", Some("idle_prompt"), MARKER);
+    }
+
+    #[test]
+    fn merge_hooks_preserves_user_notification_without_matcher() {
+        // User has a `Notification` entry with no matcher (fires on every
+        // notification type). ADE installs `Notification[matcher=idle_prompt]`.
+        // The unmatched user entry is matcher-distinct from ADE's, so it
+        // must survive untouched.
+        let user_entry = json!({
+            "hooks": [{ "type": "command", "command": "/path/to/user-no-matcher.sh" }]
+        });
+        let initial = json!({
+            "hooks": {
+                "Notification": [user_entry.clone()]
+            }
+        });
+        let (settings, _) = merge_hooks(initial);
+        let arr = settings
+            .get("hooks")
+            .and_then(|h| h.get("Notification"))
+            .and_then(|a| a.as_array())
+            .unwrap();
+        assert!(
+            arr.iter().any(|e| *e == user_entry),
+            "user's no-matcher entry was disturbed; got: {}",
+            serde_json::to_string_pretty(arr).unwrap()
+        );
+        assert_event_present(&settings, "Notification", Some("idle_prompt"), MARKER);
+    }
+
+    #[test]
+    fn merge_hooks_updates_stale_ade_entry() {
+        // A previous ADE version's marker entry is present but with a stale
+        // command. Install must REPLACE it (not duplicate). This protects
+        // against "update ADE → cache file commands stay outdated".
+        let mut settings = json!({});
+        let (initial, _) = merge_hooks(settings);
+        settings = initial;
+        // Tamper with the Stop entry's command so it looks stale.
+        let stop_arr = settings
+            .get_mut("hooks")
+            .unwrap()
+            .get_mut("Stop")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        stop_arr[0]["hooks"][0]["command"] =
+            json!("true ade-status-marker; echo OUTDATED");
+        let (updated, action) = merge_hooks(settings);
+        assert!(!action.is_noop(), "stale entry must trigger an update");
+        let updated_arr = updated
+            .get("hooks")
+            .and_then(|h| h.get("Stop"))
+            .and_then(|a| a.as_array())
+            .unwrap();
+        assert_eq!(
+            updated_arr.len(),
+            1,
+            "no duplicate Stop entry should be appended"
+        );
+        let cmd = updated_arr[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            cmd.contains("idle"),
+            "Stop command should be the canonical IDLE_CMD; got: {}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn find_marker_entry_distinguishes_matcher() {
+        let arr = vec![
+            json!({
+                "matcher": "permission_prompt",
+                "hooks": [{ "type": "command", "command": "true ade-status-marker; A" }]
+            }),
+            json!({
+                "matcher": "idle_prompt",
+                "hooks": [{ "type": "command", "command": "true ade-status-marker; B" }]
+            }),
+        ];
+        // Looking for the idle_prompt one — should land on index 1, not 0.
+        assert_eq!(find_marker_entry(&arr, Some("idle_prompt")), Some(1));
+        assert_eq!(find_marker_entry(&arr, Some("permission_prompt")), Some(0));
+        // Looking for an entry with no matcher — neither matches.
+        assert_eq!(find_marker_entry(&arr, None), None);
+    }
 }
