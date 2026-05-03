@@ -9,6 +9,7 @@ mod hosts;
 mod install_hooks;
 mod install_tmux;
 mod model;
+mod notifications;
 mod preview_pane;
 mod refresh;
 mod ssh_io;

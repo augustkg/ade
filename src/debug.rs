@@ -10,16 +10,16 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use crate::claude_status::{self, ClaudeState};
+use crate::claude_status::{self, ClaudeState, Provenance};
 use crate::hosts::{Config, Host, HostKind};
 use crate::install_hooks;
 use crate::tmux::parse_pane_line;
 
 const PANE_FORMAT: &str =
-    "#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}";
+    "#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}\t#{session_id}";
 
 const REMOTE_DEBUG_CMD: &str = concat!(
-    "tmux list-panes -a -F '#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}' 2>/dev/null; ",
+    "tmux list-panes -a -F '#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}\t#{session_id}' 2>/dev/null; ",
     "echo '---ADE-PS---'; ",
     "ps -A -o pid,ppid,comm 2>/dev/null; ",
     "echo '---ADE-STATUS---'; ",
@@ -30,7 +30,7 @@ const REMOTE_DEBUG_CMD: &str = concat!(
     "  printf '\\n---ADE-STATUS-END---\\n'; ",
     "done; ",
     "echo '---ADE-HOOKS---'; ",
-    "if grep -q ade-status-marker \"$HOME\"/.claude/settings.json 2>/dev/null; then echo OK; else echo MISSING; fi"
+    "if grep -q ade-status-marker-v2 \"$HOME\"/.claude/settings.json 2>/dev/null; then echo OK; else echo MISSING; fi"
 );
 
 const SSH_OPTS: &[&str] = &[
@@ -71,7 +71,10 @@ fn print_local() {
     println!("=== local ===");
     let panes_text = capture("tmux", &["list-panes", "-a", "-F", PANE_FORMAT]);
     let ps_text = capture("ps", &["-A", "-o", "pid,ppid,comm"]);
-    let statuses = claude_status::read_local_statuses();
+    // Use the TTL-aware reader so the debug output reflects the same state
+    // ADE actually sees (otherwise stale `working` cache files would appear
+    // active in debug but absent in the TUI, which is confusing).
+    let statuses = claude_status::read_local_statuses_with_working_ttl();
     let hooks_installed = install_hooks::is_installed_local();
     print_section(&panes_text, &ps_text, &statuses, Some(hooks_installed));
 }
@@ -123,10 +126,10 @@ fn print_remote(host: &Host) {
 fn print_section(
     panes_text: &str,
     ps_text: &str,
-    statuses: &HashMap<String, ClaudeState>,
+    statuses: &HashMap<String, (ClaudeState, Provenance)>,
     hooks_installed: Option<bool>,
 ) {
-    let panes: Vec<(String, String, String, u32)> = panes_text
+    let panes: Vec<(String, String, String, u32, String)> = panes_text
         .lines()
         .filter_map(parse_pane_line)
         .collect();
@@ -142,10 +145,10 @@ fn print_section(
     let descendants_by_root = build_descendants(&pane_pids, ps_text);
 
     println!(
-        "  {:<22} {:>6} {:>7} {:<28} {:<22} {}",
+        "  {:<22} {:>6} {:>7} {:<28} {:<28} {}",
         "session", "pane", "pid", "claude descendants", "status file", "decision"
     );
-    for (session, cmd, pane_id, pane_pid) in &panes {
+    for (session, cmd, pane_id, pane_pid, _session_id) in &panes {
         let claude_descs: Vec<String> = descendants_by_root
             .get(pane_pid)
             .map(|kids| {
@@ -162,34 +165,55 @@ fn print_section(
         };
 
         let status_str = match statuses.get(pane_id) {
-            Some(ClaudeState::Working) => format!("{}.json (working)", pane_id),
-            Some(ClaudeState::Idle) => format!("{}.json (idle)", pane_id),
+            Some((ClaudeState::Working, prov)) => {
+                format!("{}.json (working{})", pane_id, prov_suffix(*prov))
+            }
+            Some((ClaudeState::Idle, prov)) => {
+                format!("{}.json (idle{})", pane_id, prov_suffix(*prov))
+            }
+            Some((ClaudeState::AwaitingApproval, prov)) => {
+                format!("{}.json (await{})", pane_id, prov_suffix(*prov))
+            }
             None => "-".to_string(),
         };
 
         let is_claude = cmd == "claude" || claude_pane_pids.contains(pane_pid);
         let decision = if is_claude {
-            let state = statuses.get(pane_id).copied().unwrap_or(ClaudeState::Idle);
+            let state = statuses
+                .get(pane_id)
+                .map(|(s, _)| *s)
+                .unwrap_or(ClaudeState::Idle);
             match state {
                 ClaudeState::Working => "claude=working",
                 ClaudeState::Idle => "claude=idle",
+                ClaudeState::AwaitingApproval => "claude=awaiting_approval",
             }
         } else {
             "no claude"
         };
 
         println!(
-            "  {:<22} {:>6} {:>7} {:<28} {:<22} {}",
+            "  {:<22} {:>6} {:>7} {:<28} {:<28} {}",
             truncate(&format!("{} [{}]", session, cmd), 22),
             pane_id,
             pane_pid,
             truncate(&claude_str, 28),
-            truncate(&status_str, 22),
+            truncate(&status_str, 28),
             decision,
         );
     }
 
     print_hooks_footer(hooks_installed);
+}
+
+/// `(demoted)` annotation for the debug status column when ADE synthesised
+/// the reading via TTL or orphan-walk rather than reading the file fresh.
+/// Empty for `Recorded` so the unaffected column stays compact.
+fn prov_suffix(prov: Provenance) -> &'static str {
+    match prov {
+        Provenance::Recorded => "",
+        Provenance::Demoted => ", demoted",
+    }
 }
 
 fn print_hooks_footer(hooks_installed: Option<bool>) {

@@ -15,6 +15,8 @@ pub struct State {
     pub folders: FoldersState,
     #[serde(default)]
     pub preview_pane: PreviewPaneState,
+    #[serde(default)]
+    pub notifications: NotificationsState,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -39,6 +41,24 @@ pub struct PreviewPaneState {
     /// view; the new value is persisted immediately.
     #[serde(default)]
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotificationsState {
+    /// User's saved preference for macOS desktop notifications when
+    /// Claude finishes a turn or pops a permission prompt. Default
+    /// `false` — opt-in. Toggled via `N` in the tree view (persisted
+    /// immediately). When false, every call to `notifications::fire`
+    /// from `App::apply_refresh_result` is short-circuited at the top
+    /// of the suppression chain.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Set true on the first time the user either presses `N` to enable
+    /// or `x` to dismiss the first-run footer nudge. Drives whether the
+    /// peach "Desktop notifications available — press N…" line is
+    /// rendered at the bottom of the main tree.
+    #[serde(default)]
+    pub first_seen: bool,
 }
 
 impl State {
@@ -116,9 +136,32 @@ mod tests {
     }
 
     #[test]
+    fn missing_notifications_section_defaults() {
+        // Existing state.toml files written before notifications shipped
+        // must load cleanly with notifications off and first_seen false
+        // (so the first-run nudge fires for them).
+        let body = "[tmux_install_nudge]\ndismissed = true\n";
+        let state: State = toml::from_str(body).unwrap();
+        assert!(!state.notifications.enabled);
+        assert!(!state.notifications.first_seen);
+    }
+
+    #[test]
+    fn round_trip_preserves_notifications_state() {
+        let mut original = State::default();
+        original.notifications.enabled = true;
+        original.notifications.first_seen = true;
+        let serialized = toml::to_string_pretty(&original).unwrap();
+        let restored: State = toml::from_str(&serialized).unwrap();
+        assert!(restored.notifications.enabled);
+        assert!(restored.notifications.first_seen);
+    }
+
+    #[test]
     fn empty_input_yields_default() {
         let state: State = toml::from_str("").unwrap();
         assert!(!state.tmux_install_nudge.dismissed);
         assert!(state.folders.closed.is_empty());
+        assert!(!state.notifications.enabled);
     }
 }
