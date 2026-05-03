@@ -4,9 +4,10 @@ use std::process::Command;
 
 pub struct LocalTmux;
 
-const LIST_FORMAT: &str = "#{session_name}\t#{session_windows}\t#{session_attached}";
+const LIST_FORMAT: &str =
+    "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_id}";
 const PANE_FORMAT: &str =
-    "#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}";
+    "#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}\t#{session_id}";
 
 impl TmuxBackend for LocalTmux {
     fn list_sessions(&self) -> Result<Vec<Session>, String> {
@@ -51,7 +52,7 @@ impl TmuxBackend for LocalTmux {
         let pane_pids: Vec<u32> = panes_text
             .lines()
             .filter_map(parse_pane_line)
-            .map(|(_, _, _, pid)| pid)
+            .map(|(_, _, _, pid, _)| pid)
             .collect();
         let claude_pane_pids = claude_status::find_claude_pane_pids(&pane_pids, &ps_text);
 
@@ -59,8 +60,9 @@ impl TmuxBackend for LocalTmux {
         let claude_by_session = map_claude_states(&panes_text, &statuses, &claude_pane_pids);
 
         for s in &mut sessions {
-            if let Some(state) = claude_by_session.get(&s.name) {
-                s.claude = Some(*state);
+            if let Some(rollup) = claude_by_session.get(&s.name) {
+                s.claude = rollup.state;
+                s.claude_demoted = rollup.demoted;
             }
         }
 
@@ -71,7 +73,7 @@ impl TmuxBackend for LocalTmux {
             let panes_iter = panes_text
                 .lines()
                 .filter_map(parse_pane_line)
-                .map(|(_, cmd, pid, ppid)| (cmd, pid, ppid));
+                .map(|(_, cmd, pid, ppid, _)| (cmd, pid, ppid));
             claude_status::demote_orphan_working_files(
                 panes_iter,
                 &claude_pane_pids,

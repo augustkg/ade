@@ -34,9 +34,9 @@ const STATUS_SENTINEL: &str = "---ADE-STATUS---";
 const HOOKS_SENTINEL: &str = "---ADE-HOOKS---";
 
 const REMOTE_LIST_CMD: &str = concat!(
-    "tmux list-sessions -F '#{session_name}\t#{session_windows}\t#{session_attached}' 2>/dev/null; ",
+    "tmux list-sessions -F '#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_id}' 2>/dev/null; ",
     "echo '---ADE-PANES---'; ",
-    "tmux list-panes -a -F '#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}' 2>/dev/null; ",
+    "tmux list-panes -a -F '#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}\t#{session_id}' 2>/dev/null; ",
     "echo '---ADE-PS---'; ",
     "ps -A -o pid,ppid,comm 2>/dev/null; ",
     "echo '---ADE-STATUS---'; ",
@@ -47,7 +47,7 @@ const REMOTE_LIST_CMD: &str = concat!(
     "  printf '\\n---ADE-STATUS-END---\\n'; ",
     "done; ",
     "echo '---ADE-HOOKS---'; ",
-    "if grep -q ade-status-marker \"$HOME\"/.claude/settings.json 2>/dev/null; then echo OK; else echo MISSING; fi"
+    "if grep -q ade-status-marker-v2 \"$HOME\"/.claude/settings.json 2>/dev/null; then echo OK; else echo MISSING; fi"
 );
 
 fn shell_safe(s: &str) -> bool {
@@ -110,15 +110,16 @@ impl RemoteTmux {
                 let pane_pids: Vec<u32> = panes_part
                     .lines()
                     .filter_map(parse_pane_line)
-                    .map(|(_, _, _, pid)| pid)
+                    .map(|(_, _, _, pid, _)| pid)
                     .collect();
                 let claude_pane_pids =
                     claude_status::find_claude_pane_pids(&pane_pids, ps_part);
                 let claude_by_session =
                     map_claude_states(panes_part, &statuses, &claude_pane_pids);
                 for s in &mut sessions {
-                    if let Some(state) = claude_by_session.get(&s.name) {
-                        s.claude = Some(*state);
+                    if let Some(rollup) = claude_by_session.get(&s.name) {
+                        s.claude = rollup.state;
+                        s.claude_demoted = rollup.demoted;
                     }
                 }
 

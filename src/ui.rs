@@ -46,17 +46,44 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_tree(frame, chunks[1], app);
     }
 
-    if app.should_show_tmux_nudge() {
-        let footer = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(chunks[2]);
-        render_tmux_nudge(frame, footer[0]);
-        render_help_bar(frame, footer[2], app);
-    } else {
+    // Footer can stack up to three opt-in/warning nudges above the help
+    // bar:
+    //   1. Tmux clipboard config not installed (`should_show_tmux_nudge`)
+    //   2. Desktop notifications first-run prompt (`should_show_notifications_nudge`)
+    //   3. Notifications enabled but hooks stale (`should_show_hooks_stale_nudge`)
+    //
+    // Each nudge is a single row; we add a blank spacer between the
+    // last nudge and the help bar so they don't visually run together.
+    let nudges = [
+        (
+            app.should_show_tmux_nudge(),
+            render_tmux_nudge as fn(&mut Frame, Rect),
+        ),
+        (
+            app.should_show_notifications_nudge(),
+            render_notifications_nudge as fn(&mut Frame, Rect),
+        ),
+        (
+            app.should_show_hooks_stale_nudge(),
+            render_hooks_stale_nudge as fn(&mut Frame, Rect),
+        ),
+    ];
+    let active: Vec<&fn(&mut Frame, Rect)> = nudges
+        .iter()
+        .filter_map(|(show, f)| if *show { Some(f) } else { None })
+        .collect();
+    if active.is_empty() {
         render_help_bar(frame, chunks[2], app);
+    } else {
+        // One row per nudge + one blank spacer + one row for the help bar.
+        let mut constraints: Vec<Constraint> = vec![Constraint::Length(1); active.len() + 1];
+        constraints.push(Constraint::Length(1));
+        let footer = Layout::vertical(constraints).split(chunks[2]);
+        for (i, render) in active.iter().enumerate() {
+            render(frame, footer[i]);
+        }
+        let help_idx = footer.len() - 1;
+        render_help_bar(frame, footer[help_idx], app);
     }
 
     if let AppState::CreatingSession(ref form) = app.state {
@@ -358,13 +385,13 @@ fn render_session_row(
 
 /// Small ` claude ` chip used on session and folder rows.
 ///
-/// Renders only for `Working` — Claude is actively processing a turn (the
-/// `UserPromptSubmit` hook fired and no `Stop` / `SessionEnd` /
-/// `Notification(idle_prompt)` has fired since). Idle Claude (loaded but
-/// waiting at the prompt) does not render — `tmux::map_claude_states`
-/// already drops Idle upstream, so this match never sees it in practice.
-/// The Idle arm exists only as a typesafety barrier; if a future refactor
-/// leaks an `Idle` here we render nothing — silent suppression beats a
+/// Renders for `Working` (Claude is actively processing a turn) and for
+/// `AwaitingApproval` (Claude has popped a permission prompt and is
+/// blocked on the user). Idle Claude (loaded but waiting at the prompt)
+/// does not render — `tmux::map_claude_states` already drops Idle
+/// upstream, so this match never sees it in practice. The Idle arm
+/// exists only as a typesafety barrier; if a future refactor leaks an
+/// `Idle` here we render nothing — silent suppression beats a
 /// false-positive chip.
 fn claude_chip(state: ClaudeState) -> Span<'static> {
     match state {
@@ -373,6 +400,13 @@ fn claude_chip(state: ClaudeState) -> Span<'static> {
             Style::default()
                 .fg(theme::BASE)
                 .bg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ClaudeState::AwaitingApproval => Span::styled(
+            " claude · approve ",
+            Style::default()
+                .fg(theme::BASE)
+                .bg(theme::RED)
                 .add_modifier(Modifier::BOLD),
         ),
         ClaudeState::Idle => Span::raw(""),
@@ -717,6 +751,74 @@ fn render_tmux_nudge(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// Warning shown when notifications are enabled but the Claude hooks
+/// aren't installed (or are stale v1) on local OR any remote — without
+/// re-running install-hooks the user will never receive the
+/// `permission_prompt` matcher's banners. Distinct copy from the
+/// notifications first-run nudge so users with both visible can tell
+/// them apart.
+fn render_hooks_stale_nudge(frame: &mut Frame, area: Rect) {
+    let line = Line::from(vec![
+        Span::styled(
+            " Heads-up ",
+            Style::default()
+                .fg(theme::BASE)
+                .bg(theme::RED)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "Claude hooks out of date — run ",
+            Style::default().fg(theme::TEXT),
+        ),
+        Span::styled(
+            "ade install-hooks",
+            Style::default()
+                .fg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " (and per-host) so notifications fire on every Claude event.",
+            Style::default().fg(theme::TEXT),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// First-run prompt for the desktop-notification feature. Shown only when
+/// `state.notifications.enabled` is false AND `state.notifications.first_seen`
+/// is also false. Pressing `N` enables (and flips first_seen); pressing `x`
+/// dismisses (also flips first_seen). Either way the nudge never shows
+/// again unless the user manually edits `state.toml`.
+fn render_notifications_nudge(frame: &mut Frame, area: Rect) {
+    let line = Line::from(vec![
+        Span::styled(
+            " Tip ",
+            Style::default()
+                .fg(theme::BASE)
+                .bg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "Desktop notifications available — press ",
+            Style::default().fg(theme::TEXT),
+        ),
+        Span::styled(
+            "N",
+            Style::default()
+                .fg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " to enable. Banner when Claude finishes in any session.  ",
+            Style::default().fg(theme::TEXT),
+        ),
+        Span::styled("(x to dismiss)", Style::default().fg(theme::OVERLAY2)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
 fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
     let key = |s: &'static str| Span::styled(s, Style::default().fg(theme::PEACH));
     let txt = |s: &'static str| Span::styled(s, Style::default().fg(theme::OVERLAY2));
@@ -768,6 +870,8 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
             txt(" embed  "),
             key("p"),
             txt(" preview-pane  "),
+            key("N"),
+            txt(" notify  "),
             key("n"),
             txt(" new  "),
             key("R"),
