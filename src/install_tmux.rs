@@ -32,7 +32,7 @@ const SOURCE_LINE: &str = "source-file -q ~/.config/ade/tmux.conf  # ade-tmux-ma
 /// stale and overwritten on the next `install`.
 const MANAGED_BODY: &str = "\
 # Managed by ADE — do not edit. Run `ade install-tmux-config --uninstall` to remove.
-# ade-tmux-managed v3
+# ade-tmux-managed v4
 
 # Mouse drag-select-to-copy + OSC 52 clipboard, with the mosh-friendly Ms
 # override so the escape sequence survives mosh 1.4.0's strict parser.
@@ -57,6 +57,18 @@ set-window-option -g automatic-rename-format '#T'
 # unset (e.g. attaching outside ADE).
 set-option -g set-titles on
 set-option -g set-titles-string '#{?#{@ade-title},#{@ade-title},#W}'
+
+# `prefix B` — back to ADE.
+# When ADE attached this session as a parent process (the spawn-and-wait
+# path: outside-tmux local, or any remote SSH/Mosh attach), the per-attach
+# remote shell wrapper plants `@ade-parent` on the session and clears it on
+# exit. In that mode `prefix B` detaches, returning control to the parent
+# ADE TUI in the same tab. Otherwise (ADE was launched from inside this
+# tmux and used switch-client to bring you here, OR the session was
+# attached without ADE), `@ade-parent` is unset, so `prefix B` falls back
+# to switch-client -l, which lands on whatever session you came from
+# (typically the pane where ADE is still running).
+bind-key B if-shell -F '#{@ade-parent}' 'detach-client' 'switch-client -l'
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,5 +529,22 @@ mod tests {
         // Random non-marker lines.
         assert!(!is_marker_line("set -g mouse on"));
         assert!(!is_marker_line(""));
+    }
+
+    #[test]
+    fn managed_body_carries_v4_sentinel() {
+        // Bumping the sentinel invalidates installs of prior versions so
+        // they're detected as Stale and re-installed. If you change v4 →
+        // v5 in MANAGED_BODY, update this test too.
+        assert!(MANAGED_BODY.contains("ade-tmux-managed v4"));
+    }
+
+    #[test]
+    fn managed_body_binds_prefix_b_smart_back_to_ade() {
+        // The smart `prefix B` keybinding routes between detach-client and
+        // switch-client -l based on @ade-parent. Both halves must be
+        // present so neither flow regresses.
+        assert!(MANAGED_BODY
+            .contains("bind-key B if-shell -F '#{@ade-parent}' 'detach-client' 'switch-client -l'"));
     }
 }

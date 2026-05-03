@@ -12,9 +12,14 @@
 //! `\x1b`, the C1 ST `\x9c`, and CR/LF/TAB) so an externally-named tmux
 //! session with embedded control bytes can't smuggle a different OSC sequence.
 //!
-//! No restore-on-detach. ADE replaces itself with `tmux`/`ssh`/`mosh` via
-//! `execvp`, so we can't run code after detach. We emit `clear()` immediately
-//! before exec instead — the new program's own title sequences then take over.
+//! Lifecycle around attach: ADE no longer execs into tmux/ssh/mosh —
+//! it spawns them as children and waits, with the TUI suspended in
+//! between (`tui_lifecycle`). `clear()` fires on suspend so tmux's
+//! `set-titles-string` (driven by `@ade-title`) takes over without
+//! flashing the ADE row title. After the child exits, `set()` on the
+//! next draw re-emits ADE's selection title; the cache flip from the
+//! suspend `clear()` ensures that `set` actually writes the bytes
+//! rather than no-op'ing.
 
 use std::io::{self, Write};
 use std::sync::{Mutex, OnceLock};

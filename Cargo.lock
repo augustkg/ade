@@ -18,6 +18,7 @@ dependencies = [
  "ansi-to-tui",
  "color-eyre",
  "crossterm",
+ "libc",
  "portable-pty",
  "ratatui",
  "serde",

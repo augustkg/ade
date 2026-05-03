@@ -466,9 +466,12 @@ impl EmbeddedTerm {
     }
 
     /// Spawn an embedded attach to a remote session via the same
-    /// SSH/Mosh routing as `crate::build_attach_command` — we go through
-    /// that helper so the local exec-replace `attach` and the embedded
-    /// path use identical command lines.
+    /// SSH/Mosh routing as `crate::build_attach_command`. We pass
+    /// `plant_parent: false` because embedded preview is *not* a parent-
+    /// process attach — ADE is still drawing in the host pane, and the
+    /// `@ade-parent` marker would mislead the `prefix B` keybinding
+    /// (`detach-client` instead of `switch-client -l`) for any future
+    /// direct attach to the same session.
     pub fn spawn_remote(
         host: &Host,
         name: &str,
@@ -476,7 +479,7 @@ impl EmbeddedTerm {
         cols: u16,
     ) -> Result<Self, String> {
         let target = format!("={}", name);
-        let (program, args) = crate::build_attach_command(host, &target);
+        let (program, args) = crate::build_attach_command(host, &target, false);
         let mut cmd = CommandBuilder::new(&program);
         for a in &args {
             cmd.arg(a);
