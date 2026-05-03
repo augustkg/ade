@@ -16,11 +16,28 @@ use crate::ssh_io;
 
 /// Marker substring embedded in our hook commands so we can recognise an
 /// already-installed hook and avoid appending duplicates on repeat installs.
-const MARKER: &str = "ade-status-marker";
+///
+/// **Version bump (v1 → v2):** the introduction of the new
+/// `Notification[matcher=permission_prompt]` hook means a v1 install
+/// (which lacks that matcher) is incomplete for this revision. Bumping
+/// the marker forces `is_installed_local`, the Hosts-screen nudge, and
+/// the remote grep to all read v1 installs as MISSING so the user is
+/// prompted to re-run `ade install-hooks`. The migration step in
+/// `merge_hooks` removes v1 marker entries before installing v2 ones,
+/// so re-running is safe and non-duplicating.
+const MARKER: &str = "ade-status-marker-v2";
 
-const WORKING_CMD: &str = r#"true ade-status-marker; PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"; [ -z "$PANE" ] || (mkdir -p "$HOME/.cache/ade/claude-status" && printf '{"state":"working","at":"%s"}' "$(date -u +%FT%TZ)" > "$HOME/.cache/ade/claude-status/${PANE}.json")"#;
+/// v1 marker substring. Used only by the migration step in `merge_hooks`
+/// to detect and drop legacy entries written by ADE versions before the
+/// `permission_prompt` matcher landed. The trailing `;` is what makes
+/// this distinguishable from v2 (whose commands embed `ade-status-marker-v2;`).
+const LEGACY_V1_MARKER: &str = "ade-status-marker;";
 
-const IDLE_CMD: &str = r#"true ade-status-marker; PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"; [ -z "$PANE" ] || (mkdir -p "$HOME/.cache/ade/claude-status" && printf '{"state":"idle","at":"%s"}' "$(date -u +%FT%TZ)" > "$HOME/.cache/ade/claude-status/${PANE}.json")"#;
+const WORKING_CMD: &str = r#"true ade-status-marker-v2; PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"; [ -z "$PANE" ] || (mkdir -p "$HOME/.cache/ade/claude-status" && printf '{"state":"working","at":"%s"}' "$(date -u +%FT%TZ)" > "$HOME/.cache/ade/claude-status/${PANE}.json")"#;
+
+const IDLE_CMD: &str = r#"true ade-status-marker-v2; PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"; [ -z "$PANE" ] || (mkdir -p "$HOME/.cache/ade/claude-status" && printf '{"state":"idle","at":"%s"}' "$(date -u +%FT%TZ)" > "$HOME/.cache/ade/claude-status/${PANE}.json")"#;
+
+const AWAITING_APPROVAL_CMD: &str = r#"true ade-status-marker-v2; PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"; [ -z "$PANE" ] || (mkdir -p "$HOME/.cache/ade/claude-status" && printf '{"state":"awaiting_approval","at":"%s"}' "$(date -u +%FT%TZ)" > "$HOME/.cache/ade/claude-status/${PANE}.json")"#;
 
 /// Check whether ADE's status hooks are already present in the local
 /// `~/.claude/settings.json`. Returns `true` if our marker is found.
@@ -151,6 +168,11 @@ const HOOK_EVENTS: &[HookEvent] = &[
     HookEvent { event: "SessionEnd", matcher: None, command: IDLE_CMD },
     HookEvent { event: "SessionStart", matcher: None, command: IDLE_CMD },
     HookEvent { event: "Notification", matcher: Some("idle_prompt"), command: IDLE_CMD },
+    // Notification[matcher=permission_prompt]: writes `awaiting_approval` so
+    // the chip can flip to its red "needs approve" variant and the
+    // notification dispatch can fire a "Claude is waiting for you" banner
+    // to the macOS NotificationCenter. See `src/notifications.rs`.
+    HookEvent { event: "Notification", matcher: Some("permission_prompt"), command: AWAITING_APPROVAL_CMD },
 ];
 
 #[derive(Debug, Default)]
@@ -213,12 +235,47 @@ fn merge_hooks(mut settings: Value) -> (Value, InstallAction) {
     }
 
     let hooks_obj = hooks.as_object_mut().unwrap();
+
+    // v1 → v2 migration: drop any ADE-owned entries that carry the legacy
+    // marker (`true ade-status-marker;` literal — no `-v2` suffix). Without
+    // this step, the canonical merge below would append v2 entries *next
+    // to* v1 entries because `find_marker_entry` searches for `MARKER`
+    // (now v2) and won't see v1. Result would be two ADE entries per
+    // event: one stale v1, one fresh v2 — both firing on each Claude
+    // event. The migration runs unconditionally; on a clean install (no
+    // v1 entries) it's a no-op.
+    drop_legacy_v1_entries(hooks_obj);
+
     for he in HOOK_EVENTS {
         let change = ensure_event(hooks_obj, he.event, he.matcher, he.command);
         action.record(he.event, change);
     }
 
     (settings, action)
+}
+
+/// Walk every event array in `hooks_obj` and remove entries whose nested
+/// `hooks[].command` contains the legacy v1 marker but not the v2 marker.
+/// Non-ADE entries are untouched. Empty arrays are left in place — `serde`
+/// will serialise them as `[]`, harmless.
+fn drop_legacy_v1_entries(hooks_obj: &mut serde_json::Map<String, Value>) {
+    for (_event, val) in hooks_obj.iter_mut() {
+        let Some(arr) = val.as_array_mut() else {
+            continue;
+        };
+        arr.retain(|entry| {
+            let Some(inner) = entry.get("hooks").and_then(|h| h.as_array()) else {
+                return true;
+            };
+            let is_legacy_v1 = inner.iter().any(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.contains(LEGACY_V1_MARKER) && !s.contains(MARKER))
+                    .unwrap_or(false)
+            });
+            !is_legacy_v1
+        });
+    }
 }
 
 /// Ensure the given event's array contains the canonical ADE entry with the
@@ -347,10 +404,12 @@ fn cleanup_old_local_path() -> Result<usize, String> {
     Ok(removed)
 }
 
-/// Remove every nested entry whose `command` contains MARKER from any
-/// hook event array, regardless of event name. Iterates the entire `hooks`
-/// object so we also clean up stragglers from future ADE versions if the
-/// user downgrades. Returns the count of removed entries.
+/// Remove every nested entry whose `command` contains either the current
+/// `MARKER` (v2) or the legacy v1 marker, from any hook event array,
+/// regardless of event name. Iterates the entire `hooks` object so we
+/// clean up stragglers from past ADE versions (legacy settings.local.json
+/// may still hold v1 entries from before the marker bump). Returns the
+/// count of removed entries.
 fn strip_ade_entries(value: &mut Value) -> usize {
     let Some(hooks) = value.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
         return 0;
@@ -367,7 +426,7 @@ fn strip_ade_entries(value: &mut Value) -> usize {
             };
             for h in inner {
                 if let Some(cmd) = h.get("command").and_then(|c| c.as_str()) {
-                    if cmd.contains(MARKER) {
+                    if cmd.contains(MARKER) || cmd.contains(LEGACY_V1_MARKER) {
                         return false;
                     }
                 }
@@ -479,6 +538,12 @@ mod tests {
         assert_event_present(&settings, "SessionEnd", None, MARKER);
         assert_event_present(&settings, "SessionStart", None, MARKER);
         assert_event_present(&settings, "Notification", Some("idle_prompt"), MARKER);
+        assert_event_present(
+            &settings,
+            "Notification",
+            Some("permission_prompt"),
+            MARKER,
+        );
     }
 
     #[test]
@@ -553,12 +618,16 @@ mod tests {
     #[test]
     fn merge_hooks_updates_stale_ade_entry() {
         // A previous ADE version's marker entry is present but with a stale
-        // command. Install must REPLACE it (not duplicate). This protects
-        // against "update ADE → cache file commands stay outdated".
+        // command (still v2 marker — to test "in-place update" rather than
+        // "v1→v2 migration"). Install must REPLACE it (not duplicate).
+        // This protects against "update ADE → cache file commands stay
+        // outdated".
         let mut settings = json!({});
         let (initial, _) = merge_hooks(settings);
         settings = initial;
-        // Tamper with the Stop entry's command so it looks stale.
+        // Tamper with the Stop entry's command so it looks stale, but keep
+        // the v2 marker substring so the migration step doesn't drop it
+        // and the canonical merge re-targets it for update.
         let stop_arr = settings
             .get_mut("hooks")
             .unwrap()
@@ -566,8 +635,8 @@ mod tests {
             .unwrap()
             .as_array_mut()
             .unwrap();
-        stop_arr[0]["hooks"][0]["command"] =
-            json!("true ade-status-marker; echo OUTDATED");
+        let stale_cmd = format!("true {}; echo OUTDATED", MARKER);
+        stop_arr[0]["hooks"][0]["command"] = json!(stale_cmd);
         let (updated, action) = merge_hooks(settings);
         assert!(!action.is_noop(), "stale entry must trigger an update");
         let updated_arr = updated
@@ -590,14 +659,16 @@ mod tests {
 
     #[test]
     fn find_marker_entry_distinguishes_matcher() {
+        let entry_a = format!("true {}; A", MARKER);
+        let entry_b = format!("true {}; B", MARKER);
         let arr = vec![
             json!({
                 "matcher": "permission_prompt",
-                "hooks": [{ "type": "command", "command": "true ade-status-marker; A" }]
+                "hooks": [{ "type": "command", "command": entry_a }]
             }),
             json!({
                 "matcher": "idle_prompt",
-                "hooks": [{ "type": "command", "command": "true ade-status-marker; B" }]
+                "hooks": [{ "type": "command", "command": entry_b }]
             }),
         ];
         // Looking for the idle_prompt one — should land on index 1, not 0.
@@ -605,5 +676,132 @@ mod tests {
         assert_eq!(find_marker_entry(&arr, Some("permission_prompt")), Some(0));
         // Looking for an entry with no matcher — neither matches.
         assert_eq!(find_marker_entry(&arr, None), None);
+    }
+
+    #[test]
+    fn merge_hooks_migrates_v1_marker() {
+        // Simulate a v1-installed settings.json: shell command embeds
+        // `true ade-status-marker;` (no `-v2` suffix). Migration must drop
+        // it; canonical merge then adds the v2 entries fresh. Result: only
+        // v2 entries, no v1 stragglers, no duplicates.
+        let v1_user_prompt_cmd = "true ade-status-marker; legacy v1 working command";
+        let v1_stop_cmd = "true ade-status-marker; legacy v1 idle command";
+        let initial = json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    { "hooks": [{ "type": "command", "command": v1_user_prompt_cmd }] }
+                ],
+                "Stop": [
+                    { "hooks": [{ "type": "command", "command": v1_stop_cmd }] }
+                ]
+            }
+        });
+
+        let (settings, action) = merge_hooks(initial);
+        assert!(
+            !action.is_noop(),
+            "v1 → v2 migration must be a non-noop install"
+        );
+
+        // Every event array should be exactly one ADE entry (the v2 one),
+        // not two (v1 + v2).
+        for event in [
+            "UserPromptSubmit",
+            "Stop",
+            "StopFailure",
+            "SessionEnd",
+            "SessionStart",
+        ] {
+            let arr = settings
+                .get("hooks")
+                .and_then(|h| h.get(event))
+                .and_then(|a| a.as_array())
+                .unwrap_or_else(|| panic!("expected {} array", event));
+            assert_eq!(
+                arr.len(),
+                1,
+                "after migration {} should have exactly one entry, got: {}",
+                event,
+                serde_json::to_string_pretty(arr).unwrap()
+            );
+            let cmd = arr[0]["hooks"][0]["command"].as_str().unwrap();
+            assert!(
+                cmd.contains(MARKER),
+                "{} entry should carry v2 marker; got: {}",
+                event,
+                cmd
+            );
+            assert!(
+                !cmd.contains("legacy v1"),
+                "{} entry should NOT contain v1 command body; got: {}",
+                event,
+                cmd
+            );
+        }
+
+        // Notification array should have both ADE matchers (idle_prompt +
+        // permission_prompt) and nothing else.
+        let notification_arr = settings
+            .get("hooks")
+            .and_then(|h| h.get("Notification"))
+            .and_then(|a| a.as_array())
+            .unwrap();
+        assert_eq!(
+            notification_arr.len(),
+            2,
+            "Notification should have idle_prompt + permission_prompt entries; got: {}",
+            serde_json::to_string_pretty(notification_arr).unwrap()
+        );
+    }
+
+    #[test]
+    fn merge_hooks_v1_migration_preserves_user_entries() {
+        // User has their own non-ADE entry alongside an ADE v1 entry on
+        // the same event. Migration must drop only the v1 entry; the user
+        // entry survives, and the v2 entry is added.
+        let user_entry = json!({
+            "hooks": [{ "type": "command", "command": "/path/to/user-script.sh" }]
+        });
+        let v1_entry = json!({
+            "hooks": [{ "type": "command", "command": "true ade-status-marker; legacy" }]
+        });
+        let initial = json!({
+            "hooks": {
+                "Stop": [user_entry.clone(), v1_entry]
+            }
+        });
+
+        let (settings, _) = merge_hooks(initial);
+        let arr = settings
+            .get("hooks")
+            .and_then(|h| h.get("Stop"))
+            .and_then(|a| a.as_array())
+            .unwrap();
+        // User's entry survives
+        assert!(
+            arr.iter().any(|e| *e == user_entry),
+            "user's non-ADE entry should survive migration; got: {}",
+            serde_json::to_string_pretty(arr).unwrap()
+        );
+        // v1 ADE entry gone
+        assert!(
+            !arr.iter().any(|e| {
+                e.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|inner| {
+                        inner.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|s| s.contains("legacy"))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            }),
+            "v1 entry should have been dropped; got: {}",
+            serde_json::to_string_pretty(arr).unwrap()
+        );
+        // v2 ADE entry present
+        assert_event_present(&settings, "Stop", None, MARKER);
     }
 }

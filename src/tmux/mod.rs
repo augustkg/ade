@@ -1,19 +1,40 @@
 pub mod local;
 pub mod remote;
 
-use crate::claude_status::ClaudeState;
+use crate::claude_status::{ClaudeState, Provenance};
 use crate::hosts::Host;
 use crate::model::Machine;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Session {
     pub name: String,
+    /// tmux's `#{session_id}` (e.g. `$3`). Stable across `rename-session`
+    /// — used as the diff key for notification dispatch in
+    /// `App::apply_refresh_result` so that mid-turn renames don't miss a
+    /// "Claude finished" transition and kill-then-recreate-with-same-name
+    /// doesn't fire a false positive.
+    pub session_id: String,
     pub windows: u32,
     pub attached: bool,
     /// `Some(state)` when at least one pane in this session has `claude` as
-    /// its foreground process. Populated by the backend after merging
-    /// `list-sessions`, `list-panes`, and the per-pane status files.
+    /// its foreground process AND that pane's status file says it's
+    /// `Working` or `AwaitingApproval`. Populated by the backend after
+    /// merging `list-sessions`, `list-panes`, and the per-pane status files.
     pub claude: Option<ClaudeState>,
+    /// `true` when at least one Claude pane in this session had its state
+    /// synthesised by `read_local_statuses_with_working_ttl` (TTL kicked in
+    /// on a stale active file). Used by `App::apply_refresh_result` to
+    /// suppress notification rule 5: a `Some(Working) → None` transition
+    /// caused purely by TTL is not "Claude finished a turn".
+    pub claude_demoted: bool,
+}
+
+/// Per-session rollup of every Claude pane in that session — produced by
+/// `map_claude_states` and merged into `Session` fields by the backend.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct ClaudeRollup {
+    pub state: Option<ClaudeState>,
+    pub demoted: bool,
 }
 
 pub trait TmuxBackend {
@@ -67,31 +88,47 @@ pub fn backend_for(machine: &Machine, hosts: &[Host]) -> Option<Box<dyn TmuxBack
 }
 
 pub(crate) fn parse_session_line(line: &str) -> Option<Session> {
+    // Format must be:
+    //   #{session_name}\t#{session_windows}\t#{session_attached}\t#{session_id}
+    // The `session_id` column is required (no fallback) — without a stable
+    // identity, the notification diff in `App::apply_refresh_result` can't
+    // tell rename-mid-turn apart from kill-and-recreate-same-name.
     let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() >= 3 {
+    if parts.len() >= 4 {
         Some(Session {
             name: parts[0].to_string(),
             windows: parts[1].parse().unwrap_or(0),
             attached: parts[2] == "1",
+            session_id: parts[3].to_string(),
             claude: None,
+            claude_demoted: false,
         })
     } else {
         None
     }
 }
 
-/// Parse a single line of `tmux list-panes -a -F '#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}'`
-/// into `(session_name, pane_current_command, pane_id, pane_pid)`.
-pub(crate) fn parse_pane_line(line: &str) -> Option<(String, String, String, u32)> {
-    let parts: Vec<&str> = line.splitn(4, '\t').collect();
-    if parts.len() != 4 {
+/// Parse a single line of `tmux list-panes -a -F '#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}\t#{session_id}'`
+/// into `(session_name, pane_current_command, pane_id, pane_pid, session_id)`.
+///
+/// The `session_id` column is what notification dispatch keys on — it
+/// survives `rename-session` between the list-sessions and list-panes
+/// calls, so a pane belongs to "the same tmux session as before" even
+/// if `session_name` changed in flight. Older format strings without
+/// `#{session_id}` parse with the trailing field missing — we fail
+/// the parse rather than silently fall back, so the `5` here must be
+/// matched by every caller's `-F` argument.
+pub(crate) fn parse_pane_line(line: &str) -> Option<(String, String, String, u32, String)> {
+    let parts: Vec<&str> = line.splitn(5, '\t').collect();
+    if parts.len() != 5 {
         return None;
     }
     let session = parts[0];
     let cmd = parts[1];
     let pane_id = parts[2];
     let pane_pid: u32 = parts[3].parse().ok()?;
-    if session.is_empty() || pane_id.is_empty() {
+    let session_id = parts[4];
+    if session.is_empty() || pane_id.is_empty() || session_id.is_empty() {
         return None;
     }
     Some((
@@ -99,50 +136,64 @@ pub(crate) fn parse_pane_line(line: &str) -> Option<(String, String, String, u32
         cmd.to_string(),
         pane_id.to_string(),
         pane_pid,
+        session_id.to_string(),
     ))
 }
 
-/// Join `list-panes -a` output with the per-pane status map and return a map
-/// of `session_name → ClaudeState`. A session is included in the result only
-/// when at least one of its panes is **actively working** — i.e. has a
-/// `claude` process in its descendant tree AND a `state=working` status
-/// file. Idle panes (Claude loaded but waiting at the prompt) and panes
-/// with no status file at all are intentionally skipped, so the `claude`
-/// chip in the UI lights up only while a turn is in progress.
+/// Join `list-panes -a` output with the per-pane status map and return a
+/// per-session `ClaudeRollup`. A session ends up in the result if any of
+/// its Claude panes had:
+///   - an active state (`Working` or `AwaitingApproval`), recorded or not
+///   - or a TTL-demoted reading (state synthesised to `Idle` from a stale
+///     active file)
+///
+/// `rollup.state` is `Some(state)` only when an active pane's state was
+/// observed — `Idle` panes (no chip rendered) and TTL-demoted panes
+/// contribute nothing to it. `rollup.demoted` is `true` when any pane
+/// in the session had `Provenance::Demoted` — the App's notification
+/// diff uses this to suppress the false-positive "Claude finished"
+/// banner that would otherwise fire on a TTL transition.
 ///
 /// A pane is considered to be running Claude if either `pane_current_command`
 /// is `claude` OR `pane_pid` is in the descendant set built from a `ps`
 /// walk (catches shell-wrapped or background-launched Claude processes).
 pub(crate) fn map_claude_states(
     panes_text: &str,
-    statuses: &std::collections::HashMap<String, ClaudeState>,
+    statuses: &std::collections::HashMap<String, (ClaudeState, Provenance)>,
     claude_pane_pids: &std::collections::HashSet<u32>,
-) -> std::collections::HashMap<String, ClaudeState> {
-    let mut out: std::collections::HashMap<String, ClaudeState> = std::collections::HashMap::new();
+) -> std::collections::HashMap<String, ClaudeRollup> {
+    let mut out: std::collections::HashMap<String, ClaudeRollup> =
+        std::collections::HashMap::new();
     for line in panes_text.lines() {
-        let Some((session, cmd, pane_id, pane_pid)) = parse_pane_line(line) else {
+        // We pull `session_id` out of pane lines too (see
+        // `parse_pane_line`) but key the rollup on session NAME so the
+        // existing list-sessions ↔ panes join (which uses name) keeps
+        // working unchanged. The session_id field is present here as
+        // future-proofing for a join-by-id refactor; not yet wired.
+        let Some((session, cmd, pane_id, pane_pid, _session_id)) = parse_pane_line(line) else {
             continue;
         };
         let is_claude = cmd == "claude" || claude_pane_pids.contains(&pane_pid);
         if !is_claude {
             continue;
         }
-        // Only surface Working. A missing status file (hooks not installed
-        // yet, or hooks installed but no prompt submitted) is treated the
-        // same as Idle: no working signal observed → no chip.
-        let Some(state) = statuses.get(&pane_id).copied() else {
+        let Some(&(state, prov)) = statuses.get(&pane_id) else {
             continue;
         };
-        if !matches!(state, ClaudeState::Working) {
-            continue;
+        let entry = out.entry(session).or_default();
+        if matches!(
+            state,
+            ClaudeState::Working | ClaudeState::AwaitingApproval
+        ) {
+            entry.state = match entry.state {
+                Some(cur) if state > cur => Some(state),
+                None => Some(state),
+                Some(cur) => Some(cur),
+            };
         }
-        out.entry(session)
-            .and_modify(|cur| {
-                if state > *cur {
-                    *cur = state;
-                }
-            })
-            .or_insert(state);
+        if matches!(prov, Provenance::Demoted) {
+            entry.demoted = true;
+        }
     }
     out
 }

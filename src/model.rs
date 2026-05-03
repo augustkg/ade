@@ -47,12 +47,21 @@ impl PartialOrd for Machine {
 #[derive(Debug, Clone)]
 pub struct Session {
     pub raw_name: String,
+    /// tmux's stable `#{session_id}` (e.g. `$3`). Used by
+    /// `App::apply_refresh_result` as the diff key for notification
+    /// dispatch — survives `rename-session`, distinct from
+    /// `kill+recreate-same-name`.
+    pub session_id: String,
     pub prefix: Option<String>,
     pub leaf: String,
     pub windows: u32,
     pub attached: bool,
     pub machine: Machine,
     pub claude: Option<ClaudeState>,
+    /// Mirrors `tmux::Session::claude_demoted`. Carried through to
+    /// `App::apply_refresh_result` for notification suppression rule 5
+    /// (TTL-driven demotions are not "Claude finished a turn").
+    pub claude_demoted: bool,
 }
 
 impl Session {
@@ -68,12 +77,14 @@ impl Session {
         };
         Self {
             raw_name: s.name,
+            session_id: s.session_id,
             prefix,
             leaf,
             windows: s.windows,
             attached: s.attached,
             machine,
             claude: s.claude,
+            claude_demoted: s.claude_demoted,
         }
     }
 }

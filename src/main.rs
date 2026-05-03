@@ -9,6 +9,7 @@ mod hosts;
 mod install_hooks;
 mod install_tmux;
 mod model;
+mod notifications;
 mod preview_pane;
 mod refresh;
 mod ssh_io;
@@ -19,6 +20,7 @@ mod test_harness;
 mod text_field;
 mod theme;
 mod tmux;
+mod tui_lifecycle;
 mod ui;
 
 use std::process::Command;
@@ -59,28 +61,15 @@ fn main() -> Result<()> {
     // `MouseCaptureGuard` — enabling it globally would swallow
     // the user's normal terminal scroll / Cmd+drag selection
     // while they're just browsing the tree.
-    let result = run(&mut terminal);
+    let (config, _warning) = Config::load();
+    let result = run_loop(&mut terminal, &config);
     ratatui::restore();
+    term_title::clear();
 
-    match result {
-        Ok(Some(AppAction::AttachSession { name, machine })) => {
-            // Don't clear the title here: attach() exec-replaces into tmux,
-            // and tmux's `set-titles` (with @ade-title plumbed through the
-            // managed config) takes over with our `folder/session | host`
-            // string. Clearing first would briefly flash an empty title.
-            let (config, _warning) = Config::load();
-            attach(&name, &machine, &config);
-        }
-        Ok(_) => {
-            term_title::clear();
-        }
-        Err(e) => {
-            term_title::clear();
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
     }
-
     Ok(())
 }
 
@@ -269,72 +258,128 @@ fn run_install_tmux(args: &[String]) -> Result<()> {
     }
 }
 
-fn attach(name: &str, machine: &Machine, config: &Config) {
-    let target = format!("={}", name);
-    let inside = tmux::is_inside_tmux();
+/// What to do when the user picks a session from the TUI. Resolved per
+/// attach attempt — depends on machine + whether ADE is running inside
+/// tmux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachOutcome {
+    /// Local + inside tmux: hand off via `tmux switch-client`. ADE keeps
+    /// running in its original pane; the user returns via `prefix L`
+    /// (last-session) — see the `prefix B` if-shell in `MANAGED_BODY`.
+    SwitchClient,
+    /// Local-outside-tmux or any remote attach: ADE spawns the attach
+    /// command and waits for it to exit. The TUI suspends + resumes
+    /// around the wait.
+    SpawnAndWait,
+    /// User picked the session they're already in (only reachable from
+    /// inside-tmux). Nothing to do — keep the picker on screen.
+    SameSessionNoOp,
+}
 
-    // Diagnostic log: starts a fresh /tmp/ade-attach.log on every attempt.
-    // run_status appends subprocess results below, so the file ends up with
-    // a complete trace of one attach attempt — including the env we used to
-    // decide inside vs outside tmux.
+fn attach_outcome(name: &str, machine: &Machine) -> AttachOutcome {
+    let inside = tmux::is_inside_tmux();
+    match machine {
+        Machine::Local => {
+            if !inside {
+                return AttachOutcome::SpawnAndWait;
+            }
+            if matches!(tmux::current_session().as_deref(), Some(c) if c == name) {
+                AttachOutcome::SameSessionNoOp
+            } else {
+                AttachOutcome::SwitchClient
+            }
+        }
+        // Remote: always spawn-and-wait. From inside tmux, ADE's pane
+        // hosts the ssh/mosh child for the duration; from outside, the
+        // tab does. Either way `prefix B` → detach → child exits → ADE
+        // resumes.
+        Machine::Remote(_) => AttachOutcome::SpawnAndWait,
+    }
+}
+
+fn log_attach_intent(name: &str, machine: &Machine, outcome: AttachOutcome) {
     let env_tmux = std::env::var("TMUX").unwrap_or_default();
     let env_tmux_pane = std::env::var("TMUX_PANE").unwrap_or_default();
     let current = tmux::current_session().unwrap_or_default();
     let log = format!(
         "{}\n\
-         attach: name={} machine={:?} inside_tmux={} target={}\n\
+         attach: name={} machine={:?} outcome={:?}\n\
          env: TMUX={:?} TMUX_PANE={:?}\n\
          current_session: {:?}\n",
         chrono_now(),
         name,
         machine,
-        inside,
-        target,
+        outcome,
         env_tmux,
         env_tmux_pane,
         current,
     );
     let _ = std::fs::write("/tmp/ade-attach.log", log);
+}
 
-    match machine {
-        Machine::Local => {
-            if inside {
-                // Same-session early return: switch-client to the session
-                // we're already in is a silent no-op, so just quit cleanly
-                // instead. The user sees no popup; ADE exits and they're
-                // back at the session they wanted (the one they were in).
-                if let Some(current) = tmux::current_session() {
-                    if current == name {
-                        append_attach_log(
-                            "skipped: already in this session (switch-client would be a no-op)\n",
-                        );
-                        return;
-                    }
-                }
-                set_session_title_option(name, machine);
-                run_status("tmux", &["switch-client", "-t", &target]);
-            } else {
-                set_session_title_option(name, machine);
-                exec_replace("tmux", &["attach-session", "-t", &target]);
-            }
-        }
+/// Spawn the attach command and block until it exits. Caller is
+/// responsible for suspending/resuming the TUI around this call.
+fn spawn_and_wait_attach(
+    name: &str,
+    machine: &Machine,
+    config: &Config,
+) -> Result<(), String> {
+    let target = format!("={}", name);
+    let (program, args) = match machine {
+        Machine::Local => (
+            "tmux".to_string(),
+            vec![
+                "attach-session".to_string(),
+                "-t".to_string(),
+                target.clone(),
+            ],
+        ),
         Machine::Remote(host_name) => {
-            let Some(host) = config.host_by_name(host_name) else {
-                eprintln!("Error: host '{}' not found in config", host_name);
-                std::process::exit(1);
-            };
-            // Always exec-replace into ssh/mosh. From outside tmux, that's
-            // the obvious thing. From inside tmux, this means our current
-            // pane becomes the mosh/ssh client and the user sees the remote
-            // session attach right where ADE was — same UX in both contexts,
-            // no "did the new window auto-select?" ambiguity. When the user
-            // detaches, the pane closes (or returns to its shell), same as
-            // any other terminal-replacing command.
-            let (program, args) = build_attach_command(host, &target);
-            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            exec_replace(&program, &arg_refs);
-            let _ = inside; // remote attach path no longer branches on inside-tmux
+            let host = config
+                .host_by_name(host_name)
+                .ok_or_else(|| format!("host '{}' not found in config", host_name))?;
+            build_attach_command(host, &target, true)
         }
+    };
+
+    let mut cmd = Command::new(&program);
+    cmd.args(&args);
+
+    #[cfg(unix)]
+    {
+        // SAFETY: pre_exec runs after fork in the child, before exec, in a
+        // single-threaded address space. Only async-signal-safe operations
+        // are permitted; `signal(2)` qualifies. Without this the child
+        // inherits ADE's SIG_IGN dispositions (installed by
+        // `tui_lifecycle::suspend`) and Ctrl+C / Ctrl+Z stop working in
+        // remote shells.
+        unsafe {
+            cmd.pre_exec(tui_lifecycle::child_restore_default_signals);
+        }
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn {}: {}", program, e))?;
+    let status = child
+        .wait()
+        .map_err(|e| format!("failed to wait for {}: {}", program, e))?;
+
+    append_attach_log(&format!(
+        "spawn_and_wait: {} {} → status={}\n",
+        program,
+        args.join(" "),
+        status,
+    ));
+
+    if status.success() {
+        Ok(())
+    } else {
+        let code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        Err(format!("{} exited with status {}", program, code))
     }
 }
 
@@ -355,6 +400,45 @@ fn set_session_title_option(name: &str, machine: &Machine) {
     let _ = std::process::Command::new("tmux")
         .args(["set-option", "-t", &session_id, "@ade-title", &title])
         .output();
+}
+
+/// Plant or clear `@ade-parent` on the target tmux session. The managed
+/// `prefix B` keybinding (see `install_tmux::MANAGED_BODY`) routes to
+/// `detach-client` when the option is truthy and `switch-client -l`
+/// otherwise — so the marker must be set before each spawn-and-wait
+/// attach and unset after, to avoid stale state confusing future direct
+/// (non-ADE) attaches to the same session.
+///
+/// Kept separate from `set_session_title_option` on purpose: the title
+/// helper is also called from the local `switch-client` path (where ADE
+/// is *not* the parent), and bundling the two would mark switch-client
+/// targets too — defeating the if-shell branch.
+///
+/// Best-effort. Local-only — remote planting/clearing is performed
+/// inline by the remote shell wrapper in `remote_attach_cmd`. Failure
+/// modes that leave the marker stale on a session: ADE itself killed
+/// with SIGKILL (skips the local unset call); remote shell killed with
+/// SIGKILL or a sufficiently abrupt connection loss (skips the `trap …
+/// EXIT`). The recovery is `tmux set-option -t SESSION -u @ade-parent`.
+///
+/// There's also a known race when two ADE processes attach the same
+/// session concurrently as parents: the first to detach unsets the
+/// marker while the second is still attached, so the second's `prefix
+/// B` falls through to `switch-client -l` instead of detaching. v1
+/// accepts this — running two ADEs on the same session at once is
+/// already an unusual setup.
+fn set_session_parent_marker(name: &str, machine: &Machine, set: bool) {
+    if !matches!(machine, Machine::Local) {
+        return;
+    }
+    let Some(session_id) = lookup_session_id(name) else { return };
+    let mut cmd = std::process::Command::new("tmux");
+    if set {
+        cmd.args(["set-option", "-t", &session_id, "@ade-parent", "1"]);
+    } else {
+        cmd.args(["set-option", "-t", &session_id, "-u", "@ade-parent"]);
+    }
+    let _ = cmd.output();
 }
 
 fn lookup_session_id(name: &str) -> Option<String> {
@@ -386,30 +470,70 @@ fn chrono_now() -> String {
 
 /// The remote command to run on the destination host. Always pre-quoted for
 /// the *remote* shell so any special chars in `target` are literal.
-pub(crate) fn remote_attach_cmd(target: &str) -> String {
-    format!("tmux attach -t {}", hosts::shell_quote(target))
+///
+/// When `plant_parent` is true, the returned string is a multi-line shell
+/// script that resolves the session id on the remote, plants `@ade-parent
+/// 1` on it, installs a `trap … EXIT` to clear the marker on detach, and
+/// then runs `tmux attach`. The trap fires after `tmux attach` returns
+/// (whether the user detached cleanly or the connection dropped) so the
+/// session never carries a stale marker into a future direct (non-ADE)
+/// attach. We deliberately *don't* `exec tmux attach` — `exec` replaces
+/// the shell and skips the trap.
+///
+/// We resolve the session id inline (rather than passing one from the
+/// local side) because `tmux set-option -t` doesn't accept the `=name`
+/// exact-match prefix that ADE uses everywhere else; same constraint
+/// `set_session_title_option` documents on the local side.
+pub(crate) fn remote_attach_cmd(target: &str, plant_parent: bool) -> String {
+    let target_q = hosts::shell_quote(target);
+    if !plant_parent {
+        return format!("tmux attach -t {}", target_q);
+    }
+    let bare_name = target.strip_prefix('=').unwrap_or(target);
+    let name_q = hosts::shell_quote(bare_name);
+    format!(
+        "__ade_id=$(tmux list-sessions -F '#{{session_name}}\t#{{session_id}}' 2>/dev/null \
+         | awk -F'\\t' -v n={name_q} '$1==n{{print $2; exit}}')\n\
+         if [ -n \"$__ade_id\" ]; then\n\
+         tmux set-option -t \"$__ade_id\" @ade-parent 1 >/dev/null 2>&1\n\
+         trap 'tmux set-option -t \"$__ade_id\" -u @ade-parent >/dev/null 2>&1' EXIT\n\
+         fi\n\
+         tmux attach -t {target_q}",
+        name_q = name_q,
+        target_q = target_q,
+    )
 }
 
-/// Build (program, args) for an exec-replace attach to a remote host.
-/// No local shell is involved (Command::new + execvp).
+/// Build (program, args) for a remote attach (spawn-and-wait or exec, the
+/// builder doesn't care). No local shell is involved (Command::new +
+/// execvp).
 ///
 /// SSH joins remaining args with spaces and ships them to the remote shell,
 /// which re-parses the resulting command string — so we must pre-quote `target`
-/// for the remote shell.
+/// for the remote shell. The `plant_parent` script returned by
+/// `remote_attach_cmd` is already a complete shell script and goes through
+/// SSH's remote-shell parse step.
 ///
-/// Mosh by contrast forwards the remote argv directly via execvp on the remote
-/// host (no remote shell), so each arg goes through byte-for-byte: we pass them
-/// separately and never quote.
+/// Mosh by contrast forwards the remote argv directly via execvp on the
+/// remote host (no remote shell). When `plant_parent` is false we pass argv
+/// byte-for-byte (`tmux attach -t TARGET`). When true, we wrap the script in
+/// `sh -c '<script>'` so the planting + trap cleanup actually run.
 ///
-/// Reused by `embedded_term::EmbeddedTerm::spawn_remote` so the embedded
-/// PTY follows the same SSH/Mosh routing as the regular full-attach path.
-pub(crate) fn build_attach_command(host: &Host, target: &str) -> (String, Vec<String>) {
+/// Reused by `embedded_term::EmbeddedTerm::spawn_remote` (which always
+/// passes `plant_parent: false` — embedded preview attaches share the same
+/// routing as full attach but must not pollute the session with a stale
+/// `@ade-parent` marker).
+pub(crate) fn build_attach_command(
+    host: &Host,
+    target: &str,
+    plant_parent: bool,
+) -> (String, Vec<String>) {
     match host.kind {
         HostKind::Ssh => {
             let mut args: Vec<String> = host.ssh_args.clone();
             args.push("-t".to_string());
             args.push(host.target.clone());
-            args.push(remote_attach_cmd(target));
+            args.push(remote_attach_cmd(target, plant_parent));
             ("ssh".to_string(), args)
         }
         HostKind::Mosh => {
@@ -424,10 +548,16 @@ pub(crate) fn build_attach_command(host: &Host, target: &str) -> (String, Vec<St
             }
             args.push(host.target.clone());
             args.push("--".to_string());
-            args.push("tmux".to_string());
-            args.push("attach".to_string());
-            args.push("-t".to_string());
-            args.push(target.to_string());
+            if plant_parent {
+                args.push("sh".to_string());
+                args.push("-c".to_string());
+                args.push(remote_attach_cmd(target, plant_parent));
+            } else {
+                args.push("tmux".to_string());
+                args.push("attach".to_string());
+                args.push("-t".to_string());
+                args.push(target.to_string());
+            }
             ("mosh".to_string(), args)
         }
     }
@@ -435,9 +565,10 @@ pub(crate) fn build_attach_command(host: &Host, target: &str) -> (String, Vec<St
 
 #[allow(dead_code)]
 /// Build a single shell command-line suitable for `tmux new-window -- <cmd>`.
-/// Currently unused — remote attaches always go through exec_replace — but
-/// kept around in case we ever want to reintroduce a "new window" attach mode.
-/// The string is parsed by the *local* shell into argv before reaching ssh/mosh.
+/// Currently unused — remote attaches always go through `Command::spawn` —
+/// but kept around in case we ever want to reintroduce a "new window"
+/// attach mode. The string is parsed by the *local* shell into argv before
+/// reaching ssh/mosh.
 ///
 /// For SSH, we additionally need remote-shell quoting on `target` because ssh
 /// joins remaining args with spaces and the remote shell re-parses them — so we
@@ -450,7 +581,7 @@ pub(crate) fn build_attach_command(host: &Host, target: &str) -> (String, Vec<St
 fn build_attach_shell_cmd(host: &Host, target: &str) -> String {
     let raw = match host.kind {
         HostKind::Ssh => {
-            let remote_cmd = remote_attach_cmd(target);
+            let remote_cmd = remote_attach_cmd(target, false);
             let mut s = String::from("ssh");
             for a in &host.ssh_args {
                 s.push(' ');
@@ -491,11 +622,13 @@ fn build_attach_shell_cmd(host: &Host, target: &str) -> String {
     )
 }
 
-fn run_status(program: &str, args: &[&str]) {
+/// Run a short-lived command and surface success / failure as a Result so
+/// the caller can route it into the TUI's `error_message` instead of
+/// killing the process. Used for the local `tmux switch-client` path,
+/// which needs to keep ADE running across attempts.
+fn run_command_capturing(program: &str, args: &[&str]) -> Result<(), String> {
     match Command::new(program).args(args).output() {
         Ok(out) => {
-            // Always append a record so /tmp/ade-attach.log captures the
-            // exact subprocess result, including silent successes.
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
             append_attach_log(&format!(
@@ -507,17 +640,15 @@ fn run_status(program: &str, args: &[&str]) {
                 stderr.trim(),
             ));
 
-            if !out.status.success() {
+            if out.status.success() {
+                Ok(())
+            } else {
                 let stderr_trim = stderr.trim();
-                if stderr_trim.is_empty() {
-                    eprintln!("Error: {} exited with {}", program, out.status);
+                Err(if stderr_trim.is_empty() {
+                    format!("{} exited with {}", program, out.status)
                 } else {
-                    eprintln!(
-                        "Error: {} exited with {}: {}",
-                        program, out.status, stderr_trim
-                    );
-                }
-                std::process::exit(1);
+                    format!("{} exited with {}: {}", program, out.status, stderr_trim)
+                })
             }
         }
         Err(e) => {
@@ -527,8 +658,7 @@ fn run_status(program: &str, args: &[&str]) {
                 args.join(" "),
                 e
             ));
-            eprintln!("Error: failed to run {}: {}", program, e);
-            std::process::exit(1);
+            Err(format!("failed to run {}: {}", program, e))
         }
     }
 }
@@ -544,30 +674,100 @@ fn append_attach_log(line: &str) {
     }
 }
 
-fn exec_replace(program: &str, args: &[&str]) {
-    #[cfg(unix)]
-    {
-        let err = Command::new(program).args(args).exec();
-        eprintln!("Error: failed to exec {}: {}", program, err);
-        std::process::exit(1);
-    }
+/// Persistent run loop. Today's attach is no longer terminal: ADE stays
+/// alive across attaches, suspending its TUI for spawn-and-wait branches
+/// (local-outside-tmux, remote SSH/Mosh) and resuming when the child
+/// exits. Inside-tmux switch-client returns immediately and ADE keeps
+/// drawing — the user navigates back via `prefix L` or the smart `prefix
+/// B` keybinding installed by `ade install-tmux-config`.
+fn run_loop(terminal: &mut DefaultTerminal, config: &Config) -> Result<()> {
+    let mut app = App::new();
 
-    #[cfg(not(unix))]
-    {
-        run_status(program, args);
+    loop {
+        match run_until_action(terminal, &mut app)? {
+            AppAction::Quit => return Ok(()),
+            AppAction::AttachSession { name, machine } => {
+                let outcome = attach_outcome(&name, &machine);
+                log_attach_intent(&name, &machine, outcome);
+                match outcome {
+                    AttachOutcome::SameSessionNoOp => {
+                        append_attach_log(
+                            "skipped: already in this session (switch-client would be a no-op)\n",
+                        );
+                    }
+                    AttachOutcome::SwitchClient => {
+                        // ADE remains the parent process *of nothing*
+                        // after switch-client — the user's tmux client
+                        // moves to the target session, but ADE's pane
+                        // stays alive in the previous session. Don't
+                        // plant `@ade-parent`: the if-shell needs to fall
+                        // through to switch-client -l for `prefix B` to
+                        // bring the user back to ADE.
+                        set_session_title_option(&name, &machine);
+                        let target = format!("={}", name);
+                        if let Err(msg) = run_command_capturing(
+                            "tmux",
+                            &["switch-client", "-t", &target],
+                        ) {
+                            app.error_message = Some(msg);
+                        }
+                    }
+                    AttachOutcome::SpawnAndWait => {
+                        set_session_title_option(&name, &machine);
+                        // Plant `@ade-parent` for local; the remote shell
+                        // wrapper in `remote_attach_cmd` plants + traps
+                        // its own marker for SSH/Mosh.
+                        set_session_parent_marker(&name, &machine, true);
+                        let suspend_err = tui_lifecycle::suspend(terminal)
+                            .map_err(|e| format!("suspend tui: {}", e));
+                        let attach_err = match suspend_err {
+                            Ok(()) => spawn_and_wait_attach(&name, &machine, config),
+                            Err(e) => Err(e),
+                        };
+                        // Always attempt resume — a stuck terminal is
+                        // worse than a missed error.
+                        let resume_err = tui_lifecycle::resume(terminal)
+                            .map_err(|e| format!("resume tui: {}", e));
+                        // Best-effort marker cleanup. Local: runs after
+                        // child.wait() unless ADE itself is SIGKILL'd.
+                        // Remote: cleanup lives in the remote shell's
+                        // `trap … EXIT` (see `remote_attach_cmd`); abrupt
+                        // disconnects or SIGKILL on the remote shell can
+                        // leave the marker stale. Recovery is `tmux
+                        // set-option -t SESSION -u @ade-parent` on the
+                        // affected host.
+                        set_session_parent_marker(&name, &machine, false);
+                        if let Err(msg) = attach_err {
+                            app.error_message = Some(msg);
+                        }
+                        if let Err(msg) = resume_err {
+                            // Surface but don't return — the loop will
+                            // try to keep running. If raw mode never came
+                            // back, the next draw will likely fail and we
+                            // bail then.
+                            eprintln!("Warning: {}", msg);
+                        }
+                        app.refresh();
+                    }
+                }
+                app.action = AppAction::None;
+            }
+            // run_until_action only returns Quit or AttachSession.
+            AppAction::None => unreachable!("run_until_action returns terminal actions only"),
+        }
     }
 }
 
-fn run(terminal: &mut DefaultTerminal) -> Result<Option<AppAction>> {
-    let mut app = App::new();
-
+/// Drive the TUI until the user picks a session or quits. Returns the
+/// action verbatim so `run_loop` can branch on it.
+fn run_until_action(terminal: &mut DefaultTerminal, app: &mut App) -> Result<AppAction> {
     loop {
         // Apply any finished background refresh and schedule a new one if
         // due. Non-blocking — the actual SSH/process calls happen on a
         // worker thread.
         app.tick();
 
-        terminal.draw(|frame| ui::render(frame, &app))?;
+        terminal.draw(|frame| ui::render(frame, app))?;
         term_title::set(&app.tab_title());
 
         if event::poll(Duration::from_millis(100))? {
@@ -585,11 +785,124 @@ fn run(terminal: &mut DefaultTerminal) -> Result<Option<AppAction>> {
         }
 
         if app.should_quit {
-            return Ok(Some(AppAction::Quit));
+            return Ok(AppAction::Quit);
         }
 
         if let AppAction::AttachSession { .. } = &app.action {
-            return Ok(Some(app.action.clone()));
+            return Ok(app.action.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod attach_cmd_tests {
+    use super::*;
+
+    fn ssh_host(name: &str, target: &str) -> Host {
+        Host {
+            name: name.to_string(),
+            kind: HostKind::Ssh,
+            target: target.to_string(),
+            ssh_args: Vec::new(),
+        }
+    }
+
+    fn mosh_host(name: &str, target: &str) -> Host {
+        Host {
+            name: name.to_string(),
+            kind: HostKind::Mosh,
+            target: target.to_string(),
+            ssh_args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn remote_attach_cmd_no_plant_is_simple_attach() {
+        // `=work/web` passes hosts::shell_quote untouched (all chars
+        // are in the safe set), so the rendered form omits quotes.
+        let cmd = remote_attach_cmd("=work/web", false);
+        assert_eq!(cmd, "tmux attach -t =work/web");
+    }
+
+    #[test]
+    fn remote_attach_cmd_with_plant_includes_set_option_and_trap() {
+        let cmd = remote_attach_cmd("=work", true);
+        assert!(cmd.contains("tmux list-sessions"));
+        assert!(cmd.contains("@ade-parent 1"));
+        assert!(cmd.contains("trap"));
+        assert!(cmd.contains("-u @ade-parent"));
+        assert!(cmd.contains("tmux attach -t =work"));
+        // Must not `exec` the attach — exec would skip the trap.
+        assert!(!cmd.contains("exec tmux attach"));
+    }
+
+    #[test]
+    fn remote_attach_cmd_quotes_session_names_with_spaces() {
+        let cmd = remote_attach_cmd("=my session", true);
+        // Both the bare-name (for awk lookup) and the target (for attach)
+        // must arrive shell-quoted.
+        assert!(cmd.contains("n='my session'"));
+        assert!(cmd.contains("tmux attach -t '=my session'"));
+    }
+
+    #[test]
+    fn remote_attach_cmd_quotes_session_names_with_single_quotes() {
+        let cmd = remote_attach_cmd("=it's-mine", true);
+        // hosts::shell_quote produces 'it'\''s-mine' for embedded
+        // single quotes; verify both occurrences come out intact.
+        let want = hosts::shell_quote("it's-mine");
+        let want_target = hosts::shell_quote("=it's-mine");
+        assert!(cmd.contains(&format!("n={}", want)));
+        assert!(cmd.contains(&format!("tmux attach -t {}", want_target)));
+    }
+
+    #[test]
+    fn build_attach_command_ssh_no_plant_passes_simple_attach() {
+        let host = ssh_host("h", "user@h");
+        let (program, args) = build_attach_command(&host, "=foo", false);
+        assert_eq!(program, "ssh");
+        // The remote command is the last arg. `=foo` is in
+        // hosts::shell_quote's safe set so no surrounding quotes.
+        let remote = args.last().unwrap();
+        assert_eq!(remote, "tmux attach -t =foo");
+    }
+
+    #[test]
+    fn build_attach_command_ssh_with_plant_emits_script() {
+        let host = ssh_host("h", "user@h");
+        let (program, args) = build_attach_command(&host, "=foo", true);
+        assert_eq!(program, "ssh");
+        let remote = args.last().unwrap();
+        assert!(remote.contains("@ade-parent 1"));
+        assert!(remote.contains("trap"));
+    }
+
+    #[test]
+    fn build_attach_command_mosh_no_plant_uses_direct_argv() {
+        let host = mosh_host("h", "user@h");
+        let (program, args) = build_attach_command(&host, "=foo", false);
+        assert_eq!(program, "mosh");
+        // No `sh -c` wrapper.
+        assert!(!args.iter().any(|a| a == "sh"));
+        // Direct argv after `--`: tmux attach -t =foo
+        let dash_idx = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[dash_idx + 1], "tmux");
+        assert_eq!(args[dash_idx + 2], "attach");
+        assert_eq!(args[dash_idx + 3], "-t");
+        assert_eq!(args[dash_idx + 4], "=foo");
+    }
+
+    #[test]
+    fn build_attach_command_mosh_with_plant_wraps_in_sh_c() {
+        let host = mosh_host("h", "user@h");
+        let (program, args) = build_attach_command(&host, "=foo", true);
+        assert_eq!(program, "mosh");
+        let dash_idx = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[dash_idx + 1], "sh");
+        assert_eq!(args[dash_idx + 2], "-c");
+        let script = &args[dash_idx + 3];
+        assert!(script.contains("@ade-parent 1"));
+        assert!(script.contains("trap"));
+        assert!(script.contains("tmux attach -t =foo"));
     }
 }
