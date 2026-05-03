@@ -61,8 +61,13 @@ fn main() -> Result<()> {
     // `MouseCaptureGuard` — enabling it globally would swallow
     // the user's normal terminal scroll / Cmd+drag selection
     // while they're just browsing the tree.
-    let (config, _warning) = Config::load();
-    let result = run_loop(&mut terminal, &config);
+    //
+    // No `Config::load()` here — `App::new()` loads it (and the Hosts
+    // screen mutates `app.config` in place + persists). Loading a
+    // separate snapshot here would go stale the moment the user adds
+    // or edits a host mid-session, and the next attach to that host
+    // would resolve against the old config.
+    let result = run_loop(&mut terminal);
     ratatui::restore();
     term_title::clear();
 
@@ -680,7 +685,7 @@ fn append_attach_log(line: &str) {
 /// exits. Inside-tmux switch-client returns immediately and ADE keeps
 /// drawing — the user navigates back via `prefix L` or the smart `prefix
 /// B` keybinding installed by `ade install-tmux-config`.
-fn run_loop(terminal: &mut DefaultTerminal, config: &Config) -> Result<()> {
+fn run_loop(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut app = App::new();
 
     loop {
@@ -721,7 +726,10 @@ fn run_loop(terminal: &mut DefaultTerminal, config: &Config) -> Result<()> {
                         let suspend_err = tui_lifecycle::suspend(terminal)
                             .map_err(|e| format!("suspend tui: {}", e));
                         let attach_err = match suspend_err {
-                            Ok(()) => spawn_and_wait_attach(&name, &machine, config),
+                            // Use the live `app.config` so adds/edits via
+                            // the Hosts screen take effect on the very
+                            // next attach, no restart required.
+                            Ok(()) => spawn_and_wait_attach(&name, &machine, &app.config),
                             Err(e) => Err(e),
                         };
                         // Always attempt resume — a stuck terminal is
