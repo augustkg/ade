@@ -29,6 +29,14 @@ use std::time::{Duration, SystemTime};
 /// idle-state cleanup.
 const WORKING_TTL: Duration = Duration::from_secs(4 * 60 * 60);
 
+/// Per-session Claude state observed by ADE.
+///
+/// **Variant order is load-bearing.** `PartialOrd` is derived in declaration
+/// order, and the rollup in `crate::tmux::map_claude_states` does
+/// `if state > *cur { *cur = state }` — so the ordering picks which state
+/// "wins" when a session has multiple Claude panes in different states.
+/// `Idle < Working < AwaitingApproval` means an awaiting-approval pane
+/// always shows the most attention-grabbing chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ClaudeState {
     /// Claude is loaded but waiting for user input. (Default when a pane
@@ -38,6 +46,25 @@ pub enum ClaudeState {
     /// Claude is actively processing a turn (last hook event was
     /// `UserPromptSubmit`, no `Stop` since).
     Working,
+    /// Claude is waiting on the user to approve a permission prompt.
+    /// Set by the `Notification[matcher=permission_prompt]` hook.
+    AwaitingApproval,
+}
+
+/// How a `ClaudeState` reading reached us. Drives notification-suppression
+/// rule 5 (TTL/orphan demotions are not "Claude finished a turn"). When
+/// `read_local_statuses_with_working_ttl` or `demote_orphan_working_files`
+/// synthesises an `Idle` from a stale `Working` cache file, the resulting
+/// reading is `Demoted` even though it looks identical to a freshly-written
+/// `Idle`. App-side diff logic skips notifications for `Demoted` transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// The state was read from a status file the hook actually wrote.
+    Recorded,
+    /// ADE synthesised this state — typically demoting a stale `Working`
+    /// or `AwaitingApproval` because the file's mtime exceeded `WORKING_TTL`
+    /// or because the Claude pane's pid is no longer in the descendant set.
+    Demoted,
 }
 
 /// Read every `*.json` file under `~/.cache/ade/claude-status/` and return a
@@ -70,31 +97,47 @@ pub fn read_local_statuses() -> HashMap<String, ClaudeState> {
     out
 }
 
-/// Same as `read_local_statuses` but applies a TTL to `Working` entries.
+/// Same as `read_local_statuses` but applies a TTL to `Working` /
+/// `AwaitingApproval` entries and tags each reading with its `Provenance`.
 ///
 /// Reasoning: every legitimate "Claude is now idle" transition triggers one
 /// of our hooks (`Stop`, `StopFailure`, `SessionEnd`,
 /// `Notification(idle_prompt)`, `SessionStart`) which overwrites the cache
-/// file with `state=idle`. A `working` cache file that hasn't been touched
-/// in `WORKING_TTL` means *every* idle hook failed to fire — the most
-/// common cause being that the hooks weren't installed yet when the
-/// in-progress Claude session started, so it can't emit them retroactively.
-/// In that case we'd rather show "no chip" than a stale chip until the
-/// user submits another prompt.
+/// file with `state=idle`. A `working` (or `awaiting_approval`) cache file
+/// that hasn't been touched in `WORKING_TTL` means *every* idle hook failed
+/// to fire — the most common cause being that the hooks weren't installed
+/// yet when the in-progress Claude session started, so it can't emit them
+/// retroactively. In that case we'd rather show "no chip" than a stale chip
+/// until the user submits another prompt.
 ///
 /// Read-only — never modifies the cache file. The next legitimate hook
 /// firing (or `SessionStart` on Claude relaunch) will overwrite naturally.
 /// Local-only by design: `fs::metadata().modified()` is the local kernel's
 /// view of the local filesystem, with no clock-skew exposure that would
 /// false-demote on a host with a drifting clock.
-pub fn read_local_statuses_with_working_ttl() -> HashMap<String, ClaudeState> {
-    let mut out = read_local_statuses();
+///
+/// `Provenance::Recorded` means the state came from a hook-written file
+/// (or no demotion was needed). `Provenance::Demoted` means we synthesised
+/// the `Idle` from a stale active file. The notification dispatch in
+/// `App::apply_refresh_result` uses Provenance to suppress false-positive
+/// "Claude finished" banners that would otherwise fire when TTL just ran.
+pub fn read_local_statuses_with_working_ttl() -> HashMap<String, (ClaudeState, Provenance)> {
+    let raw = read_local_statuses();
+    let mut out: HashMap<String, (ClaudeState, Provenance)> = raw
+        .into_iter()
+        .map(|(k, v)| (k, (v, Provenance::Recorded)))
+        .collect();
     let Some(dir) = status_dir() else {
         return out;
     };
     let now = SystemTime::now();
-    for (pane_id, state) in out.iter_mut() {
-        if !matches!(state, ClaudeState::Working) {
+    for (pane_id, entry) in out.iter_mut() {
+        // Only TTL the active states; Idle is already the "nothing to do"
+        // state and demoting it again would be a no-op.
+        if !matches!(
+            entry.0,
+            ClaudeState::Working | ClaudeState::AwaitingApproval
+        ) {
             continue;
         }
         let path = dir.join(format!("{}.json", pane_id));
@@ -106,7 +149,7 @@ pub fn read_local_statuses_with_working_ttl() -> HashMap<String, ClaudeState> {
         };
         let elapsed = now.duration_since(mtime).unwrap_or(Duration::ZERO);
         if elapsed > WORKING_TTL {
-            *state = ClaudeState::Idle;
+            *entry = (ClaudeState::Idle, Provenance::Demoted);
         }
     }
     out
@@ -125,7 +168,12 @@ pub fn read_local_statuses_with_working_ttl() -> HashMap<String, ClaudeState> {
 /// ```
 ///
 /// i.e. `<pane_id>\n<json body>\n---ADE-STATUS-END---\n`, repeated.
-pub fn parse_remote_statuses(text: &str) -> HashMap<String, ClaudeState> {
+///
+/// All entries are `Provenance::Recorded` — the remote probe does not
+/// apply a TTL or orphan-walk (the remote tmux runs its own hook chain
+/// against its own clock, so demotion happens server-side and we trust
+/// what we read).
+pub fn parse_remote_statuses(text: &str) -> HashMap<String, (ClaudeState, Provenance)> {
     let mut out = HashMap::new();
     for chunk in text.split("---ADE-STATUS-END---") {
         let trimmed = chunk.trim_start_matches('\n');
@@ -136,7 +184,7 @@ pub fn parse_remote_statuses(text: &str) -> HashMap<String, ClaudeState> {
         let Some(pane_id) = lines.next() else { continue };
         let body: String = lines.collect::<Vec<_>>().join("\n");
         if let Some(state) = parse_status_body(&body) {
-            out.insert(pane_id.trim().to_string(), state);
+            out.insert(pane_id.trim().to_string(), (state, Provenance::Recorded));
         }
     }
     out
@@ -194,44 +242,55 @@ fn parse_status_body(body: &str) -> Option<ClaudeState> {
     match state {
         "working" => Some(ClaudeState::Working),
         "idle" => Some(ClaudeState::Idle),
+        "awaiting_approval" => Some(ClaudeState::AwaitingApproval),
         _ => None,
     }
 }
 
 /// On refresh, any pane that no longer has Claude in its process tree but
-/// still has a `state=working` status file on disk is "orphaned" — Claude
-/// died (kill -9, crash, SSH drop, anything that fires no terminal hook)
-/// without writing idle. Demote the file so a future Claude relaunched in
-/// the same tmux pane doesn't inherit the stale working state.
+/// still has an active (`working` or `awaiting_approval`) status file on
+/// disk is "orphaned" — Claude died (kill -9, crash, SSH drop, anything
+/// that fires no terminal hook) without writing idle. Demote the file so a
+/// future Claude relaunched in the same tmux pane doesn't inherit the
+/// stale active state.
 ///
-/// Returns the count of files demoted. Caller MUST gate this on a
-/// successful `ps` snapshot — if the descendant set is empty because `ps`
-/// failed (not because Claude is actually gone), every pane would look
-/// orphaned and we'd false-demote every working chip.
+/// Returns the set of pane_ids that were demoted in this pass — fed back
+/// into the in-memory rollup so the same refresh tick treats them as
+/// `Provenance::Demoted` (suppressing notification-dispatch rule 5)
+/// without waiting for the next tick to re-read the file.
+///
+/// Caller MUST gate this on a successful `ps` snapshot — if the descendant
+/// set is empty because `ps` failed (not because Claude is actually gone),
+/// every pane would look orphaned and we'd false-demote every active chip.
 pub fn demote_orphan_working_files<I>(
     panes: I,
     claude_pane_pids: &HashSet<u32>,
-    statuses: &HashMap<String, ClaudeState>,
-) -> usize
+    statuses: &HashMap<String, (ClaudeState, Provenance)>,
+) -> HashSet<String>
 where
     I: IntoIterator<Item = (String, String, u32)>,
 {
+    let mut demoted: HashSet<String> = HashSet::new();
     let dir = match status_dir() {
         Some(d) => d,
-        None => return 0,
+        None => return demoted,
     };
-    let mut demoted = 0;
     for (cmd, pane_id, pane_pid) in panes {
         let is_claude = cmd == "claude" || claude_pane_pids.contains(&pane_pid);
         if is_claude {
             continue;
         }
-        if matches!(statuses.get(&pane_id), Some(ClaudeState::Working)) {
-            let path = dir.join(format!("{}.json", pane_id));
-            // Minimal idle payload — `at` is decorative (parser ignores it).
-            if std::fs::write(&path, br#"{"state":"idle"}"#).is_ok() {
-                demoted += 1;
-            }
+        let active = matches!(
+            statuses.get(&pane_id).map(|(s, _)| s),
+            Some(ClaudeState::Working | ClaudeState::AwaitingApproval)
+        );
+        if !active {
+            continue;
+        }
+        let path = dir.join(format!("{}.json", pane_id));
+        // Minimal idle payload — `at` is decorative (parser ignores it).
+        if std::fs::write(&path, br#"{"state":"idle"}"#).is_ok() {
+            demoted.insert(pane_id);
         }
     }
     demoted
@@ -325,9 +384,41 @@ mod tests {
 ---ADE-STATUS-END---\n\
 %17\n\
 {\"state\":\"idle\"}\n\
+---ADE-STATUS-END---\n\
+%99\n\
+{\"state\":\"awaiting_approval\"}\n\
 ---ADE-STATUS-END---\n";
         let result = parse_remote_statuses(text);
-        assert_eq!(result.get("%5"), Some(&ClaudeState::Working));
-        assert_eq!(result.get("%17"), Some(&ClaudeState::Idle));
+        assert_eq!(
+            result.get("%5"),
+            Some(&(ClaudeState::Working, Provenance::Recorded))
+        );
+        assert_eq!(
+            result.get("%17"),
+            Some(&(ClaudeState::Idle, Provenance::Recorded))
+        );
+        assert_eq!(
+            result.get("%99"),
+            Some(&(ClaudeState::AwaitingApproval, Provenance::Recorded))
+        );
+    }
+
+    #[test]
+    fn parse_status_body_awaiting_approval() {
+        let body = r#"{"state":"awaiting_approval","at":"2026-05-02T12:00:00Z"}"#;
+        assert_eq!(
+            parse_status_body(body),
+            Some(ClaudeState::AwaitingApproval)
+        );
+    }
+
+    #[test]
+    fn claude_state_partial_ord_idle_lt_working_lt_awaiting() {
+        // Load-bearing: the rollup `if state > *cur { *cur = state }` in
+        // tmux::map_claude_states relies on this ordering to prefer the
+        // most attention-grabbing state when a session has multiple panes.
+        assert!(ClaudeState::Idle < ClaudeState::Working);
+        assert!(ClaudeState::Working < ClaudeState::AwaitingApproval);
+        assert!(ClaudeState::Idle < ClaudeState::AwaitingApproval);
     }
 }

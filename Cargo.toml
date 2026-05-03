@@ -18,3 +18,12 @@ toml = "0.8"
 ansi-to-tui = "7"
 portable-pty = "0.9"
 vt100 = "0.15"
+# Native macOS NotificationCenter banners. On macOS this delegates to
+# `mac-notification-sys` which uses NSUserNotification — deprecated by
+# Apple but the only path that works for an unsigned terminal binary.
+# v1 ships macOS-only; the crate's Linux D-Bus fallback works
+# unchanged if anyone ports later.
+notify-rust = "4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

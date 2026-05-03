@@ -1,10 +1,12 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::claude_status::ClaudeState;
 use crate::cwd;
 use crate::embedded_term::{chord_step, translate_mouse, ChordOutcome, ChordState, EmbeddedTerm};
+use crate::notifications;
 use crate::hosts::{Config, Host, HostKind};
 use crate::install_hooks;
 use crate::install_tmux::InstallStatus;
@@ -20,6 +22,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// cheap; remote backends are spawned in parallel threads and bounded by the
 /// per-host SSH ConnectTimeout. Tuning point if it ever feels janky.
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Per-session notification debounce — suppresses repeats within this
+/// window. Defends against status-file flapping (e.g. `Stop` immediately
+/// followed by another `UserPromptSubmit`, or `permission_prompt` firing
+/// multiple times during a single approval flow). Conservative default;
+/// raise if real users report banner spam.
+const NOTIFICATION_DEBOUNCE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -355,6 +364,41 @@ pub struct App {
     /// When the most recent refresh (sync or background) was *started*. Used
     /// by `tick()` to decide when the next background refresh is due.
     last_refresh_started: Instant,
+
+    // ---- Notification dispatch state (`src/notifications.rs`) ----
+    /// Per-session Claude state from the most recent refresh, keyed by
+    /// `(Machine, session_id)`. Compared against the current refresh in
+    /// `apply_refresh_result` to detect transitions (see the table in
+    /// `lets-add-a-new-toasty-narwhal.md`). `session_id` is tmux's stable
+    /// `$N` — survives `rename-session` so the diff doesn't miss
+    /// transitions across mid-turn renames.
+    pub prior_claude_states: HashMap<(Machine, String), ClaudeState>,
+    /// Per-session "last time we fired a notification" timestamp, used by
+    /// suppression rule 7 (debounce: skip repeats within 5s).
+    pub last_notified_at: HashMap<(Machine, String), Instant>,
+    /// True after the first successful `apply_refresh_result`. Until then,
+    /// `prior_claude_states` is empty and we'd notify for every initial
+    /// state — suppression rule 2 skips that pass entirely.
+    pub notifications_initialised: bool,
+    /// `Some((machine, session_id))` while the user has Tab'd into a
+    /// session. Mirror of `embedded_term`'s target — kept separate
+    /// because `embedded_term` doesn't carry tmux identity. Used by
+    /// suppression rule 4: don't fire for the session the user is
+    /// actively viewing in the embedded panel. Cleared everywhere
+    /// `exit_embedded` is invoked (which itself runs on the chord exit,
+    /// the write-failure path, and `tick`'s dead-child detection).
+    pub embedded_target: Option<(Machine, String)>,
+    /// Loaded from `state.notifications.first_seen`. When false AND
+    /// `state.notifications.enabled` is false, the first-run footer
+    /// nudge ("Desktop notifications available — press N…") is shown.
+    /// Flipped true when the user presses `N` (enable) or `x` (dismiss).
+    pub notifications_first_seen: bool,
+    /// Sessions whose *most recent* refresh saw a `Provenance::Demoted`
+    /// reading (TTL synthesised an Idle from a stale active file).
+    /// Suppression rule 5 reads this on the *next* tick to skip the
+    /// false-positive `Some(Working) → None` banner that the demote
+    /// would otherwise produce.
+    pub prior_demoted: HashSet<(Machine, String)>,
 }
 
 impl Default for App {
@@ -395,9 +439,49 @@ impl App {
             hosts_notice: None,
             pending_refresh: None,
             last_refresh_started: Instant::now(),
+            prior_claude_states: HashMap::new(),
+            last_notified_at: HashMap::new(),
+            notifications_initialised: false,
+            embedded_target: None,
+            notifications_first_seen: persisted.notifications.first_seen,
+            prior_demoted: HashSet::new(),
         };
         app.refresh();
         app
+    }
+
+    /// True when the opt-in nudge for desktop notifications should appear
+    /// in the main-tree footer. Mirrors `should_show_tmux_nudge`'s gating
+    /// shape: only in tree state, only when notifications are off, only
+    /// when the user hasn't already been shown this nudge or the hint
+    /// to re-run install-hooks. Press `N` to enable (which also sets
+    /// `first_seen`), `x` to dismiss.
+    pub fn should_show_notifications_nudge(&self) -> bool {
+        matches!(self.state, AppState::Tree)
+            && !self.notifications_first_seen
+            && !State::load().notifications.enabled
+    }
+
+    /// True when notifications are enabled but ADE detects the Claude
+    /// hooks aren't installed (or are stale v1 / missing the new
+    /// `permission_prompt` matcher) on local OR any configured remote.
+    /// Tells the user to run `ade install-hooks` so they actually get
+    /// banners — without this nudge they'd silently miss them after
+    /// updating ADE without re-installing hooks.
+    pub fn should_show_hooks_stale_nudge(&self) -> bool {
+        if !matches!(self.state, AppState::Tree) {
+            return false;
+        }
+        if !State::load().notifications.enabled {
+            return false;
+        }
+        if !self.local_hooks_installed {
+            return true;
+        }
+        // Any remote host whose marker check returned false (not unknown).
+        self.host_hooks
+            .values()
+            .any(|status| matches!(status, Some(false)))
     }
 
     /// Save the set of collapsed folder prefixes to
@@ -454,6 +538,8 @@ impl App {
 
     /// Apply a refresh result (from sync or background) to App state.
     /// Snapshots current expansion state first so user toggles aren't lost.
+    /// After the tree is rebuilt, runs the per-session transition diff that
+    /// dispatches macOS desktop notifications (see `dispatch_notifications`).
     fn apply_refresh_result(&mut self, result: RefreshResult) {
         for (k, v) in self.tree.expanded_snapshot() {
             self.expanded_memory.insert(k, v);
@@ -469,12 +555,228 @@ impl App {
         if self.selected_index >= n {
             self.selected_index = n - 1;
         }
+
+        self.dispatch_notifications();
+    }
+
+    /// Build a per-session map of `(Machine, session_id) → ClaudeState` from
+    /// the freshly-rebuilt tree, diff it against `self.prior_claude_states`,
+    /// and fire `notifications::fire` for each transition that survives the
+    /// suppression rules. Updates `prior_claude_states`,
+    /// `last_notified_at`, and `notifications_initialised` at the end.
+    ///
+    /// **Suppression rules** (in evaluation order — match the plan doc):
+    /// 1. Global `state.notifications.enabled` flag (cheapest gate).
+    /// 2. First refresh after launch: `notifications_initialised` is false.
+    /// 3. Currently-attached local session (`tree.current_session`).
+    /// 4. Embedded-Tab target (`embedded_target`).
+    /// 5. TTL/orphan-driven demotion (the *prior* tick's session was
+    ///    `claude_demoted = true`, meaning the active state we observed
+    ///    last tick came from a TTL synthesis — suppressing this tick's
+    ///    `→ None` transition that's just the demote materialising).
+    /// 6. SessionStart restart false-positive: accepted in v1, no
+    ///    additional suppression here.
+    /// 7. Per-session debounce within `NOTIFICATION_DEBOUNCE`.
+    fn dispatch_notifications(&mut self) {
+        // Defense in depth against the embedded dead-child race: even
+        // though `tick()` runs `is_alive()` before us, the child can die
+        // between that check and now. Re-check here so the embedded_target
+        // suppression in rule 4 doesn't read a stale value.
+        if let Some(et) = self.embedded_term.as_mut() {
+            if !et.is_alive() {
+                self.exit_embedded();
+            }
+        }
+
+        let enabled = State::load().notifications.enabled;
+
+        // Build the new state map from the rebuilt tree. Carries
+        // `claude_demoted` alongside the state so we can stash it as part
+        // of the prior-state record for next-tick rule 5 evaluation.
+        let mut new_states: HashMap<(Machine, String), (Option<ClaudeState>, bool)> =
+            HashMap::new();
+        for s in &self.tree.sessions {
+            new_states.insert(
+                (s.machine.clone(), s.session_id.clone()),
+                (s.claude, s.claude_demoted),
+            );
+        }
+
+        // Machines that errored this refresh — used by the
+        // vanished-session second pass to avoid firing "Claude finished"
+        // for every active session on a host that just went unreachable
+        // (the sessions are still alive over there; we just couldn't
+        // reach them this tick).
+        let errored_machines: HashSet<Machine> = self
+            .tree
+            .errors
+            .iter()
+            .map(|(m, _)| m.clone())
+            .collect();
+
+        if enabled && self.notifications_initialised {
+            for (key, (new_state, demoted)) in &new_states {
+                let prior = self.prior_claude_states.get(key).copied();
+                if !is_fire_transition(prior, *new_state) {
+                    continue;
+                }
+                // Rule 5 (current-tick demote): if THIS tick saw a
+                // Provenance::Demoted reading for the session, the
+                // active → None transition is just the TTL/orphan
+                // synthesis materialising — not a real "Claude finished".
+                // Must check current-tick `demoted`, not prior_demoted —
+                // the demote happens this tick, and using prior would
+                // miss the immediate suppression and only catch the
+                // *next* tick's `None → None` non-transition (which never
+                // fires anyway).
+                if *demoted && new_state.is_none() {
+                    continue;
+                }
+                if self.suppress_transition(key) {
+                    continue;
+                }
+                let (machine, _sid) = key;
+                let session = self
+                    .tree
+                    .sessions
+                    .iter()
+                    .find(|s| &s.machine == machine && &s.session_id == &key.1);
+                let Some(s) = session else { continue };
+                notifications::fire(
+                    machine.title_label(),
+                    s.prefix.as_deref(),
+                    &s.leaf,
+                );
+                self.last_notified_at.insert(key.clone(), Instant::now());
+            }
+
+            // Sessions that disappeared entirely between ticks: same
+            // logic — if the prior state was active, treat as `→ None`.
+            // The `for new_states` loop above only iterates sessions
+            // that exist *now*, so killed sessions wouldn't be caught
+            // without this second pass.
+            let prior_keys: Vec<(Machine, String)> =
+                self.prior_claude_states.keys().cloned().collect();
+            for key in prior_keys {
+                if new_states.contains_key(&key) {
+                    continue;
+                }
+                // Skip "vanished" entries when their host errored this
+                // refresh — the sessions probably still exist; we just
+                // couldn't see them. Without this guard, a brief mosh
+                // network blip would fire `host/$id` notifications for
+                // every active session on that host.
+                if errored_machines.contains(&key.0) {
+                    continue;
+                }
+                let prior = self.prior_claude_states.get(&key).copied();
+                if !is_fire_transition(prior, None) {
+                    continue;
+                }
+                if self.suppress_transition(&key) {
+                    continue;
+                }
+                // Without a current Session row we have no folder/leaf
+                // for the body — fall back to the raw session_id. This
+                // is the rare case where a session vanished between
+                // ticks; copy reads "local/$3" but the user still gets
+                // the signal that something they were watching ended.
+                let (machine, sid) = &key;
+                notifications::fire(machine.title_label(), None, sid);
+                self.last_notified_at.insert(key, Instant::now());
+            }
+        }
+
+        // Rebuild prior_claude_states only with sessions we actually saw.
+        // For errored machines, KEEP the previous prior entries — they
+        // didn't actually disappear; we just couldn't observe them. This
+        // way, when the host comes back, the comparison is against the
+        // last-known state, not against an empty baseline.
+        let mut next_prior: HashMap<(Machine, String), ClaudeState> =
+            new_states
+                .iter()
+                .filter_map(|(k, (state, _))| state.map(|s| (k.clone(), s)))
+                .collect();
+        for (key, state) in &self.prior_claude_states {
+            if errored_machines.contains(&key.0) && !next_prior.contains_key(key) {
+                next_prior.insert(key.clone(), *state);
+            }
+        }
+        self.prior_claude_states = next_prior;
+
+        // `prior_demoted` is no longer load-bearing for suppression
+        // (current-tick demoted flag in `new_states[key].1` covers it),
+        // but we keep it cached so future tick logic — e.g. tracking
+        // sessions that recovered from demotion — has the data on hand.
+        self.prior_demoted = new_states
+            .iter()
+            .filter_map(|(k, (_, dem))| if *dem { Some(k.clone()) } else { None })
+            .collect();
+        self.notifications_initialised = true;
+    }
+
+    /// Per-key suppression evaluator — applies rules 3 (current session),
+    /// 4 (embedded target), 5 (TTL demote), 7 (debounce). Rules 1
+    /// (enabled) and 2 (initialised) are checked at the call site
+    /// because they short-circuit the whole loop, not per-key.
+    fn suppress_transition(&self, key: &(Machine, String)) -> bool {
+        // Rule 3: currently-attached local session.
+        if matches!(key.0, Machine::Local) {
+            if let Some(current_name) = &self.tree.current_session {
+                // tmux::current_session returns by name; resolve to a
+                // session_id via the tree.
+                let cur_id = self
+                    .tree
+                    .sessions
+                    .iter()
+                    .find(|s| &s.raw_name == current_name && matches!(s.machine, Machine::Local))
+                    .map(|s| s.session_id.clone());
+                if cur_id.as_ref() == Some(&key.1) {
+                    return true;
+                }
+            }
+        }
+        // Rule 4: embedded-Tab target.
+        if self.embedded_target.as_ref() == Some(key) {
+            return true;
+        }
+        // Rule 5: prior tick's reading was demoted (TTL/orphan).
+        if self.prior_demoted.contains(key) {
+            return true;
+        }
+        // Rule 7: per-session debounce.
+        if let Some(last) = self.last_notified_at.get(key) {
+            if last.elapsed() < NOTIFICATION_DEBOUNCE {
+                return true;
+            }
+        }
+        false
     }
 
     /// Called once per event-loop iteration. Applies a finished background
     /// refresh and schedules a new one when the interval has elapsed.
     /// Non-blocking: if the worker is still running, just leaves it alone.
+    ///
+    /// Dead-child detection runs **before** `apply_refresh_result` so the
+    /// notification dispatch (rule 4: suppress for the embedded target)
+    /// reads a fresh `embedded_target = None` on the same tick the child
+    /// died, rather than seeing a stale embedded_target and incorrectly
+    /// suppressing a real "Claude finished" banner for the just-detached
+    /// session.
     pub fn tick(&mut self) {
+        // Detect a dead embedded child (target session killed externally,
+        // mosh/ssh dropped, etc.) and exit cleanly back to the tree —
+        // BEFORE we apply the refresh, so the diff in
+        // `apply_refresh_result` sees the cleared `embedded_target`.
+        let embedded_dead = self
+            .embedded_term
+            .as_mut()
+            .map(|et| !et.is_alive())
+            .unwrap_or(false);
+        if embedded_dead {
+            self.exit_embedded();
+        }
+
         if let Some(handle) = self.pending_refresh.take() {
             if handle.is_finished() {
                 if let Ok(result) = handle.join() {
@@ -493,17 +795,6 @@ impl App {
         if self.preview_pane_enabled && self.embedded_term.is_none() {
             let target = self.preview_target();
             self.preview_pane.tick(target.as_ref(), &self.config.hosts);
-        }
-
-        // Detect a dead embedded child (target session killed externally,
-        // mosh/ssh dropped, etc.) and exit cleanly back to the tree.
-        let embedded_dead = self
-            .embedded_term
-            .as_mut()
-            .map(|et| !et.is_alive())
-            .unwrap_or(false);
-        if embedded_dead {
-            self.exit_embedded();
         }
 
         if self.pending_refresh.is_none()
@@ -542,17 +833,22 @@ impl App {
         }
     }
 
-    /// True when the in-TUI "tmux clipboard not configured" nudge should be
-    /// rendered. Only shown when ADE is running inside tmux (otherwise the
-    /// fix isn't relevant), the marker is missing locally, the user hasn't
-    /// already dismissed it, and we're in the main tree state — so the `x`
-    /// dismissal binding is always reachable when the nudge is visible
-    /// rather than being shadowed by a modal's own keymap.
+    /// True when the in-TUI "tmux config not installed / out of date" nudge
+    /// should be rendered. Only shown when ADE is running inside tmux
+    /// (otherwise the fix isn't relevant), the marker is missing or stale
+    /// locally, the user hasn't already dismissed it, and we're in the main
+    /// tree state — so the `x` dismissal binding is always reachable when
+    /// the nudge is visible rather than being shadowed by a modal's own
+    /// keymap. Stale matches when the managed body version bumped (e.g.
+    /// v3 → v4) and the user hasn't re-run `ade install-tmux-config` yet.
     pub fn should_show_tmux_nudge(&self) -> bool {
         !self.tmux_nudge_dismissed
             && matches!(self.state, AppState::Tree)
             && tmux::is_inside_tmux()
-            && matches!(self.local_tmux_config_status, InstallStatus::Missing)
+            && matches!(
+                self.local_tmux_config_status,
+                InstallStatus::Missing | InstallStatus::Stale
+            )
     }
 
     /// Persist the dismissal so we don't re-pester after restart. State
@@ -571,6 +867,34 @@ impl App {
         self.preview_pane_enabled = !self.preview_pane_enabled;
         let mut state = State::load();
         state.preview_pane.enabled = self.preview_pane_enabled;
+        let _ = state.save();
+    }
+
+    /// Toggle desktop notifications and persist. First toggle also flips
+    /// `first_seen` so the opt-in nudge stops appearing. The new value is
+    /// announced via a transient `error_message` (existing pattern in
+    /// other toggles) so the user gets immediate visual confirmation.
+    fn toggle_notifications(&mut self) {
+        let mut state = State::load();
+        state.notifications.enabled = !state.notifications.enabled;
+        state.notifications.first_seen = true;
+        let new_state = state.notifications.enabled;
+        let _ = state.save();
+        self.notifications_first_seen = true;
+        self.error_message = Some(if new_state {
+            "Notifications enabled".to_string()
+        } else {
+            "Notifications disabled".to_string()
+        });
+    }
+
+    /// Persist the user's dismissal of the desktop-notifications nudge
+    /// without enabling notifications. Same pattern as
+    /// `dismiss_tmux_nudge`.
+    fn dismiss_notifications_nudge(&mut self) {
+        self.notifications_first_seen = true;
+        let mut state = State::load();
+        state.notifications.first_seen = true;
         let _ = state.save();
     }
 
@@ -673,10 +997,11 @@ impl App {
         };
         let name = session.raw_name.clone();
         let machine = session.machine.clone();
+        let session_id = session.session_id.clone();
 
         // Placeholder size — UI's first frame after entering embedded
         // immediately calls `resize()` with the actual rect dimensions.
-        let result = match machine {
+        let result = match machine.clone() {
             Machine::Local => EmbeddedTerm::spawn_local(&name, 24, 80),
             Machine::Remote(host_name) => match self
                 .config
@@ -692,6 +1017,10 @@ impl App {
             Ok(et) => {
                 self.embedded_term = Some(et);
                 self.embedded_chord = ChordState::Idle;
+                // Notification suppression rule 4: while the user is
+                // viewing this session in the embedded panel, don't fire
+                // banners for it. Cleared in `exit_embedded`.
+                self.embedded_target = Some((machine, session_id));
             }
             Err(e) => {
                 self.error_message = Some(format!("embedded: {}", e));
@@ -702,7 +1031,9 @@ impl App {
     /// Tear down the embedded session and return focus to the tree.
     /// Idempotent: calling when not embedded is a no-op. Called by:
     /// the exit chord, write-failure detection in `handle_embedded_key`,
-    /// and child-death detection in `tick`.
+    /// and child-death detection in `tick`. Clears `embedded_target` in
+    /// every path so notification rule 4 doesn't permanently suppress
+    /// the previously-attached session.
     fn exit_embedded(&mut self) {
         if let Some(mut et) = self.embedded_term.take() {
             et.kill();
@@ -710,6 +1041,7 @@ impl App {
             drop(et);
         }
         self.embedded_chord = ChordState::Idle;
+        self.embedded_target = None;
     }
 
     /// Returns the embedded session's PTY size if active, useful for
@@ -818,12 +1150,22 @@ impl App {
                 self.state = AppState::HostsList { selected: 0 };
             }
             KeyCode::Char('x') => {
+                // Both opt-in nudges share the `x` key. When both are
+                // visible at once, dismiss the tmux one first (it's
+                // rendered on top); the next `x` clears the notifications
+                // nudge. Visible-but-already-dismissed cases short-circuit
+                // via the `should_show_*` checks.
                 if self.should_show_tmux_nudge() {
                     self.dismiss_tmux_nudge();
+                } else if self.should_show_notifications_nudge() {
+                    self.dismiss_notifications_nudge();
                 }
             }
             KeyCode::Char('p') => {
                 self.toggle_preview_pane();
+            }
+            KeyCode::Char('N') => {
+                self.toggle_notifications();
             }
             KeyCode::Tab => {
                 self.try_enter_embedded();
@@ -933,10 +1275,12 @@ impl App {
                 };
                 match self.selected_action {
                     SessionAction::Enter => {
-                        // The same-session-no-op case is handled in
-                        // main.rs::attach: it just returns early so ADE quits
-                        // and the user stays in the session they were in,
-                        // which is exactly what they wanted.
+                        // The same-session-no-op case is decided in
+                        // main.rs::attach_outcome: when the user picks the
+                        // session they're already in (only reachable from
+                        // inside-tmux), the loop treats it as a no-op and
+                        // keeps the picker on screen — switch-client to
+                        // self would be silent anyway.
                         self.action = AppAction::AttachSession {
                             name: session.raw_name,
                             machine: session.machine,
@@ -1544,6 +1888,76 @@ fn compute_closed_list(prev_closed: &[String], snapshot: HashMap<String, bool>) 
     let mut out: Vec<String> = closed.into_iter().collect();
     out.sort();
     out
+}
+
+/// Decide whether a `(prior, new)` per-session state pair should fire a
+/// "Claude is waiting for you" banner. Mirrors the transition table in
+/// `lets-add-a-new-toasty-narwhal.md`. Per-key suppression rules
+/// (current session, embedded target, demote, debounce) are handled
+/// separately by `App::suppress_transition`.
+fn is_fire_transition(prior: Option<ClaudeState>, new: Option<ClaudeState>) -> bool {
+    use ClaudeState::*;
+    match (prior, new) {
+        // Active → finished: the headline notification.
+        (Some(Working), None) | (Some(AwaitingApproval), None) => true,
+        // Working → AwaitingApproval: switched to needing approval.
+        (Some(Working), Some(AwaitingApproval)) => true,
+        // None → AwaitingApproval: needs approval from a fresh state.
+        (None, Some(AwaitingApproval)) => true,
+        // Everything else (Idle → Working = user's own action,
+        // Working → Working = still going, AwaitingApproval → Working
+        // = approval granted + work resumed, identity transitions) is
+        // not user-facing.
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod is_fire_transition_tests {
+    use super::*;
+    use ClaudeState::*;
+
+    #[test]
+    fn working_to_none_fires() {
+        assert!(is_fire_transition(Some(Working), None));
+    }
+
+    #[test]
+    fn awaiting_to_none_fires() {
+        assert!(is_fire_transition(Some(AwaitingApproval), None));
+    }
+
+    #[test]
+    fn none_to_working_does_not_fire() {
+        // User's own action — they just submitted a prompt.
+        assert!(!is_fire_transition(None, Some(Working)));
+    }
+
+    #[test]
+    fn working_to_working_does_not_fire() {
+        assert!(!is_fire_transition(Some(Working), Some(Working)));
+    }
+
+    #[test]
+    fn working_to_awaiting_fires() {
+        assert!(is_fire_transition(Some(Working), Some(AwaitingApproval)));
+    }
+
+    #[test]
+    fn awaiting_to_working_does_not_fire() {
+        // Approval granted; work resumed.
+        assert!(!is_fire_transition(Some(AwaitingApproval), Some(Working)));
+    }
+
+    #[test]
+    fn none_to_awaiting_fires() {
+        assert!(is_fire_transition(None, Some(AwaitingApproval)));
+    }
+
+    #[test]
+    fn none_to_none_does_not_fire() {
+        assert!(!is_fire_transition(None, None));
+    }
 }
 
 #[cfg(test)]
