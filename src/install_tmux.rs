@@ -88,11 +88,33 @@ pub enum FileAction {
     NoOp,
 }
 
+/// Result of attempting `tmux source-file ~/.tmux.conf` after a non-noop
+/// install. Lets the user see whether their new keybindings (e.g.
+/// `prefix B`) are already live or whether they still need to do
+/// something — without making them think about the difference between
+/// installing the file and reloading the running server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadStatus {
+    /// `tmux source-file` succeeded — new bindings are active on the
+    /// default tmux server.
+    Reloaded,
+    /// No tmux server is running on this host. The new config will be
+    /// loaded the next time tmux starts; nothing for the user to do.
+    NoServer,
+    /// Reload was not attempted because the install was a no-op (file
+    /// already current, no work needed).
+    Skipped,
+    /// `tmux source-file` ran but returned a non-zero exit. Carries
+    /// the relevant stderr so the user can debug.
+    Failed(String),
+}
+
 #[derive(Debug)]
 pub struct InstallReport {
     pub managed_action: FileAction,
     pub conf_action: FileAction,
     pub mouse_off: bool,
+    pub reload: ReloadStatus,
 }
 
 impl InstallReport {
@@ -107,14 +129,26 @@ impl InstallReport {
         }
         let mut parts = Vec::new();
         match self.managed_action {
-            FileAction::Created => parts.push("created ~/.config/ade/tmux.conf"),
-            FileAction::Updated => parts.push("updated ~/.config/ade/tmux.conf"),
+            FileAction::Created => parts.push("created ~/.config/ade/tmux.conf".to_string()),
+            FileAction::Updated => parts.push("updated ~/.config/ade/tmux.conf".to_string()),
             FileAction::NoOp => {}
         }
         match self.conf_action {
-            FileAction::Created => parts.push("created ~/.tmux.conf with source line"),
-            FileAction::Updated => parts.push("appended source line to ~/.tmux.conf"),
+            FileAction::Created => {
+                parts.push("created ~/.tmux.conf with source line".to_string())
+            }
+            FileAction::Updated => {
+                parts.push("appended source line to ~/.tmux.conf".to_string())
+            }
             FileAction::NoOp => {}
+        }
+        match &self.reload {
+            ReloadStatus::Reloaded => parts.push("reloaded tmux".to_string()),
+            ReloadStatus::NoServer => {
+                parts.push("no tmux server running (will apply on next start)".to_string())
+            }
+            ReloadStatus::Skipped => {}
+            ReloadStatus::Failed(err) => parts.push(format!("reload failed: {}", err)),
         }
         parts.join("; ")
     }
@@ -187,10 +221,21 @@ pub fn install_local() -> Result<InstallReport, String> {
 
     let mouse_off = detect_mouse_off_local();
 
+    // Skip reload if neither file changed — there's nothing new for tmux
+    // to pick up, and we'd just generate noise in the success message.
+    let reload = if matches!(managed_action, FileAction::NoOp)
+        && matches!(conf_action, FileAction::NoOp)
+    {
+        ReloadStatus::Skipped
+    } else {
+        reload_local(&tmux_conf)
+    };
+
     Ok(InstallReport {
         managed_action,
         conf_action,
         mouse_off,
+        reload,
     })
 }
 
@@ -303,10 +348,19 @@ pub fn install_remote(config: &Config, host_name: &str) -> Result<InstallReport,
     // for local installs to keep ssh chatter minimal.
     let mouse_off = false;
 
+    let reload = if matches!(managed_action, FileAction::NoOp)
+        && matches!(conf_action, FileAction::NoOp)
+    {
+        ReloadStatus::Skipped
+    } else {
+        reload_remote(host)
+    };
+
     Ok(InstallReport {
         managed_action,
         conf_action,
         mouse_off,
+        reload,
     })
 }
 
@@ -359,6 +413,99 @@ fn ssh_append_source_line(host: &Host) -> Result<(), String> {
                { tail -c1 ~/.tmux.conf | grep -q . && printf '\\n'; cat; printf '\\n'; } \
                >> ~/.tmux.conf";
     ssh_io::run_with_stdin(host, cmd, SOURCE_LINE.as_bytes()).map(|_| ())
+}
+
+// ─── Reload (auto-source-file after install) ────────────────────────────────
+
+/// Try to make the just-installed config active on the running tmux
+/// server. Tmux's `source-file` does **not** auto-start a server, so a
+/// non-zero exit with "no server running" in the stderr is the normal
+/// "user has no tmux running" case — not a failure.
+fn reload_local(tmux_conf: &std::path::Path) -> ReloadStatus {
+    match std::process::Command::new("tmux")
+        .arg("source-file")
+        .arg(tmux_conf)
+        .output()
+    {
+        Ok(out) if out.status.success() => ReloadStatus::Reloaded,
+        Ok(out) => parse_tmux_reload_failure(&out.stderr, out.status.to_string()),
+        Err(e) => ReloadStatus::Failed(format!("could not run tmux: {}", e)),
+    }
+}
+
+/// Remote variant. Wraps the source-file in a shell snippet that always
+/// exits 0 and tags its outcome with a one-line prefix
+/// (`OK` / `NOSERVER` / `FAIL\n<stderr>`) so we can distinguish "no
+/// server running" from a syntax error without parsing remote tmux
+/// stderr from a non-zero ssh exit (which `ssh_io::run` already turns
+/// into an `Err`).
+fn reload_remote(host: &Host) -> ReloadStatus {
+    // Mirrors `is_no_server_error`: NoServer iff `no server running`
+    // OR (`error connecting to` AND `No such file or directory`)
+    // appear in stderr. Permission/Connection errors and config-load
+    // errors that mention only one of those phrases stay Failed.
+    let cmd = "out=$(tmux source-file ~/.tmux.conf 2>&1); ec=$?; \
+               noserver=0; \
+               if printf '%s' \"$out\" | grep -q 'no server running'; then noserver=1; \
+               elif printf '%s' \"$out\" | grep -q 'error connecting to' \
+                    && printf '%s' \"$out\" | grep -q 'No such file or directory'; then noserver=1; \
+               fi; \
+               if [ $ec -eq 0 ]; then echo OK; \
+               elif [ $noserver -eq 1 ]; then echo NOSERVER; \
+               else printf 'FAIL\\n%s\\n' \"$out\"; fi";
+    match ssh_io::run(host, cmd) {
+        Ok(out) => parse_remote_reload_output(&out),
+        Err(e) => ReloadStatus::Failed(e),
+    }
+}
+
+fn parse_tmux_reload_failure(stderr_bytes: &[u8], status: String) -> ReloadStatus {
+    let err = String::from_utf8_lossy(stderr_bytes).trim().to_string();
+    if is_no_server_error(&err) {
+        ReloadStatus::NoServer
+    } else if err.is_empty() {
+        ReloadStatus::Failed(format!("tmux exited {}", status))
+    } else {
+        ReloadStatus::Failed(err)
+    }
+}
+
+/// True for any tmux stderr that means "no running server" rather than
+/// "config has a real problem". Two known phrasings:
+///   - `no server running on /tmp/tmux-N/default` — server existed
+///     before, socket deleted.
+///   - `error connecting to /tmp/tmux-N/default (No such file or
+///     directory)` — server never started, socket file absent.
+///
+/// The second pattern requires BOTH substrings together. Matching on
+/// `No such file or directory` alone would misclassify real config
+/// errors like `source-file ~/.tmux.local.conf` (without `-q`) where
+/// the running server fails to load a referenced file. Matching on
+/// `error connecting to` alone would misclassify real
+/// socket-permission errors (`Permission denied` / `Connection
+/// refused`) — those mean "tmux is there but unreachable", not "no
+/// tmux at all".
+fn is_no_server_error(err: &str) -> bool {
+    err.contains("no server running")
+        || (err.contains("error connecting to") && err.contains("No such file or directory"))
+}
+
+fn parse_remote_reload_output(out: &str) -> ReloadStatus {
+    let mut lines = out.lines();
+    match lines.next() {
+        Some("OK") => ReloadStatus::Reloaded,
+        Some("NOSERVER") => ReloadStatus::NoServer,
+        Some("FAIL") => {
+            let detail = lines.collect::<Vec<_>>().join("\n");
+            ReloadStatus::Failed(if detail.trim().is_empty() {
+                "unknown".to_string()
+            } else {
+                detail
+            })
+        }
+        Some(other) => ReloadStatus::Failed(format!("unexpected reload output: {}", other)),
+        None => ReloadStatus::Failed("no reload output".to_string()),
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -529,6 +676,131 @@ mod tests {
         // Random non-marker lines.
         assert!(!is_marker_line("set -g mouse on"));
         assert!(!is_marker_line(""));
+    }
+
+    #[test]
+    fn is_no_server_error_matches_both_phrasings() {
+        // The "deleted socket file" case.
+        assert!(is_no_server_error("no server running on /tmp/tmux-1000/default"));
+        // The "socket never created" case (Codex caught this regression).
+        assert!(is_no_server_error(
+            "error connecting to /tmp/tmux-1000/default (No such file or directory)"
+        ));
+    }
+
+    #[test]
+    fn is_no_server_error_does_not_match_real_failures() {
+        // A tmux config syntax error must not be misclassified as no-server.
+        assert!(!is_no_server_error(
+            "/home/u/.tmux.conf:42: unknown command: gobbledygook"
+        ));
+        assert!(!is_no_server_error(""));
+        // Codex caught these: a socket *exists* but can't be talked to.
+        // These are real reload failures, not "no server" — `--all`
+        // should fail loud, not silently say "will apply on next start".
+        assert!(!is_no_server_error(
+            "error connecting to /tmp/tmux-1000/default (Permission denied)"
+        ));
+        assert!(!is_no_server_error(
+            "error connecting to /tmp/tmux-1000/default (Connection refused)"
+        ));
+        // Round 4 catch: a running server's config tries to load a
+        // missing file via `source-file ~/.tmux.local.conf` (no `-q`).
+        // That's a real reload failure — the server *is* up. We must
+        // NOT match on "No such file or directory" alone; require the
+        // socket-connection phrasing alongside.
+        assert!(!is_no_server_error(
+            "/home/u/.tmux.conf:5: No such file or directory: /home/u/missing.conf"
+        ));
+    }
+
+    #[test]
+    fn parse_tmux_reload_failure_classifies_socket_missing_as_no_server() {
+        let bytes = b"error connecting to /tmp/tmux-1000/default (No such file or directory)\n";
+        assert_eq!(
+            parse_tmux_reload_failure(bytes, "exit status: 1".to_string()),
+            ReloadStatus::NoServer
+        );
+    }
+
+    #[test]
+    fn parse_remote_reload_output_recognises_ok() {
+        assert_eq!(
+            parse_remote_reload_output("OK\n"),
+            ReloadStatus::Reloaded
+        );
+    }
+
+    #[test]
+    fn parse_remote_reload_output_recognises_no_server() {
+        assert_eq!(
+            parse_remote_reload_output("NOSERVER\n"),
+            ReloadStatus::NoServer
+        );
+    }
+
+    #[test]
+    fn parse_remote_reload_output_carries_failure_detail() {
+        let out = "FAIL\n/home/u/.tmux.conf:42: bad config\n";
+        match parse_remote_reload_output(out) {
+            ReloadStatus::Failed(msg) => {
+                assert!(msg.contains("bad config"), "missing detail: {}", msg)
+            }
+            other => panic!("expected Failed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_remote_reload_output_unknown_first_line_is_failed() {
+        match parse_remote_reload_output("WAT") {
+            ReloadStatus::Failed(_) => {}
+            other => panic!("expected Failed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn install_report_summary_announces_reload() {
+        let r = InstallReport {
+            managed_action: FileAction::Created,
+            conf_action: FileAction::Updated,
+            mouse_off: false,
+            reload: ReloadStatus::Reloaded,
+        };
+        assert!(r.summary().ends_with("reloaded tmux"));
+    }
+
+    #[test]
+    fn install_report_summary_explains_no_server() {
+        let r = InstallReport {
+            managed_action: FileAction::Created,
+            conf_action: FileAction::Created,
+            mouse_off: false,
+            reload: ReloadStatus::NoServer,
+        };
+        assert!(r.summary().contains("no tmux server running"));
+    }
+
+    #[test]
+    fn install_report_summary_surfaces_reload_failure() {
+        let r = InstallReport {
+            managed_action: FileAction::Updated,
+            conf_action: FileAction::NoOp,
+            mouse_off: false,
+            reload: ReloadStatus::Failed("bad config line 5".to_string()),
+        };
+        assert!(r.summary().contains("reload failed: bad config line 5"));
+    }
+
+    #[test]
+    fn install_report_summary_skipped_when_noop() {
+        let r = InstallReport {
+            managed_action: FileAction::NoOp,
+            conf_action: FileAction::NoOp,
+            mouse_off: false,
+            reload: ReloadStatus::Skipped,
+        };
+        // Noop summary doesn't mention reload — there was nothing to reload.
+        assert_eq!(r.summary(), "already installed — nothing to do");
     }
 
     #[test]
