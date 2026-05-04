@@ -61,8 +61,13 @@ fn main() -> Result<()> {
     // `MouseCaptureGuard` — enabling it globally would swallow
     // the user's normal terminal scroll / Cmd+drag selection
     // while they're just browsing the tree.
-    let (config, _warning) = Config::load();
-    let result = run_loop(&mut terminal, &config);
+    //
+    // No `Config::load()` here — `App::new()` loads it (and the Hosts
+    // screen mutates `app.config` in place + persists). Loading a
+    // separate snapshot here would go stale the moment the user adds
+    // or edits a host mid-session, and the next attach to that host
+    // would resolve against the old config.
+    let result = run_loop(&mut terminal);
     ratatui::restore();
     term_title::clear();
 
@@ -80,8 +85,9 @@ fn print_usage() {
          Usage:\n\
          \x20\x20ade                                    Launch the TUI\n\
          \x20\x20ade install-hooks [--host H]           Install Claude Code status hooks (local or remote)\n\
-         \x20\x20ade install-tmux-config [--host H]     Install tmux clipboard config (local or remote)\n\
-         \x20\x20ade install-tmux-config --uninstall    Remove the tmux clipboard config\n\
+         \x20\x20ade install-tmux-config [--host H]     Install tmux clipboard config (local or one remote)\n\
+         \x20\x20ade install-tmux-config --all          Install on local + every host in hosts.toml\n\
+         \x20\x20ade install-tmux-config --uninstall    Remove the tmux clipboard config (use --all for everywhere)\n\
          \x20\x20ade debug claude [--host H]            Diagnose why ADE does/doesn't see Claude per pane\n\
          \x20\x20ade help                               Show this message"
     );
@@ -172,6 +178,7 @@ fn run_install_hooks(args: &[String]) -> Result<()> {
 fn run_install_tmux(args: &[String]) -> Result<()> {
     let mut host: Option<String> = None;
     let mut uninstall = false;
+    let mut all = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -184,6 +191,7 @@ fn run_install_tmux(args: &[String]) -> Result<()> {
                 host = Some(args[i].clone());
             }
             "--uninstall" => uninstall = true,
+            "--all" => all = true,
             other => {
                 eprintln!("Error: unknown argument '{}'", other);
                 std::process::exit(2);
@@ -192,63 +200,44 @@ fn run_install_tmux(args: &[String]) -> Result<()> {
         i += 1;
     }
 
-    if uninstall {
-        let result = match host {
-            None => install_tmux::uninstall_local()
-                .map(|r| ("local".to_string(), r.summary())),
-            Some(name) => {
-                let (config, _warning) = Config::load();
-                install_tmux::uninstall_remote(&config, &name)
-                    .map(|r| (name.clone(), r.summary()))
-            }
-        };
-        return match result {
-            Ok((target, msg)) => {
-                println!("{}: {}", target, msg);
-                Ok(())
-            }
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        };
+    if all && host.is_some() {
+        eprintln!("Error: --all and --host are mutually exclusive");
+        std::process::exit(2);
     }
 
-    let result = match host {
+    if uninstall {
+        return run_uninstall_tmux(host, all);
+    }
+
+    if all {
+        return run_install_tmux_all();
+    }
+
+    // Single-host (or local) install. We extract `reload_failed`
+    // before consuming the report into the message so the exit code
+    // reflects reload failures the same way `--all` does — otherwise
+    // CI / scripts would see exit 0 despite "reload failed: …" in
+    // the printed output.
+    let outcome = match host {
         None => install_tmux::install_local().map(|r| {
-            let mut msg = format!("local: {}", r.summary());
-            if r.mouse_off {
-                msg.push_str(
-                    "\nWarning: detected `mouse off` in your tmux config. \
-                     ADE's clipboard config requires `mouse on` for drag-select-to-copy. \
-                     Remove or update that line, then reload tmux.",
-                );
-            }
-            if !r.is_noop() {
-                msg.push_str(
-                    "\nNext: run `tmux source-file ~/.tmux.conf` (or restart tmux) to apply.",
-                );
-            }
-            msg
+            let reload_failed = matches!(r.reload, install_tmux::ReloadStatus::Failed(_));
+            (format_local_install_msg(r), reload_failed)
         }),
         Some(name) => {
             let (config, _warning) = Config::load();
             install_tmux::install_remote(&config, &name).map(|r| {
-                let mut msg = format!("{}: {}", name, r.summary());
-                if !r.is_noop() {
-                    msg.push_str(
-                        "\nNext: on that host, run `tmux source-file ~/.tmux.conf` \
-                         (or restart tmux) to apply.",
-                    );
-                }
-                msg
+                let reload_failed = matches!(r.reload, install_tmux::ReloadStatus::Failed(_));
+                (format!("{}: {}", name, r.summary()), reload_failed)
             })
         }
     };
 
-    match result {
-        Ok(msg) => {
+    match outcome {
+        Ok((msg, reload_failed)) => {
             println!("{}", msg);
+            if reload_failed {
+                std::process::exit(1);
+            }
             Ok(())
         }
         Err(e) => {
@@ -256,6 +245,126 @@ fn run_install_tmux(args: &[String]) -> Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+/// Run `install_tmux_config` across local + every host in `hosts.toml`,
+/// continuing past per-host failures so the user sees a complete
+/// summary in one shot. Exit code reflects worst-case: 0 only if every
+/// step succeeded, 1 otherwise.
+///
+/// If `hosts.toml` exists but doesn't parse, `Config::load()` returns
+/// an empty default plus a warning — that would silently skip every
+/// remote and exit 0, which is the opposite of what `--all` advertises.
+/// Refuse to proceed in that case.
+fn run_install_tmux_all() -> Result<()> {
+    let (config, parse_warning) = Config::load();
+    if let Some(w) = parse_warning {
+        eprintln!("Error: cannot --all: hosts.toml failed to parse: {}", w);
+        std::process::exit(1);
+    }
+
+    let mut any_failed = false;
+
+    match install_tmux::install_local() {
+        Ok(report) => {
+            if matches!(report.reload, install_tmux::ReloadStatus::Failed(_)) {
+                any_failed = true;
+            }
+            println!("{}", format_local_install_msg(report));
+        }
+        Err(e) => {
+            println!("local: error: {}", e);
+            any_failed = true;
+        }
+    }
+
+    if config.hosts.is_empty() {
+        println!("(no remote hosts configured in ~/.config/ade/hosts.toml)");
+    } else {
+        for host in &config.hosts {
+            match install_tmux::install_remote(&config, &host.name) {
+                Ok(report) => {
+                    if matches!(report.reload, install_tmux::ReloadStatus::Failed(_)) {
+                        any_failed = true;
+                    }
+                    println!("{}: {}", host.name, report.summary());
+                }
+                Err(e) => {
+                    println!("{}: error: {}", host.name, e);
+                    any_failed = true;
+                }
+            }
+        }
+    }
+
+    if any_failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_uninstall_tmux(host: Option<String>, all: bool) -> Result<()> {
+    if all {
+        let (config, parse_warning) = Config::load();
+        if let Some(w) = parse_warning {
+            eprintln!("Error: cannot --all: hosts.toml failed to parse: {}", w);
+            std::process::exit(1);
+        }
+        let mut any_failed = false;
+
+        match install_tmux::uninstall_local() {
+            Ok(report) => println!("local: {}", report.summary()),
+            Err(e) => {
+                println!("local: error: {}", e);
+                any_failed = true;
+            }
+        }
+        for h in &config.hosts {
+            match install_tmux::uninstall_remote(&config, &h.name) {
+                Ok(report) => println!("{}: {}", h.name, report.summary()),
+                Err(e) => {
+                    println!("{}: error: {}", h.name, e);
+                    any_failed = true;
+                }
+            }
+        }
+        if any_failed {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    let result = match host {
+        None => install_tmux::uninstall_local()
+            .map(|r| ("local".to_string(), r.summary())),
+        Some(name) => {
+            let (config, _warning) = Config::load();
+            install_tmux::uninstall_remote(&config, &name)
+                .map(|r| (name.clone(), r.summary()))
+        }
+    };
+    match result {
+        Ok((target, msg)) => {
+            println!("{}: {}", target, msg);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn format_local_install_msg(r: install_tmux::InstallReport) -> String {
+    let mut msg = format!("local: {}", r.summary());
+    if r.mouse_off {
+        msg.push_str(
+            "\nWarning: detected `mouse off` in your tmux config. \
+             ADE's clipboard config requires `mouse on` for drag-select-to-copy. \
+             Remove or update that line, then reload tmux.",
+        );
+    }
+    msg
 }
 
 /// What to do when the user picks a session from the TUI. Resolved per
@@ -680,7 +789,7 @@ fn append_attach_log(line: &str) {
 /// exits. Inside-tmux switch-client returns immediately and ADE keeps
 /// drawing — the user navigates back via `prefix L` or the smart `prefix
 /// B` keybinding installed by `ade install-tmux-config`.
-fn run_loop(terminal: &mut DefaultTerminal, config: &Config) -> Result<()> {
+fn run_loop(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut app = App::new();
 
     loop {
@@ -721,7 +830,10 @@ fn run_loop(terminal: &mut DefaultTerminal, config: &Config) -> Result<()> {
                         let suspend_err = tui_lifecycle::suspend(terminal)
                             .map_err(|e| format!("suspend tui: {}", e));
                         let attach_err = match suspend_err {
-                            Ok(()) => spawn_and_wait_attach(&name, &machine, config),
+                            // Use the live `app.config` so adds/edits via
+                            // the Hosts screen take effect on the very
+                            // next attach, no restart required.
+                            Ok(()) => spawn_and_wait_attach(&name, &machine, &app.config),
                             Err(e) => Err(e),
                         };
                         // Always attempt resume — a stuck terminal is
