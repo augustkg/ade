@@ -34,7 +34,6 @@ ADE reads `~/.config/ade/hosts.toml`. Add entries from the in-app `H` view, or b
 name = "hetzner-admin"
 kind = "ssh"
 target = "hetzner-admin"
-ssh_args = ["-p", "22"]
 
 [[hosts]]
 name = "web"
