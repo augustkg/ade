@@ -62,6 +62,16 @@ pub struct Session {
     /// `App::apply_refresh_result` for notification suppression rule 5
     /// (TTL-driven demotions are not "Claude finished a turn").
     pub claude_demoted: bool,
+    /// Mirrors `tmux::Session::claude_present`. True when any pane in
+    /// this session is running Claude, regardless of state. The Duplicate
+    /// action reads this to decide whether to fork the Claude session.
+    pub claude_present: bool,
+    /// Context-window percentage (0..=100) for this session's Claude pane,
+    /// surfaced verbatim from `tmux::Session::claude_context_pct`. Rendered
+    /// as `claude · NN%` by the UI. `None` when the v3 hook hasn't written
+    /// usage data yet (legacy v2 install on the host, or no assistant turn
+    /// has happened in the session).
+    pub claude_context_pct: Option<u8>,
 }
 
 impl Session {
@@ -85,6 +95,8 @@ impl Session {
             machine,
             claude: s.claude,
             claude_demoted: s.claude_demoted,
+            claude_present: s.claude_present,
+            claude_context_pct: s.claude_context_pct,
         }
     }
 }

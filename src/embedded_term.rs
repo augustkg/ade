@@ -233,12 +233,12 @@ fn mouse_button_code(b: MouseButton) -> u32 {
 /// the embedded session itself uses. Bare Esc breaks vim; bare Tab is
 /// the entry key. The classic approach is a tmux-style prefix chord:
 ///
-///   `Ctrl+Space` then `q`  →  exit embedded mode
+///   `Ctrl+Space` then `Space`        →  exit embedded mode
 ///   `Ctrl+Space` then any other key  →  forward buffered prefix + key
-///   `Ctrl+Space` then `Ctrl+Space`  →  forward exactly one literal
-///                                       prefix (escape hatch for
-///                                       sessions that use NUL for
-///                                       their own purposes)
+///   `Ctrl+Space` then `Ctrl+Space`   →  forward exactly one literal
+///                                        prefix (escape hatch for
+///                                        sessions that use NUL for
+///                                        their own purposes)
 ///
 /// `Ctrl+Space` is a deliberate choice over `Ctrl+\` (the previous
 /// default). The backslash key on Danish, German, Norwegian, French
@@ -327,9 +327,9 @@ pub fn chord_step(state: &mut ChordState, event: KeyEvent) -> ChordOutcome {
         ChordState::Pending => {
             // Anything that emerges from Pending puts us back in Idle.
             *state = ChordState::Idle;
-            // `q` is the exit verb. Plain 'q' / 'Q' with no modifiers
-            // (or just SHIFT) — Ctrl+q etc. should pass through.
-            if matches!(event.code, KeyCode::Char('q' | 'Q'))
+            // Plain Space (no Ctrl, no Alt) is the exit verb. Ctrl+Space
+            // is the prefix-passthrough escape hatch handled just below.
+            if matches!(event.code, KeyCode::Char(' '))
                 && !event.modifiers.contains(KeyModifiers::CONTROL)
                 && !event.modifiers.contains(KeyModifiers::ALT)
             {
@@ -1114,34 +1114,10 @@ mod chord_tests {
     }
 
     #[test]
-    fn pending_q_exits() {
+    fn pending_space_exits() {
         let mut s = ChordState::Pending;
-        let out = chord_step(&mut s, ev(KeyCode::Char('q'), KeyModifiers::NONE));
+        let out = chord_step(&mut s, ev(KeyCode::Char(' '), KeyModifiers::NONE));
         assert_eq!(out, ChordOutcome::Exit);
-        assert_eq!(s, ChordState::Idle);
-    }
-
-    #[test]
-    fn pending_capital_q_also_exits() {
-        // SHIFT+q is fine — it's still a "q" with the user's intent.
-        let mut s = ChordState::Pending;
-        let out = chord_step(
-            &mut s,
-            ev(KeyCode::Char('Q'), KeyModifiers::SHIFT),
-        );
-        assert_eq!(out, ChordOutcome::Exit);
-    }
-
-    #[test]
-    fn pending_ctrl_q_does_not_exit_passes_through() {
-        // Ctrl+q in shells = XON/restart-output. Don't hijack it.
-        let mut s = ChordState::Pending;
-        let out = chord_step(
-            &mut s,
-            ev(KeyCode::Char('q'), KeyModifiers::CONTROL),
-        );
-        // Buffered prefix + Ctrl+q (0x11)
-        assert_eq!(out, ChordOutcome::Forward(vec![CHORD_PREFIX_BYTE, 0x11]));
         assert_eq!(s, ChordState::Idle);
     }
 
@@ -1193,8 +1169,8 @@ mod chord_tests {
             ev(KeyCode::Char(' '), KeyModifiers::CONTROL),
         );
         assert_eq!(s, ChordState::Pending);
-        // q
-        let out = chord_step(&mut s, ev(KeyCode::Char('q'), KeyModifiers::NONE));
+        // Space
+        let out = chord_step(&mut s, ev(KeyCode::Char(' '), KeyModifiers::NONE));
         assert_eq!(out, ChordOutcome::Exit);
         assert_eq!(s, ChordState::Idle);
     }

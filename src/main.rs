@@ -4,6 +4,7 @@ mod app;
 mod claude_status;
 mod cwd;
 mod debug;
+mod duplicate_log;
 mod embedded_term;
 mod hosts;
 mod install_hooks;
@@ -85,6 +86,7 @@ fn print_usage() {
          Usage:\n\
          \x20\x20ade                                    Launch the TUI\n\
          \x20\x20ade install-hooks [--host H]           Install Claude Code status hooks (local or remote)\n\
+         \x20\x20ade install-hooks --all                Install hooks on local + every host in hosts.toml\n\
          \x20\x20ade install-tmux-config [--host H]     Install tmux clipboard config (local or one remote)\n\
          \x20\x20ade install-tmux-config --all          Install on local + every host in hosts.toml\n\
          \x20\x20ade install-tmux-config --uninstall    Remove the tmux clipboard config (use --all for everywhere)\n\
@@ -136,6 +138,7 @@ fn run_debug(args: &[String]) -> Result<()> {
 
 fn run_install_hooks(args: &[String]) -> Result<()> {
     let mut host: Option<String> = None;
+    let mut all = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -147,12 +150,22 @@ fn run_install_hooks(args: &[String]) -> Result<()> {
                 }
                 host = Some(args[i].clone());
             }
+            "--all" => all = true,
             other => {
                 eprintln!("Error: unknown argument '{}'", other);
                 std::process::exit(2);
             }
         }
         i += 1;
+    }
+
+    if all && host.is_some() {
+        eprintln!("Error: --all and --host are mutually exclusive");
+        std::process::exit(2);
+    }
+
+    if all {
+        return run_install_hooks_all();
     }
 
     let result = match host {
@@ -173,6 +186,52 @@ fn run_install_hooks(args: &[String]) -> Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+/// Run `install_hooks` across local + every host in `hosts.toml`,
+/// continuing past per-host failures so the user sees a complete
+/// summary in one shot. Exit code reflects worst-case: 0 only if every
+/// step succeeded, 1 otherwise. Mirrors `run_install_tmux_all`.
+///
+/// If `hosts.toml` exists but doesn't parse, `Config::load()` returns
+/// an empty default plus a warning — that would silently skip every
+/// remote and exit 0, which is the opposite of what `--all` advertises.
+/// Refuse to proceed in that case.
+fn run_install_hooks_all() -> Result<()> {
+    let (config, parse_warning) = Config::load();
+    if let Some(w) = parse_warning {
+        eprintln!("Error: cannot --all: hosts.toml failed to parse: {}", w);
+        std::process::exit(1);
+    }
+
+    let mut any_failed = false;
+
+    match install_hooks::install_local() {
+        Ok(msg) => println!("{}", msg),
+        Err(e) => {
+            println!("local: error: {}", e);
+            any_failed = true;
+        }
+    }
+
+    if config.hosts.is_empty() {
+        println!("(no remote hosts configured in ~/.config/ade/hosts.toml)");
+    } else {
+        for host in &config.hosts {
+            match install_hooks::install_remote(&config, &host.name) {
+                Ok(msg) => println!("{}", msg),
+                Err(e) => {
+                    println!("{}: error: {}", host.name, e);
+                    any_failed = true;
+                }
+            }
+        }
+    }
+
+    if any_failed {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn run_install_tmux(args: &[String]) -> Result<()> {

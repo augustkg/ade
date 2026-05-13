@@ -139,6 +139,8 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
     for (i, row) in visible.iter().enumerate() {
         let is_selected = i == app.selected_index && app.focus_area == FocusArea::SessionList;
         let is_renaming = matches!(app.state, AppState::RenamingSession { .. }) && is_selected;
+        let is_duplicating =
+            matches!(app.state, AppState::DuplicatingSession { .. }) && is_selected;
         let renaming_folder =
             matches!(app.state, AppState::RenamingFolder { .. }) && is_selected;
 
@@ -162,6 +164,16 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
                 if is_renaming {
                     let mut spans = vec![Span::raw(indent_for(in_folder))];
                     spans.extend(text_field_spans(&app.input_buffer, true, theme::PEACH));
+                    ListItem::new(Line::from(spans))
+                } else if is_duplicating {
+                    let mut spans = vec![Span::raw(indent_for(in_folder))];
+                    spans.push(Span::styled(
+                        "+ ",
+                        Style::default()
+                            .fg(theme::TEAL)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.extend(text_field_spans(&app.input_buffer, true, theme::TEAL));
                     ListItem::new(Line::from(spans))
                 } else {
                     let is_current = matches!(session.machine, Machine::Local)
@@ -258,7 +270,9 @@ fn render_folder_row(
 
     if let Some(state) = folder.claude {
         spans.push(Span::raw("  "));
-        spans.push(claude_chip(state));
+        // Folders never carry a context percentage of their own — drilling
+        // down to a specific session is where the % is meaningful.
+        spans.push(claude_chip(state, None));
     }
 
     if is_selected {
@@ -323,6 +337,11 @@ fn render_session_row(
     } else {
         Style::default().fg(inactive_color)
     };
+    let duplicate_style = if is_selected && selected_action == SessionAction::Duplicate {
+        Style::default().fg(theme::BASE).bg(theme::TEAL)
+    } else {
+        Style::default().fg(inactive_color)
+    };
     let delete_style = if is_selected && selected_action == SessionAction::Delete {
         Style::default().fg(theme::BASE).bg(theme::RED)
     } else {
@@ -356,9 +375,23 @@ fn render_session_row(
     ));
     spans.push(Span::styled(metadata, Style::default().fg(theme::OVERLAY0)));
 
-    if let Some(state) = session.claude {
+    // Render the Claude chip in three cases:
+    //   1. Active state (Working / AwaitingApproval) — bright chip.
+    //   2. Idle Claude WITH a context percentage — dim chip so the user
+    //      can see "this remote box has a 92% idle Claude" without
+    //      attaching.
+    //   3. Otherwise (idle Claude on a host that hasn't reported ctx
+    //      data) — nothing, matching pre-v3 behaviour.
+    let chip_state = session.claude.or({
+        if session.claude_present && session.claude_context_pct.is_some() {
+            Some(ClaudeState::Idle)
+        } else {
+            None
+        }
+    });
+    if let Some(state) = chip_state {
         spans.push(Span::raw("  "));
-        spans.push(claude_chip(state));
+        spans.push(claude_chip(state, session.claude_context_pct));
     }
 
     if is_current {
@@ -377,6 +410,8 @@ fn render_session_row(
         spans.push(Span::raw(" "));
         spans.push(Span::styled(" Rename ", rename_style));
         spans.push(Span::raw(" "));
+        spans.push(Span::styled(" Duplicate ", duplicate_style));
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(" Delete ", delete_style));
     }
 
@@ -385,23 +420,20 @@ fn render_session_row(
 
 /// Small ` claude ` chip used on session and folder rows.
 ///
-/// Renders for `Working` (Claude is actively processing a turn) and for
-/// `AwaitingApproval` (Claude has popped a permission prompt and is
-/// blocked on the user). Idle Claude (loaded but waiting at the prompt)
-/// does not render — `tmux::map_claude_states` already drops Idle
-/// upstream, so this match never sees it in practice. The Idle arm
-/// exists only as a typesafety barrier; if a future refactor leaks an
-/// `Idle` here we render nothing — silent suppression beats a
-/// false-positive chip.
-fn claude_chip(state: ClaudeState) -> Span<'static> {
+/// Renders for `Working` (peach), `AwaitingApproval` (red, takes
+/// precedence — drops the percentage so the "needs you" signal isn't
+/// diluted), and, if `ctx_pct` is `Some`, also for `Idle` (dim chip on
+/// SURFACE1, so a near-full idle Claude is glanceable across many
+/// remote boxes).
+///
+/// `ctx_pct` is the latest context-window percentage written by the v3
+/// hook script — see `claude_status::context_window_pct`. `None` means
+/// the v3 hook hasn't fired yet (legacy v2 install on the host, or no
+/// assistant turn has happened in this session); in that case the
+/// Working chip falls back to its pre-v3 ` claude ` label and Idle
+/// renders nothing.
+fn claude_chip(state: ClaudeState, ctx_pct: Option<u8>) -> Span<'static> {
     match state {
-        ClaudeState::Working => Span::styled(
-            " claude ",
-            Style::default()
-                .fg(theme::BASE)
-                .bg(theme::PEACH)
-                .add_modifier(Modifier::BOLD),
-        ),
         ClaudeState::AwaitingApproval => Span::styled(
             " claude · approve ",
             Style::default()
@@ -409,7 +441,28 @@ fn claude_chip(state: ClaudeState) -> Span<'static> {
                 .bg(theme::RED)
                 .add_modifier(Modifier::BOLD),
         ),
-        ClaudeState::Idle => Span::raw(""),
+        ClaudeState::Working => {
+            let label = match ctx_pct {
+                Some(pct) => format!(" claude · {}% ", pct),
+                None => " claude ".to_string(),
+            };
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(theme::BASE)
+                    .bg(theme::PEACH)
+                    .add_modifier(Modifier::BOLD),
+            )
+        }
+        ClaudeState::Idle => match ctx_pct {
+            Some(pct) => Span::styled(
+                format!(" claude · {}% ", pct),
+                Style::default()
+                    .fg(theme::SUBTEXT0)
+                    .bg(theme::SURFACE1),
+            ),
+            None => Span::raw(""),
+        },
     }
 }
 
@@ -839,7 +892,7 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 txt(" · "),
-                key("q"),
+                key("Space"),
                 txt(" exit  "),
                 key("Ctrl+Space"),
                 txt(" send literal  any other key passes through"),
@@ -847,7 +900,7 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             Line::from(vec![
                 Span::raw(" "),
-                key("Ctrl+Space q"),
+                key("Ctrl+Space Space"),
                 txt(" exit embedded  "),
                 key("Ctrl+Space Ctrl+Space"),
                 txt(" send literal NUL"),
@@ -876,6 +929,8 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
             txt(" new  "),
             key("R"),
             txt(" rename  "),
+            key("y"),
+            txt(" duplicate  "),
             key("d"),
             txt(" delete  "),
             key("H"),
@@ -900,6 +955,13 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" "),
             key("Enter"),
             txt(" rename  "),
+            key("Esc"),
+            txt(" cancel"),
+        ],
+        AppState::DuplicatingSession { .. } => vec![
+            Span::raw(" "),
+            key("Enter"),
+            txt(" duplicate  "),
             key("Esc"),
             txt(" cancel"),
         ],

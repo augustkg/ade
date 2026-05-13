@@ -47,7 +47,12 @@ const REMOTE_LIST_CMD: &str = concat!(
     "  printf '\\n---ADE-STATUS-END---\\n'; ",
     "done; ",
     "echo '---ADE-HOOKS---'; ",
-    "if grep -q ade-status-marker-v2 \"$HOME\"/.claude/settings.json 2>/dev/null; then echo OK; else echo MISSING; fi"
+    // Hook marker check: report installed when the CURRENT marker
+    // (`ade-status-marker-v3`) is present. Older v2 installs report
+    // MISSING so the Hosts UI nudges the user to re-run
+    // `ade install-hooks` — that's what ships the v3 hook script and
+    // wires the new context-window plumbing.
+    "if grep -q ade-status-marker-v3 \"$HOME\"/.claude/settings.json 2>/dev/null; then echo OK; else echo MISSING; fi"
 );
 
 fn shell_safe(s: &str) -> bool {
@@ -120,6 +125,8 @@ impl RemoteTmux {
                     if let Some(rollup) = claude_by_session.get(&s.name) {
                         s.claude = rollup.state;
                         s.claude_demoted = rollup.demoted;
+                        s.claude_present = rollup.present;
+                        s.claude_context_pct = rollup.context_pct;
                     }
                 }
 
@@ -167,9 +174,98 @@ impl TmuxBackend for RemoteTmux {
         let cmd = format!("tmux kill-session -t '={}'", name);
         self.ssh(&cmd).and_then(check_status)
     }
+
+    fn duplicate_session(
+        &self,
+        source: &str,
+        new_name: &str,
+        claude_running: bool,
+    ) -> Result<(), String> {
+        if !shell_safe(source) || !shell_safe(new_name) {
+            crate::duplicate_log::log(&format!(
+                "remote.duplicate: rejected by shell_safe (source={:?} new_name={:?})",
+                source, new_name
+            ));
+            return Err("invalid session name".to_string());
+        }
+        let cmd = self.build_duplicate_cmd(source, new_name, claude_running);
+        crate::duplicate_log::log(&format!(
+            "remote.duplicate: host={} target={} cmd={}",
+            self.host.name, self.host.target, cmd
+        ));
+        let out = self.ssh(&cmd)?;
+        crate::duplicate_log::log(&format!(
+            "remote.duplicate: exit={:?} stdout={:?} stderr={:?}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        ));
+        check_status(out)
+    }
 }
 
 impl RemoteTmux {
+    /// Assemble the shell script the remote backend would run for a
+    /// duplicate. Extracted so unit tests can pin the substitution
+    /// without round-tripping through SSH. Callers must ensure `source`
+    /// and `new_name` are `shell_safe` — this function does not
+    /// re-validate.
+    pub(crate) fn build_duplicate_cmd(
+        &self,
+        source: &str,
+        new_name: &str,
+        claude_running: bool,
+    ) -> String {
+        // `CLAUDE` is sourced from the App layer's `Session.claude_present`,
+        // which the refresh loop populated using the same descendant-PID walk
+        // we use locally — so detection is symmetric across machines. We
+        // use `claude_present` (any Claude pane) rather than `claude.is_some()`
+        // (active state only) so idle Claude sessions still get forked.
+        let claude_flag = if claude_running { 1 } else { 0 };
+        // Trailing colon on `=name` makes the target resolve to a
+        // pane, not a session — required for `#{{pane_current_path}}`
+        // to be populated. Same gotcha as `capture_pane`.
+        format!(
+            "SRC='={src}:'; NEW='{new}'; CLAUDE={cl_var}; \
+             CWD=$(tmux display-message -t \"$SRC\" -p '#{{pane_current_path}}' 2>/dev/null) || exit 1; \
+             [ -n \"$CWD\" ] || {{ echo 'source pane has no cwd' >&2; exit 1; }}; \
+             SID=''; \
+             if [ \"$CLAUDE\" -eq 1 ]; then \
+               ENC=$(printf '%s' \"$CWD\" | sed 's|/|-|g'); \
+               PROJ=\"$HOME/.claude/projects/$ENC\"; \
+               if [ -d \"$PROJ\" ]; then \
+                 __OLDIFS=\"$IFS\"; IFS='\n'; \
+                 for f in $(ls -1t \"$PROJ\"/*.jsonl 2>/dev/null); do \
+                   [ -f \"$f\" ] || continue; \
+                   base=\"${{f##*/}}\"; \
+                   stem=\"${{base%.jsonl}}\"; \
+                   case \"$stem\" in \
+                     [0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) \
+                       SID=\"$stem\"; break ;; \
+                   esac; \
+                 done; \
+                 IFS=\"$__OLDIFS\"; \
+               fi; \
+             fi; \
+             if [ -n \"$SID\" ]; then \
+               INNER=\"claude --resume $SID --fork-session\"; \
+             elif [ \"$CLAUDE\" -eq 1 ]; then \
+               INNER=\"claude\"; \
+             else \
+               INNER=\"\"; \
+             fi; \
+             if [ -n \"$INNER\" ]; then \
+               CMD=\"bash -lc '$INNER'\"; \
+               tmux new-session -d -s \"$NEW\" -c \"$CWD\" \"$CMD\"; \
+             else \
+               tmux new-session -d -s \"$NEW\" -c \"$CWD\"; \
+             fi",
+            src = source,
+            new = new_name,
+            cl_var = claude_flag,
+        )
+    }
+
     /// Capture the active pane of a remote session with ANSI escapes,
     /// for the ambient preview pane. One SSH round-trip; expected to be
     /// called at most every few hundred ms per host.

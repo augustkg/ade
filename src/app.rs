@@ -245,6 +245,10 @@ pub enum AppState {
         original_name: String,
         machine: Machine,
     },
+    DuplicatingSession {
+        source_name: String,
+        machine: Machine,
+    },
     RenamingFolder {
         original_prefix: String,
     },
@@ -290,6 +294,7 @@ pub enum SessionAction {
     #[default]
     Enter,
     Rename,
+    Duplicate,
     Delete,
 }
 
@@ -924,6 +929,7 @@ impl App {
             AppState::Tree => self.handle_tree_key(key),
             AppState::CreatingSession(_) => self.handle_creating_session_key(key),
             AppState::RenamingSession { .. } => self.handle_renaming_session_key(key),
+            AppState::DuplicatingSession { .. } => self.handle_duplicating_session_key(key),
             AppState::RenamingFolder { .. } => self.handle_renaming_folder_key(key),
             AppState::Confirming(_) => self.handle_confirming_key(key),
             AppState::HostsList { .. } => self.handle_hosts_list_key(key),
@@ -975,23 +981,20 @@ impl App {
 
     /// Try to enter embedded mode against the currently-highlighted
     /// session. No-op in any case where the focus or row isn't right
-    /// (folder rows, NewSession placeholder, no preview pane enabled,
-    /// etc.). Errors during PTY/child spawn surface via `error_message`.
+    /// (folder rows, NewSession placeholder, etc.). Errors during PTY/
+    /// child spawn surface via `error_message`. If the preview pane
+    /// isn't open yet, Tab opens it first — equivalent to `p` + `Tab`
+    /// in one keystroke.
     fn try_enter_embedded(&mut self) {
-        if !self.preview_pane_enabled {
-            // Codex Phase-5 UX nit: silent no-op was hard to discover.
-            // Surface a short hint so first-time Tab presses don't
-            // look broken when the panel hasn't been turned on yet.
-            self.error_message =
-                Some("Enable the preview pane with `p` first, then Tab to enter.".to_string());
-            return;
-        }
         if self.focus_area != FocusArea::SessionList {
             return;
         }
         let Some(Row::Session(idx)) = self.current_row() else {
             return;
         };
+        if !self.preview_pane_enabled {
+            self.toggle_preview_pane();
+        }
         let Some(session) = self.tree.session(idx) else {
             return;
         };
@@ -1086,30 +1089,44 @@ impl App {
                     self.selected_action = SessionAction::Enter;
                 }
             }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if matches!(
-                    self.current_row(),
-                    Some(Row::Session(_)) | Some(Row::Folder(_))
-                ) {
+            KeyCode::Right | KeyCode::Char('l') => match self.current_row() {
+                Some(Row::Session(_)) => {
                     self.selected_action = match self.selected_action {
                         SessionAction::Enter => SessionAction::Rename,
-                        SessionAction::Rename => SessionAction::Delete,
+                        SessionAction::Rename => SessionAction::Duplicate,
+                        SessionAction::Duplicate => SessionAction::Delete,
                         SessionAction::Delete => SessionAction::Delete,
                     };
                 }
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                if matches!(
-                    self.current_row(),
-                    Some(Row::Session(_)) | Some(Row::Folder(_))
-                ) {
+                Some(Row::Folder(_)) => {
+                    // Folder rows have no Duplicate slot — folders are a
+                    // pure UI grouping, not a tmux primitive.
+                    self.selected_action = match self.selected_action {
+                        SessionAction::Enter => SessionAction::Rename,
+                        SessionAction::Rename => SessionAction::Delete,
+                        SessionAction::Duplicate | SessionAction::Delete => SessionAction::Delete,
+                    };
+                }
+                _ => {}
+            },
+            KeyCode::Left | KeyCode::Char('h') => match self.current_row() {
+                Some(Row::Session(_)) => {
                     self.selected_action = match self.selected_action {
                         SessionAction::Enter => SessionAction::Enter,
                         SessionAction::Rename => SessionAction::Enter,
-                        SessionAction::Delete => SessionAction::Rename,
+                        SessionAction::Duplicate => SessionAction::Rename,
+                        SessionAction::Delete => SessionAction::Duplicate,
                     };
                 }
-            }
+                Some(Row::Folder(_)) => {
+                    self.selected_action = match self.selected_action {
+                        SessionAction::Enter => SessionAction::Enter,
+                        SessionAction::Rename => SessionAction::Enter,
+                        SessionAction::Duplicate | SessionAction::Delete => SessionAction::Rename,
+                    };
+                }
+                _ => {}
+            },
             KeyCode::Char('o') | KeyCode::Char(' ') => {
                 if let Some(Row::Folder(idx)) = self.current_row() {
                     self.tree.toggle_folder(idx);
@@ -1145,6 +1162,7 @@ impl App {
                 self.input_buffer.clear();
             }
             KeyCode::Char('R') => self.start_rename_selected(),
+            KeyCode::Char('y') => self.start_duplicate_selected(),
             KeyCode::Char('d') => self.start_delete_selected(),
             KeyCode::Char('H') => {
                 self.state = AppState::HostsList { selected: 0 };
@@ -1200,6 +1218,24 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn start_duplicate_selected(&mut self) {
+        let Some(Row::Session(idx)) = self.current_row() else {
+            return;
+        };
+        let Some(session) = self.tree.session(idx) else {
+            return;
+        };
+        let source = session.raw_name.clone();
+        let machine = session.machine.clone();
+        // Pre-fill with `<source>-copy`. Users can edit before committing.
+        let suggested = format!("{}-copy", source);
+        self.state = AppState::DuplicatingSession {
+            source_name: source,
+            machine,
+        };
+        self.input_buffer = TextField::from_str(&suggested);
     }
 
     fn start_delete_selected(&mut self) {
@@ -1267,6 +1303,9 @@ impl App {
                 }
                 SessionAction::Rename => self.start_rename_selected(),
                 SessionAction::Delete => self.start_delete_selected(),
+                // Folder rows can't reach Duplicate via cycling; the arm
+                // exists only for type completeness.
+                SessionAction::Duplicate => {}
             },
             Some(Row::Session(idx)) => {
                 let session = match self.tree.session(idx) {
@@ -1293,6 +1332,7 @@ impl App {
                         };
                         self.input_buffer = TextField::from_str(&session.raw_name);
                     }
+                    SessionAction::Duplicate => self.start_duplicate_selected(),
                     SessionAction::Delete => self.start_delete_selected(),
                 }
             }
@@ -1455,6 +1495,124 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn handle_duplicating_session_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.state = AppState::Tree;
+                self.input_buffer.clear();
+                self.selected_action = SessionAction::Enter;
+            }
+            KeyCode::Enter => {
+                if !self.input_buffer.is_empty() {
+                    self.execute_duplicate_session();
+                }
+            }
+            KeyCode::Backspace => self.input_buffer.delete_left(),
+            KeyCode::Delete => self.input_buffer.delete_right(),
+            KeyCode::Left => self.input_buffer.move_left(),
+            KeyCode::Right => self.input_buffer.move_right(),
+            KeyCode::Home => self.input_buffer.move_home(),
+            KeyCode::End => self.input_buffer.move_end(),
+            KeyCode::Char(c) => {
+                if c.is_alphanumeric() || c == '-' || c == '_' || c == '/' {
+                    self.input_buffer.insert(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn execute_duplicate_session(&mut self) {
+        let new_name = self.input_buffer.trim().to_string();
+        if new_name.is_empty() {
+            crate::duplicate_log::log("execute: aborted (empty new_name)");
+            return;
+        }
+        let (source, machine) = if let AppState::DuplicatingSession {
+            source_name,
+            machine,
+        } = &self.state
+        {
+            (source_name.clone(), machine.clone())
+        } else {
+            crate::duplicate_log::log("execute: aborted (state was not DuplicatingSession)");
+            return;
+        };
+        crate::duplicate_log::log(&format!(
+            "execute: source={:?} new_name={:?} machine={:?}",
+            source,
+            new_name,
+            machine.label()
+        ));
+
+        // Pre-validate name collision on the same host so the banner reads
+        // cleanly instead of surfacing raw tmux stderr.
+        let collision = self.tree.sessions.iter().any(|s| {
+            s.machine == machine && s.raw_name == new_name
+        });
+        if collision {
+            crate::duplicate_log::log("execute: collision precheck rejected");
+            self.error_message = Some(format!(
+                "session '{}' already exists on {}",
+                new_name,
+                machine.label()
+            ));
+            self.state = AppState::Tree;
+            self.input_buffer.clear();
+            self.selected_action = SessionAction::Enter;
+            return;
+        }
+
+        // Pull `claude_running` from the already-refreshed session field —
+        // computed identically for local and remote by the refresh loop's
+        // descendant-PID walk, so local and remote duplicate share detection.
+        // We key off `claude_present` (any Claude pane) rather than
+        // `claude.is_some()` (active state only): an idle Claude sitting
+        // at its prompt is exactly the case we want to fork, but it has
+        // no `state` and would be missed by the active-state check.
+        let claude_running = self
+            .tree
+            .sessions
+            .iter()
+            .find(|s| s.machine == machine && s.raw_name == source)
+            .map(|s| s.claude_present)
+            .unwrap_or(false);
+        crate::duplicate_log::log(&format!(
+            "execute: claude_running={} (resolved from tree.sessions)",
+            claude_running
+        ));
+
+        let result = match self.backend(&machine) {
+            Some(b) => {
+                crate::duplicate_log::log("execute: calling backend.duplicate_session");
+                b.duplicate_session(&source, &new_name, claude_running)
+            }
+            None => {
+                crate::duplicate_log::log(&format!(
+                    "execute: backend lookup returned None for machine={:?}",
+                    machine.label()
+                ));
+                Err(format!("unknown host: {}", machine.label()))
+            }
+        };
+        match result {
+            Ok(()) => {
+                crate::duplicate_log::log("execute: backend returned Ok — calling refresh()");
+                self.state = AppState::Tree;
+                self.input_buffer.clear();
+                self.selected_action = SessionAction::Enter;
+                self.refresh();
+            }
+            Err(e) => {
+                crate::duplicate_log::log(&format!("execute: backend returned Err: {:?}", e));
+                self.error_message = Some(e);
+                self.state = AppState::Tree;
+                self.input_buffer.clear();
+                self.selected_action = SessionAction::Enter;
+            }
         }
     }
 

@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use crate::claude_status::{self, ClaudeState, Provenance};
+use crate::claude_status::{self, ClaudeState, Provenance, Reading};
 use crate::hosts::{Config, Host, HostKind};
 use crate::install_hooks;
 use crate::tmux::parse_pane_line;
@@ -30,7 +30,7 @@ const REMOTE_DEBUG_CMD: &str = concat!(
     "  printf '\\n---ADE-STATUS-END---\\n'; ",
     "done; ",
     "echo '---ADE-HOOKS---'; ",
-    "if grep -q ade-status-marker-v2 \"$HOME\"/.claude/settings.json 2>/dev/null; then echo OK; else echo MISSING; fi"
+    "if grep -q ade-status-marker-v3 \"$HOME\"/.claude/settings.json 2>/dev/null; then echo OK; else echo MISSING; fi"
 );
 
 const SSH_OPTS: &[&str] = &[
@@ -126,7 +126,7 @@ fn print_remote(host: &Host) {
 fn print_section(
     panes_text: &str,
     ps_text: &str,
-    statuses: &HashMap<String, (ClaudeState, Provenance)>,
+    statuses: &HashMap<String, Reading>,
     hooks_installed: Option<bool>,
 ) {
     let panes: Vec<(String, String, String, u32, String)> = panes_text
@@ -145,7 +145,7 @@ fn print_section(
     let descendants_by_root = build_descendants(&pane_pids, ps_text);
 
     println!(
-        "  {:<22} {:>6} {:>7} {:<28} {:<28} {}",
+        "  {:<22} {:>6} {:>7} {:<28} {:<32} {}",
         "session", "pane", "pid", "claude descendants", "status file", "decision"
     );
     for (session, cmd, pane_id, pane_pid, _session_id) in &panes {
@@ -164,25 +164,33 @@ fn print_section(
             claude_descs.join(",")
         };
 
-        let status_str = match statuses.get(pane_id) {
-            Some((ClaudeState::Working, prov)) => {
-                format!("{}.json (working{})", pane_id, prov_suffix(*prov))
-            }
-            Some((ClaudeState::Idle, prov)) => {
-                format!("{}.json (idle{})", pane_id, prov_suffix(*prov))
-            }
-            Some((ClaudeState::AwaitingApproval, prov)) => {
-                format!("{}.json (await{})", pane_id, prov_suffix(*prov))
+        let reading = statuses.get(pane_id);
+        let status_str = match reading {
+            Some(r) => {
+                let label = match r.state {
+                    ClaudeState::Working => "working",
+                    ClaudeState::Idle => "idle",
+                    ClaudeState::AwaitingApproval => "await",
+                };
+                let pct = r
+                    .usage
+                    .as_ref()
+                    .map(|u| format!(", {}%", claude_status::context_window_pct(u)))
+                    .unwrap_or_default();
+                format!(
+                    "{}.json ({}{}{})",
+                    pane_id,
+                    label,
+                    prov_suffix(r.provenance),
+                    pct
+                )
             }
             None => "-".to_string(),
         };
 
         let is_claude = cmd == "claude" || claude_pane_pids.contains(pane_pid);
         let decision = if is_claude {
-            let state = statuses
-                .get(pane_id)
-                .map(|(s, _)| *s)
-                .unwrap_or(ClaudeState::Idle);
+            let state = reading.map(|r| r.state).unwrap_or(ClaudeState::Idle);
             match state {
                 ClaudeState::Working => "claude=working",
                 ClaudeState::Idle => "claude=idle",
@@ -193,12 +201,12 @@ fn print_section(
         };
 
         println!(
-            "  {:<22} {:>6} {:>7} {:<28} {:<28} {}",
+            "  {:<22} {:>6} {:>7} {:<28} {:<32} {}",
             truncate(&format!("{} [{}]", session, cmd), 22),
             pane_id,
             pane_pid,
             truncate(&claude_str, 28),
-            truncate(&status_str, 28),
+            truncate(&status_str, 32),
             decision,
         );
     }

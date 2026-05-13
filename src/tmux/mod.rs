@@ -1,7 +1,7 @@
 pub mod local;
 pub mod remote;
 
-use crate::claude_status::{ClaudeState, Provenance};
+use crate::claude_status::{self, ClaudeState, Provenance, Reading};
 use crate::hosts::Host;
 use crate::model::Machine;
 
@@ -27,6 +27,18 @@ pub struct Session {
     /// suppress notification rule 5: a `Some(Working) → None` transition
     /// caused purely by TTL is not "Claude finished a turn".
     pub claude_demoted: bool,
+    /// `true` when at least one pane in this session is running `claude`
+    /// (or a descendant of `claude`) regardless of whether it's actively
+    /// working. `claude` is `None` for idle Claude — we don't render a
+    /// chip for it — but the duplicate flow still wants to fork an idle
+    /// Claude into the new session, so it keys off this instead.
+    pub claude_present: bool,
+    /// Context-window percentage (0..=100) for this session's Claude pane,
+    /// computed via `claude_status::context_window_pct` from the latest
+    /// assistant turn the v3 hook script captured. `None` when the v3 hook
+    /// hasn't fired yet (legacy v2 install, or Claude session started
+    /// before its first assistant turn).
+    pub claude_context_pct: Option<u8>,
 }
 
 /// Per-session rollup of every Claude pane in that session — produced by
@@ -35,6 +47,17 @@ pub struct Session {
 pub struct ClaudeRollup {
     pub state: Option<ClaudeState>,
     pub demoted: bool,
+    /// `true` as soon as we observe any Claude pane in the session,
+    /// independent of whether a status file gave us a state. Idle Claude
+    /// often has no status row (the hook only writes on state changes),
+    /// so without this flag the rollup would say "no Claude here" for a
+    /// session sitting at the prompt.
+    pub present: bool,
+    /// Highest context-window percentage observed across this session's
+    /// Claude panes. `None` when no pane produced a `Reading` with usage
+    /// data (legacy v2 hook install, or no assistant turn has happened
+    /// yet). Used by the UI to render `claude · NN%`.
+    pub context_pct: Option<u8>,
 }
 
 pub trait TmuxBackend {
@@ -42,6 +65,20 @@ pub trait TmuxBackend {
     fn create_session(&self, name: &str) -> Result<(), String>;
     fn rename_session(&self, old: &str, new: &str) -> Result<(), String>;
     fn kill_session(&self, name: &str) -> Result<(), String>;
+    /// Create a new session in the same cwd as `source`. If `claude_running`,
+    /// look up the source's Claude session-id (most recently modified jsonl
+    /// in `~/.claude/projects/<encoded-cwd>/`) and launch
+    /// `claude --resume <id> --fork-session` inside the new session — that
+    /// branches the conversation cleanly instead of having two clients write
+    /// to the same history. If the id can't be found, fall back to plain
+    /// `claude`. If `claude_running` is false, just spawn the default shell
+    /// in the new session at the source's cwd.
+    fn duplicate_session(
+        &self,
+        source: &str,
+        new_name: &str,
+        claude_running: bool,
+    ) -> Result<(), String>;
 }
 
 /// True if ADE is being launched from inside a tmux pane. Checks `TMUX`
@@ -78,6 +115,30 @@ pub fn local() -> local::LocalTmux {
     local::LocalTmux
 }
 
+/// True if `s` looks like a Claude Code session UUID — the canonical
+/// `8-4-4-4-12` hex layout. Mirrors the `case` glob used in the
+/// `RemoteTmux::duplicate_session` shell script so local and remote
+/// accept the exact same set of stems; without that symmetry, a
+/// malformed `.jsonl` name would be passed to `claude --resume` locally
+/// but fall back to plain `claude` remotely.
+pub(crate) fn is_session_uuid(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        let is_dash_pos = i == 8 || i == 13 || i == 18 || i == 23;
+        if is_dash_pos {
+            if b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn backend_for(machine: &Machine, hosts: &[Host]) -> Option<Box<dyn TmuxBackend>> {
     match machine {
         Machine::Local => Some(Box::new(local::LocalTmux)),
@@ -102,6 +163,8 @@ pub(crate) fn parse_session_line(line: &str) -> Option<Session> {
             session_id: parts[3].to_string(),
             claude: None,
             claude_demoted: false,
+            claude_present: false,
+            claude_context_pct: None,
         })
     } else {
         None
@@ -159,7 +222,7 @@ pub(crate) fn parse_pane_line(line: &str) -> Option<(String, String, String, u32
 /// walk (catches shell-wrapped or background-launched Claude processes).
 pub(crate) fn map_claude_states(
     panes_text: &str,
-    statuses: &std::collections::HashMap<String, (ClaudeState, Provenance)>,
+    statuses: &std::collections::HashMap<String, Reading>,
     claude_pane_pids: &std::collections::HashSet<u32>,
 ) -> std::collections::HashMap<String, ClaudeRollup> {
     let mut out: std::collections::HashMap<String, ClaudeRollup> =
@@ -177,23 +240,156 @@ pub(crate) fn map_claude_states(
         if !is_claude {
             continue;
         }
-        let Some(&(state, prov)) = statuses.get(&pane_id) else {
+        // Mark presence as soon as we identify a Claude pane, BEFORE the
+        // status-file lookup. Idle Claude often has no status row (the
+        // hook only writes on state transitions), so requiring a status
+        // to set `present` would miss exactly the case the duplicate
+        // flow cares about most.
+        let entry = out.entry(session).or_default();
+        entry.present = true;
+        let Some(reading) = statuses.get(&pane_id) else {
             continue;
         };
-        let entry = out.entry(session).or_default();
         if matches!(
-            state,
+            reading.state,
             ClaudeState::Working | ClaudeState::AwaitingApproval
         ) {
             entry.state = match entry.state {
-                Some(cur) if state > cur => Some(state),
-                None => Some(state),
+                Some(cur) if reading.state > cur => Some(reading.state),
+                None => Some(reading.state),
                 Some(cur) => Some(cur),
             };
         }
-        if matches!(prov, Provenance::Demoted) {
+        if matches!(reading.provenance, Provenance::Demoted) {
             entry.demoted = true;
+        }
+        // Surface the highest context % across all Claude panes in this
+        // session. In practice there's only ever one (the duplicate-fork
+        // flow makes new sessions, not multiple Claudes in the same one),
+        // but the max-aggregation is the principled choice and costs
+        // nothing.
+        if let Some(usage) = reading.usage.as_ref() {
+            let pct = claude_status::context_window_pct(usage);
+            entry.context_pct = Some(match entry.context_pct {
+                Some(cur) => cur.max(pct),
+                None => pct,
+            });
         }
     }
     out
+}
+
+#[cfg(test)]
+mod claude_rollup_tests {
+    //! Pins the detection semantics around `ClaudeRollup`:
+    //!   * `present` flips on as soon as ANY Claude pane is observed,
+    //!     even if the status file is missing — exactly the idle case
+    //!     the Duplicate action needs to flag.
+    //!   * `state` stays `None` for idle Claude (no status row) so the
+    //!     refresh-time chip rendering is unchanged.
+    //!   * The descendant-PID walk picks up shell-wrapped Claude too.
+
+    use super::{map_claude_states, ClaudeRollup};
+    use crate::claude_status::{ClaudeState, ContextUsage, Provenance, Reading};
+    use std::collections::{HashMap, HashSet};
+
+    fn pane_line(session: &str, cmd: &str, pane_id: &str, pid: u32, sid: &str) -> String {
+        format!("{}\t{}\t{}\t{}\t{}", session, cmd, pane_id, pid, sid)
+    }
+
+    fn reading(state: ClaudeState, usage: Option<ContextUsage>) -> Reading {
+        Reading {
+            state,
+            provenance: Provenance::Recorded,
+            usage,
+            seq: None,
+        }
+    }
+
+    #[test]
+    fn idle_claude_sets_present_even_without_status_file() {
+        let panes =
+            pane_line("sess", "claude", "%1", 1234, "$1") + "\n";
+        let statuses: HashMap<String, Reading> = HashMap::new();
+        let claude_pids: HashSet<u32> = HashSet::new();
+        let out = map_claude_states(&panes, &statuses, &claude_pids);
+        let rollup = out.get("sess").expect("rollup for idle Claude pane");
+        assert!(
+            rollup.present,
+            "idle Claude with no status row must set present"
+        );
+        assert!(
+            rollup.state.is_none(),
+            "no chip for idle: state stays None"
+        );
+        assert!(!rollup.demoted);
+        assert!(rollup.context_pct.is_none());
+    }
+
+    #[test]
+    fn working_claude_sets_state_and_present() {
+        let panes =
+            pane_line("sess", "claude", "%1", 1234, "$1") + "\n";
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            "%1".to_string(),
+            reading(ClaudeState::Working, None),
+        );
+        let claude_pids = HashSet::new();
+        let out = map_claude_states(&panes, &statuses, &claude_pids);
+        let rollup = out.get("sess").expect("rollup");
+        assert!(rollup.present);
+        assert_eq!(rollup.state, Some(ClaudeState::Working));
+    }
+
+    #[test]
+    fn non_claude_pane_does_not_set_present() {
+        let panes =
+            pane_line("sess", "vim", "%1", 1234, "$1") + "\n";
+        let statuses = HashMap::new();
+        let claude_pids = HashSet::new();
+        let out = map_claude_states(&panes, &statuses, &claude_pids);
+        assert!(
+            out.get("sess").is_none() || !out.get("sess").unwrap().present,
+            "no Claude pane → rollup absent or present=false; got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn shell_wrapped_claude_via_descendant_pid_sets_present() {
+        // pane_current_command is `bash`, but pane_pid is in the
+        // descendant set — must still count as Claude.
+        let panes =
+            pane_line("sess", "bash", "%1", 5555, "$1") + "\n";
+        let statuses = HashMap::new();
+        let mut claude_pids = HashSet::new();
+        claude_pids.insert(5555u32);
+        let out = map_claude_states(&panes, &statuses, &claude_pids);
+        let rollup: &ClaudeRollup = out
+            .get("sess")
+            .expect("descendant-pid Claude must be detected");
+        assert!(rollup.present);
+    }
+
+    #[test]
+    fn context_pct_surfaces_to_rollup() {
+        let panes =
+            pane_line("sess", "claude", "%1", 1234, "$1") + "\n";
+        let mut statuses = HashMap::new();
+        statuses.insert(
+            "%1".to_string(),
+            reading(
+                ClaudeState::Idle,
+                Some(ContextUsage {
+                    tokens: 50_000,
+                    model: "claude-opus-4-7".to_string(),
+                    session_id: "s".to_string(),
+                }),
+            ),
+        );
+        let out = map_claude_states(&panes, &statuses, &HashSet::new());
+        let rollup = out.get("sess").expect("rollup");
+        assert_eq!(rollup.context_pct, Some(25), "50k of 200k = 25%");
+    }
 }
