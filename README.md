@@ -67,6 +67,8 @@ touching any user-owned hooks that happen to share an entry.
 
 ADE also surfaces a one-time peach `Tip` banner inside the TUI when it notices the tmux config is missing — dismiss with `x` if you don't want it.
 
+`install-tmux-config` also ships two keybindings to jump back to ADE from inside any attached tmux session — see **Tmux keybindings** below.
+
 ## Keys (Tree view)
 
 | Key | Action |
@@ -81,6 +83,17 @@ ADE also surfaces a one-time peach `Tip` banner inside the TUI when it notices t
 | `r` | Refresh |
 | `x` | Dismiss the tmux-config nudge |
 | `q` / `Esc` | Quit |
+
+## Tmux keybindings (installed by `ade install-tmux-config`)
+
+Press these from inside any tmux session that has ADE's tmux config sourced:
+
+| Chord | Action |
+|---|---|
+| `<prefix> B` | Back to ADE — detaches when ADE attached this session itself, otherwise switches to the pane where ADE is running. |
+| `<prefix> Space` | Pop ADE up over the current pane (90×90% popup). Pick a session to switch into it; press `q` to dismiss without changing anything. Requires tmux 3.2+. |
+
+`<prefix> Space` overrides tmux's default `next-layout` binding. If you actively use multiple pane layouts, rebind it in your own `~/.tmux.conf` *after* the `source-file ~/.config/ade/tmux.conf` line.
 
 ## Commands
 
