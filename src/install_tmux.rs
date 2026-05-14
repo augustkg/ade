@@ -32,7 +32,7 @@ const SOURCE_LINE: &str = "source-file -q ~/.config/ade/tmux.conf  # ade-tmux-ma
 /// stale and overwritten on the next `install`.
 const MANAGED_BODY: &str = "\
 # Managed by ADE — do not edit. Run `ade install-tmux-config --uninstall` to remove.
-# ade-tmux-managed v5
+# ade-tmux-managed v6
 
 # Mouse drag-select-to-copy + OSC 52 clipboard, with the mosh-friendly Ms
 # override so the escape sequence survives mosh 1.4.0's strict parser.
@@ -70,19 +70,16 @@ set-option -g set-titles-string '#{?#{@ade-title},#{@ade-title},#W}'
 # (typically the pane where ADE is still running).
 bind-key B if-shell -F '#{@ade-parent}' 'detach-client' 'switch-client -l'
 
-# `prefix Space` — pop ADE up over the current pane.
-# Complements `prefix B` (which detaches / switch-client's away from the
-# current session). Space keeps you in place: pick a session in the popup,
-# ADE issues switch-client and the popup closes onto the newly-attached
-# session. If you just want to peek at the tree, press `q` in the popup
-# and your original context is untouched.
+# `prefix Space` — alias for `prefix B`. Same routing: detach-client when
+# ADE attached this session (so we return to the parent ADE TUI in the
+# same tab), otherwise switch-client -l (so we land on the pane where ADE
+# is still running). Space is the more discoverable chord; B is kept for
+# muscle-memory continuity.
 #
 # Overrides tmux's default `Space → next-layout`. Users who rely on
 # next-layout can rebind it in their own `~/.tmux.conf` after the
 # source-file line that pulls in this managed config.
-#
-# Requires tmux 3.2+ (`display-popup -E`).
-bind-key Space display-popup -E -h 90% -w 90% -T ' ADE ' 'ade'
+bind-key Space if-shell -F '#{@ade-parent}' 'detach-client' 'switch-client -l'
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -818,11 +815,11 @@ mod tests {
     }
 
     #[test]
-    fn managed_body_carries_v5_sentinel() {
+    fn managed_body_carries_v6_sentinel() {
         // Bumping the sentinel invalidates installs of prior versions so
-        // they're detected as Stale and re-installed. If you change v5 →
-        // v6 in MANAGED_BODY, update this test too.
-        assert!(MANAGED_BODY.contains("ade-tmux-managed v5"));
+        // they're detected as Stale and re-installed. If you change v6 →
+        // v7 in MANAGED_BODY, update this test too.
+        assert!(MANAGED_BODY.contains("ade-tmux-managed v6"));
     }
 
     #[test]
@@ -835,14 +832,12 @@ mod tests {
     }
 
     #[test]
-    fn managed_body_binds_prefix_space_popup() {
-        // `prefix Space` opens ADE in a centred popup over the current
-        // pane. The -E flag is load-bearing (closes the popup when ADE
-        // exits — without it, the popup would stick around as an empty
-        // frame after switch-client). 'ade' as the inner command relies
-        // on the binary being on $PATH at tmux server launch time, same
-        // assumption as the attach paths.
+    fn managed_body_binds_prefix_space_back_to_ade() {
+        // `prefix Space` is an alias for `prefix B` — same `if-shell`
+        // routing. Both halves of the conditional must be present so
+        // neither flow (detach-client when ADE attached us, switch-client
+        // -l when we got here via switch-client) regresses.
         assert!(MANAGED_BODY
-            .contains("bind-key Space display-popup -E -h 90% -w 90% -T ' ADE ' 'ade'"));
+            .contains("bind-key Space if-shell -F '#{@ade-parent}' 'detach-client' 'switch-client -l'"));
     }
 }

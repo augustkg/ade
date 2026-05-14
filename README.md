@@ -91,7 +91,7 @@ Press these from inside any tmux session that has ADE's tmux config sourced:
 | Chord | Action |
 |---|---|
 | `<prefix> B` | Back to ADE — detaches when ADE attached this session itself, otherwise switches to the pane where ADE is running. |
-| `<prefix> Space` | Pop ADE up over the current pane (90×90% popup). Pick a session to switch into it; press `q` to dismiss without changing anything. Requires tmux 3.2+. |
+| `<prefix> Space` | Same as `<prefix> B`. Aliased for discoverability and finger comfort. |
 
 `<prefix> Space` overrides tmux's default `next-layout` binding. If you actively use multiple pane layouts, rebind it in your own `~/.tmux.conf` *after* the `source-file ~/.config/ade/tmux.conf` line.
 
