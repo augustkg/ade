@@ -13,6 +13,13 @@ pub struct RemoteTmux {
 pub struct RemoteRefresh {
     pub sessions: Vec<Session>,
     pub hooks_installed: Option<bool>,
+    /// True only when the remote `tmux list-sessions` positively succeeded
+    /// (exit 0, or the no-server-running case which is a confirmed-empty
+    /// list). False when tmux is missing/broken on the host — the SSH
+    /// probe itself still exits 0 in that case, so without this flag a
+    /// broken remote tmux would read as "observed: zero sessions" and let
+    /// `App::reconcile_kanban` prune every placement on that host.
+    pub sessions_observed: bool,
 }
 
 const SSH_OPTS: &[&str] = &[
@@ -33,8 +40,24 @@ const PS_SENTINEL: &str = "---ADE-PS---";
 const STATUS_SENTINEL: &str = "---ADE-STATUS---";
 const HOOKS_SENTINEL: &str = "---ADE-HOOKS---";
 
+const LS_OK_SENTINEL: &str = "---ADE-LS-OK---";
+const LS_FAIL_SENTINEL: &str = "---ADE-LS-FAIL---";
+
 const REMOTE_LIST_CMD: &str = concat!(
-    "tmux list-sessions -F '#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_id}' 2>/dev/null; ",
+    // list-sessions runs first with an explicit disposition marker: OK for
+    // exit 0 or the no-server case (confirmed empty), FAIL for anything
+    // else (tmux missing → exit 127 "command not found", socket permission
+    // error, …). The probe's own exit code can't carry this — it's the
+    // exit of the final `if`. The no-server predicate mirrors
+    // `tmux::is_no_server_error`: `no server running`, or `error
+    // connecting to` TOGETHER WITH `No such file or directory` —
+    // `error connecting to` alone also covers Permission denied /
+    // Connection refused, which are real failures.
+    "ls_out=$(tmux list-sessions -F '#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_id}' 2>&1); ls_code=$?; ",
+    "if [ \"$ls_code\" -eq 0 ]; then echo '---ADE-LS-OK---'; printf '%s\\n' \"$ls_out\"; ",
+    "elif printf '%s' \"$ls_out\" | grep -q 'no server running'; then echo '---ADE-LS-OK---'; ",
+    "elif printf '%s' \"$ls_out\" | grep -q 'error connecting to' && printf '%s' \"$ls_out\" | grep -q 'No such file or directory'; then echo '---ADE-LS-OK---'; ",
+    "else echo '---ADE-LS-FAIL---'; fi; ",
     "echo '---ADE-PANES---'; ",
     "tmux list-panes -a -F '#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}\t#{session_id}' 2>/dev/null; ",
     "echo '---ADE-PS---'; ",
@@ -54,6 +77,25 @@ const REMOTE_LIST_CMD: &str = concat!(
     // wires the new context-window plumbing.
     "if grep -q ade-status-marker-v3 \"$HOME\"/.claude/settings.json 2>/dev/null; then echo OK; else echo MISSING; fi"
 );
+
+/// Split the sessions block of the combined probe output into
+/// `(list_sessions_succeeded, session_lines)` based on the disposition
+/// sentinel the remote script prepends. The sentinel must be the entire
+/// FIRST line — an unanchored substring match could be spoofed by
+/// session names or shell banners that happen to contain the marker
+/// text. A missing/mismatched first line (unexpected remote shell)
+/// parses whatever is there for display but reports not-observed — the
+/// safe default for placement pruning.
+fn split_ls_disposition(block: &str) -> (bool, &str) {
+    let mut parts = block.splitn(2, '\n');
+    let first = parts.next().unwrap_or("").trim_end_matches('\r');
+    let rest = parts.next().unwrap_or("");
+    match first {
+        LS_OK_SENTINEL => (true, rest),
+        LS_FAIL_SENTINEL => (false, ""),
+        _ => (false, block),
+    }
+}
 
 fn shell_safe(s: &str) -> bool {
     !s.is_empty()
@@ -94,9 +136,11 @@ impl RemoteTmux {
             }
             _ => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                let (sessions_part, rest) = stdout
+                let (sessions_block, rest) = stdout
                     .split_once(PANE_SENTINEL)
                     .unwrap_or((stdout.as_ref(), ""));
+                let (sessions_observed, sessions_part) =
+                    split_ls_disposition(sessions_block);
                 let (panes_part, rest) = rest
                     .split_once(PS_SENTINEL)
                     .unwrap_or((rest, ""));
@@ -140,6 +184,7 @@ impl RemoteTmux {
                 Ok(RemoteRefresh {
                     sessions,
                     hooks_installed,
+                    sessions_observed,
                 })
             }
         }
@@ -303,4 +348,67 @@ fn check_status(out: std::process::Output) -> Result<(), String> {
         .next()
         .unwrap_or("remote tmux command failed")
         .to_string())
+}
+
+#[cfg(test)]
+mod ls_disposition_tests {
+    //! Pins the observed-vs-failed semantics of the list-sessions
+    //! disposition sentinel (Codex implementation review): a broken
+    //! remote tmux must NOT read as "observed: zero sessions", or kanban
+    //! placement pruning would wipe that host's entries.
+
+    use super::split_ls_disposition;
+
+    #[test]
+    fn ok_marker_observes_and_yields_lines() {
+        let block = "---ADE-LS-OK---\nwork\t1\t0\t$1\n";
+        let (observed, lines) = split_ls_disposition(block);
+        assert!(observed);
+        assert!(lines.contains("work\t1\t0\t$1"));
+    }
+
+    #[test]
+    fn ok_marker_with_no_sessions_is_confirmed_empty() {
+        let (observed, lines) = split_ls_disposition("---ADE-LS-OK---\n");
+        assert!(observed);
+        assert!(lines.trim().is_empty());
+    }
+
+    #[test]
+    fn fail_marker_is_not_observed_and_drops_output() {
+        let (observed, lines) =
+            split_ls_disposition("---ADE-LS-FAIL---\ngarbage\n");
+        assert!(!observed);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn missing_marker_parses_for_display_but_is_not_observed() {
+        let block = "work\t1\t0\t$1\n";
+        let (observed, lines) = split_ls_disposition(block);
+        assert!(!observed);
+        assert_eq!(lines, block);
+    }
+
+    #[test]
+    fn sentinel_must_be_the_entire_first_line() {
+        // A banner or session name containing the marker text must not
+        // count as observed — the sentinel is anchored to line 1.
+        let spoofed = "motd: ---ADE-LS-OK--- welcome\nwork\t1\t0\t$1\n";
+        let (observed, _) = split_ls_disposition(spoofed);
+        assert!(!observed);
+
+        // A session literally named like the sentinel appears as
+        // `---ADE-LS-OK---\t1\t0\t$1` — a prefix, not the whole line.
+        let prefix_only = "---ADE-LS-OK---\t1\t0\t$1\n";
+        let (observed, _) = split_ls_disposition(prefix_only);
+        assert!(!observed);
+    }
+
+    #[test]
+    fn crlf_first_line_still_matches() {
+        let (observed, lines) = split_ls_disposition("---ADE-LS-OK---\r\nwork\t1\t0\t$1\n");
+        assert!(observed);
+        assert!(lines.contains("work"));
+    }
 }

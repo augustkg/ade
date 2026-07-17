@@ -22,8 +22,23 @@ impl TmuxBackend for LocalTmux {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 stdout.lines().filter_map(parse_session_line).collect()
             }
-            // tmux exits non-zero when no server is running — treat as empty.
-            Ok(_) => Vec::new(),
+            // tmux exits non-zero when no server is running — that's a
+            // *confirmed empty* list. Any other non-zero exit is a real
+            // failure and must be an Err: `refresh_all` uses Ok-ness to
+            // mark the machine "observed", and kanban placement pruning
+            // trusts observed-empty (a failure reported as empty would
+            // wipe every local placement).
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if super::is_no_server_error(&stderr) {
+                    Vec::new()
+                } else {
+                    return Err(format!(
+                        "tmux list-sessions failed: {}",
+                        stderr.lines().next().unwrap_or("unknown error")
+                    ));
+                }
+            }
             Err(e) => return Err(format!("local tmux unavailable: {}", e)),
         };
 

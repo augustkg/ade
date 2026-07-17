@@ -17,6 +17,35 @@ pub struct State {
     pub preview_pane: PreviewPaneState,
     #[serde(default)]
     pub notifications: NotificationsState,
+    #[serde(default)]
+    pub kanban: KanbanState,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KanbanState {
+    /// Manual kanban placements: which column the user dragged a session
+    /// to. Sessions without an entry follow the automatic columns. Kept
+    /// as a list of `[[kanban.placements]]` tables (not a map) so session
+    /// names containing `/` or `.` never become TOML key syntax.
+    /// Canonicalization (trim / dedup last-wins) happens in
+    /// `kanban::entries_to_map`, not here — `State` stays a dumb mirror
+    /// of the file.
+    #[serde(default)]
+    pub placements: Vec<PlacementEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlacementEntry {
+    /// `"local"` or a hosts.toml host name (`"local"` is reserved in
+    /// `hosts::Config::upsert` to keep the namespaces disjoint).
+    pub host: String,
+    /// Full tmux session name, including any `prefix/` part.
+    pub session: String,
+    /// `kanban::Column::id` this session was manually placed in. May
+    /// reference an id the current kanban.toml doesn't know (e.g. the
+    /// config is temporarily broken) — such entries are preserved, not
+    /// pruned, and render in the auto-awaiting column meanwhile.
+    pub column: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -163,5 +192,37 @@ mod tests {
         assert!(!state.tmux_install_nudge.dismissed);
         assert!(state.folders.closed.is_empty());
         assert!(!state.notifications.enabled);
+        assert!(state.kanban.placements.is_empty());
+    }
+
+    #[test]
+    fn missing_kanban_section_defaults_empty() {
+        // state.toml files written before the kanban feature must load
+        // cleanly with no placements.
+        let body = "[tmux_install_nudge]\ndismissed = true\n";
+        let state: State = toml::from_str(body).unwrap();
+        assert!(state.kanban.placements.is_empty());
+    }
+
+    #[test]
+    fn round_trip_preserves_kanban_placements() {
+        let mut original = State::default();
+        original.kanban.placements = vec![
+            PlacementEntry {
+                host: "local".to_string(),
+                // Session names carry `/` (folder prefix) — must survive
+                // as a TOML *value*, never become key syntax.
+                session: "work/api".to_string(),
+                column: "done".to_string(),
+            },
+            PlacementEntry {
+                host: "buildbox".to_string(),
+                session: "infra.deploy".to_string(),
+                column: "verified".to_string(),
+            },
+        ];
+        let serialized = toml::to_string_pretty(&original).unwrap();
+        let restored: State = toml::from_str(&serialized).unwrap();
+        assert_eq!(restored.kanban.placements, original.kanban.placements);
     }
 }

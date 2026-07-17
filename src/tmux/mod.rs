@@ -220,6 +220,28 @@ pub(crate) fn parse_pane_line(line: &str) -> Option<(String, String, String, u32
 /// A pane is considered to be running Claude if either `pane_current_command`
 /// is `claude` OR `pane_pid` is in the descendant set built from a `ps`
 /// walk (catches shell-wrapped or background-launched Claude processes).
+/// True for any tmux stderr that means "no running server" rather than
+/// "tmux has a real problem". Two known phrasings:
+///   - `no server running on /tmp/tmux-N/default` — server existed
+///     before, socket deleted.
+///   - `error connecting to /tmp/tmux-N/default (No such file or
+///     directory)` — server never started, socket file absent.
+///
+/// The second pattern requires BOTH substrings together. Matching on
+/// `No such file or directory` alone would misclassify real config
+/// errors like `source-file ~/.tmux.local.conf` (without `-q`) where
+/// the running server fails to load a referenced file. Matching on
+/// `error connecting to` alone would misclassify real
+/// socket-permission errors (`Permission denied` / `Connection
+/// refused`) — those mean "tmux is there but unreachable", not "no
+/// tmux at all". That distinction is load-bearing for kanban placement
+/// pruning: only a *confirmed-empty* session list may count as
+/// "observed" (see `refresh::RefreshResult::observed`).
+pub(crate) fn is_no_server_error(err: &str) -> bool {
+    err.contains("no server running")
+        || (err.contains("error connecting to") && err.contains("No such file or directory"))
+}
+
 pub(crate) fn map_claude_states(
     panes_text: &str,
     statuses: &std::collections::HashMap<String, Reading>,

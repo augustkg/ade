@@ -9,6 +9,7 @@ mod embedded_term;
 mod hosts;
 mod install_hooks;
 mod install_tmux;
+mod kanban;
 mod model;
 mod notifications;
 mod preview_pane;

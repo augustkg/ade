@@ -234,6 +234,35 @@ impl IsolatedTmux {
         Ok((w, h))
     }
 
+    /// The active pane's `#{pane_id}` (e.g. `%3`) for the named session.
+    /// Kanban acceptance tests use it to write fake Claude status files
+    /// keyed the way the hooks would.
+    pub fn pane_id(&self, session: &str) -> Result<String, String> {
+        self.display_message(session, "#{pane_id}")
+    }
+
+    /// The active pane's `#{pane_current_command}` — polled by tests that
+    /// launch a fake `claude` binary and need to know it's foreground.
+    pub fn pane_current_command(&self, session: &str) -> Result<String, String> {
+        self.display_message(session, "#{pane_current_command}")
+    }
+
+    fn display_message(&self, session: &str, format: &str) -> Result<String, String> {
+        let target = format!("={}:", session);
+        let out = self
+            .tmux(&["display-message", "-p", "-t", &target, format])
+            .output()
+            .map_err(|e| format!("display-message: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "display-message {} failed: {}",
+                format,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
     /// `true` when the named session exists on this server.
     pub fn has_session(&self, session: &str) -> bool {
         let target = format!("={}:", session);

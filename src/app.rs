@@ -10,6 +10,7 @@ use crate::notifications;
 use crate::hosts::{Config, Host, HostKind};
 use crate::install_hooks;
 use crate::install_tmux::InstallStatus;
+use crate::kanban::{self, KanbanConfig};
 use crate::model::{Machine, Row, Tree};
 use crate::preview_pane::{PreviewKey, PreviewPane};
 use crate::refresh::{refresh_all, RefreshResult};
@@ -116,6 +117,23 @@ impl CreateForm {
         Self {
             machine: Machine::Local,
             prefix: TextField::from_str(&prefix_str),
+            name: TextField::new(),
+            focus,
+        }
+    }
+
+    /// Build the form with an explicit prefix (skip the cwd guess). Used when
+    /// `n` or the folder action chip is invoked from a row that already
+    /// carries folder context, so the user only has to type the leaf.
+    pub fn with_prefix(prefix: &str) -> Self {
+        let focus = if prefix.is_empty() {
+            CreateField::Prefix
+        } else {
+            CreateField::Name
+        };
+        Self {
+            machine: Machine::Local,
+            prefix: TextField::from_str(prefix),
             name: TextField::new(),
             focus,
         }
@@ -237,9 +255,24 @@ impl HostForm {
     }
 }
 
+/// Cursor state for the kanban board view. Focus is *identity-first*:
+/// `focused_key` names the session under the cursor, and every board
+/// rebuild (2s refresh or keypress) re-resolves it to `(col, card)`
+/// indices — so a card that auto-moves columns keeps the cursor, and
+/// `H`/`L` never act on whatever slid into the old position. Only when
+/// the keyed session is gone do the positional indices act as the
+/// clamped fallback (same semantics as the tree's `selected_index`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KanbanView {
+    pub focused_col: usize,
+    pub focused_card: usize,
+    pub focused_key: Option<(Machine, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppState {
     Tree,
+    Kanban(KanbanView),
     CreatingSession(CreateForm),
     RenamingSession {
         original_name: String,
@@ -264,6 +297,17 @@ pub struct PendingConfirm {
     pub title: String,
     pub body: Vec<String>,
     pub action: PendingAction,
+    /// Optional alternate action keyed off a single char. Lets one confirm
+    /// modal offer two destructive choices (e.g. folder delete vs dissolve)
+    /// without spawning a second keybinding. `Esc`/`n` always cancel.
+    pub alternate: Option<ConfirmAlternate>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfirmAlternate {
+    pub key: char,
+    pub label: String,
+    pub action: PendingAction,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -271,6 +315,12 @@ pub enum PendingAction {
     KillSession {
         machine: Machine,
         name: String,
+    },
+    /// Kill every session inside a folder. The folder disappears once tmux
+    /// no longer reports any session sharing the prefix.
+    DeleteFolder {
+        prefix: String,
+        targets: Vec<(Machine, String)>,
     },
     /// Strip the `{prefix}/` part from each child session, demoting them to
     /// loose sessions. The folder dissolves automatically once no session
@@ -293,6 +343,7 @@ pub enum PendingAction {
 pub enum SessionAction {
     #[default]
     Enter,
+    NewSession,
     Rename,
     Duplicate,
     Delete,
@@ -404,6 +455,17 @@ pub struct App {
     /// false-positive `Some(Working) → None` banner that the demote
     /// would otherwise produce.
     pub prior_demoted: HashSet<(Machine, String)>,
+
+    // ---- Kanban board (`src/kanban.rs`) ----
+    /// Column layout from `~/.config/ade/kanban.toml` (defaults when the
+    /// file is missing or invalid). Read-only for the app's lifetime.
+    pub kanban_config: KanbanConfig,
+    /// Authoritative in-memory manual placements, `(machine, raw_name) →
+    /// column id`. Loaded once at startup, mutated by card moves /
+    /// reconciliation / rename migration, and mirrored to `state.toml`
+    /// via `persist_kanban_placements`. Never rebuilt from disk mid-run —
+    /// render and key handling must not do file I/O.
+    pub kanban_placements: HashMap<(Machine, String), String>,
 }
 
 impl Default for App {
@@ -415,7 +477,15 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         let (config, parse_warning) = Config::load();
+        let (kanban_config, kanban_warning) = KanbanConfig::load();
+        // Both config files can be broken at once; join the warnings so
+        // neither is silently swallowed by the single error banner.
+        let startup_warning = match (parse_warning, kanban_warning) {
+            (Some(a), Some(b)) => Some(format!("{}; {}", a, b)),
+            (a, b) => a.or(b),
+        };
         let persisted = State::load();
+        let kanban_placements = kanban::entries_to_map(&persisted.kanban.placements);
         let mut expanded_memory: HashMap<String, bool> = HashMap::new();
         for prefix in &persisted.folders.closed {
             expanded_memory.insert(prefix.clone(), false);
@@ -429,7 +499,7 @@ impl App {
             input_buffer: TextField::new(),
             should_quit: false,
             action: AppAction::None,
-            error_message: parse_warning,
+            error_message: startup_warning,
             expanded_memory,
             config,
             host_hooks: HashMap::new(),
@@ -450,6 +520,8 @@ impl App {
             embedded_target: None,
             notifications_first_seen: persisted.notifications.first_seen,
             prior_demoted: HashSet::new(),
+            kanban_config,
+            kanban_placements,
         };
         app.refresh();
         app
@@ -553,6 +625,7 @@ impl App {
         self.local_hooks_installed = result.local_hooks_installed;
         self.local_tmux_config_status = result.local_tmux_config_status;
         let current_session = result.current_session;
+        let observed = result.observed;
         self.tree = Tree::build(result.per_machine, result.errors, &self.expanded_memory);
         self.tree.current_session = current_session;
 
@@ -561,7 +634,116 @@ impl App {
             self.selected_index = n - 1;
         }
 
+        self.reconcile_kanban(&observed);
         self.dispatch_notifications();
+    }
+
+    /// Kanban bookkeeping after every refresh (sync or background):
+    ///
+    /// (a) **Working precedence** — a session whose Claude is Working now
+    ///     belongs to the auto-active column no matter where the user put
+    ///     it; drop its manual placement so that when Claude stops it
+    ///     falls to auto-awaiting rather than snapping back to Done.
+    /// (b) **Prune dead sessions** — but only on machines whose session
+    ///     list was *successfully observed* this refresh
+    ///     (`RefreshResult::observed`). A transient tmux/SSH failure looks
+    ///     like an empty list and must not wipe placements. Placements
+    ///     are never pruned for referencing an unknown column id — a
+    ///     temporarily broken kanban.toml must not destroy them.
+    /// (c) Re-resolve the board cursor by session identity.
+    ///
+    /// Saves at most once, and only when something actually changed — the
+    /// 2s steady state writes nothing.
+    fn reconcile_kanban(&mut self, observed: &[Machine]) {
+        let mut dirty = false;
+
+        // (a) Working precedence.
+        for s in &self.tree.sessions {
+            if s.claude == Some(ClaudeState::Working) {
+                dirty |= self
+                    .kanban_placements
+                    .remove(&(s.machine.clone(), s.raw_name.clone()))
+                    .is_some();
+            }
+        }
+
+        // (b) Prune placements for vanished sessions on observed machines.
+        let observed_set: HashSet<&Machine> = observed.iter().collect();
+        let live: HashSet<(&Machine, &str)> = self
+            .tree
+            .sessions
+            .iter()
+            .map(|s| (&s.machine, s.raw_name.as_str()))
+            .collect();
+        let before = self.kanban_placements.len();
+        self.kanban_placements.retain(|(machine, name), _| {
+            !observed_set.contains(machine) || live.contains(&(machine, name.as_str()))
+        });
+        dirty |= self.kanban_placements.len() != before;
+
+        // (c) Follow the focused card by identity.
+        if matches!(self.state, AppState::Kanban(_)) {
+            let board = kanban::build_board(
+                &self.kanban_config,
+                &self.tree.sessions,
+                &self.kanban_placements,
+            );
+            let (col, card) = self.resolve_kanban_focus(&board);
+            if let AppState::Kanban(ref mut view) = self.state {
+                view.focused_col = col;
+                view.focused_card = card;
+            }
+        }
+
+        if dirty {
+            // Background reconcile: best-effort save, no error banner —
+            // a transient I/O failure will retry on the next change.
+            let _ = self.persist_kanban_placements();
+        }
+    }
+
+    /// Resolve the kanban cursor to concrete `(col, card)` indices for the
+    /// current board: by `focused_key` identity when that session still
+    /// exists, positionally clamped otherwise. Returns `(0, 0)` when not
+    /// in the kanban state.
+    pub fn resolve_kanban_focus(&self, board: &[Vec<usize>]) -> (usize, usize) {
+        let AppState::Kanban(ref view) = self.state else {
+            return (0, 0);
+        };
+        if let Some((machine, name)) = &view.focused_key {
+            for (ci, col) in board.iter().enumerate() {
+                let pos = col.iter().position(|&si| {
+                    self.tree
+                        .session(si)
+                        .map(|s| &s.machine == machine && &s.raw_name == name)
+                        .unwrap_or(false)
+                });
+                if let Some(pos) = pos {
+                    return (ci, pos);
+                }
+            }
+        }
+        let ncols = board.len().max(1);
+        let col = view.focused_col.min(ncols - 1);
+        let len = board.get(col).map(|c| c.len()).unwrap_or(0);
+        let card = if len == 0 {
+            0
+        } else {
+            view.focused_card.min(len - 1)
+        };
+        (col, card)
+    }
+
+    /// Mirror the in-memory placements map to `state.toml`. Merge
+    /// semantics like `persist_folder_expansion`: reload, replace only the
+    /// kanban section, save. Same known cross-process race / fixed `.tmp`
+    /// path as the rest of state persistence — acceptable single-instance
+    /// best-effort. Caller decides whether a failure is worth a banner
+    /// (user-initiated moves: yes; background reconcile: no).
+    fn persist_kanban_placements(&self) -> Result<(), String> {
+        let mut state = State::load();
+        state.kanban.placements = kanban::map_to_entries(&self.kanban_placements);
+        state.save()
     }
 
     /// Build a per-session map of `(Machine, session_id) → ClaudeState` from
@@ -770,7 +952,8 @@ impl App {
     /// session.
     pub fn tick(&mut self) {
         // Detect a dead embedded child (target session killed externally,
-        // mosh/ssh dropped, etc.) and exit cleanly back to the tree —
+        // mosh/ssh dropped, etc.) and exit cleanly back to the current
+        // view (tree, or the kanban board when embedded from a card) —
         // BEFORE we apply the refresh, so the diff in
         // `apply_refresh_result` sees the cleared `embedded_target`.
         let embedded_dead = self
@@ -797,7 +980,14 @@ impl App {
         // refresh. Skip work entirely when the pane is off — and also
         // when we're embedded, since the right panel renders the live
         // PTY grid in that case (no need to keep snapshotting).
-        if self.preview_pane_enabled && self.embedded_term.is_none() {
+        // Ambient snapshots feed only the tree's side pane. The kanban
+        // board has no read-only preview (its modal IS the embedded
+        // terminal, which renders the live PTY grid) — skip the capture
+        // work there.
+        if self.preview_pane_enabled
+            && self.embedded_term.is_none()
+            && !matches!(self.state, AppState::Kanban(_))
+        {
             let target = self.preview_target();
             self.preview_pane.tick(target.as_ref(), &self.config.hosts);
         }
@@ -905,8 +1095,23 @@ impl App {
 
     /// The session currently under the cursor, expressed as a `PreviewKey`,
     /// or `None` for non-Session rows / no selection. Used by the preview
-    /// pane scheduler in `tick`.
+    /// pane scheduler in `tick` (tree only) and, on the kanban board, by
+    /// the embed-modal title — there the "cursor" is the focused card.
     pub fn preview_target(&self) -> Option<PreviewKey> {
+        if matches!(self.state, AppState::Kanban(_)) {
+            let board = kanban::build_board(
+                &self.kanban_config,
+                &self.tree.sessions,
+                &self.kanban_placements,
+            );
+            let (col, card) = self.resolve_kanban_focus(&board);
+            let &si = board.get(col)?.get(card)?;
+            let session = self.tree.session(si)?;
+            return Some(PreviewKey {
+                machine: session.machine.clone(),
+                name: session.raw_name.clone(),
+            });
+        }
         let Row::Session(idx) = self.current_row()? else {
             return None;
         };
@@ -927,6 +1132,7 @@ impl App {
         }
         match &self.state {
             AppState::Tree => self.handle_tree_key(key),
+            AppState::Kanban(_) => self.handle_kanban_key(key),
             AppState::CreatingSession(_) => self.handle_creating_session_key(key),
             AppState::RenamingSession { .. } => self.handle_renaming_session_key(key),
             AppState::DuplicatingSession { .. } => self.handle_duplicating_session_key(key),
@@ -995,6 +1201,29 @@ impl App {
         if !self.preview_pane_enabled {
             self.toggle_preview_pane();
         }
+        self.enter_embedded_session(idx);
+    }
+
+    /// Same as `try_enter_embedded`, but against the kanban board's
+    /// focused card. Doesn't touch the persisted preview preference —
+    /// the board renders the embedded grid in its modal regardless.
+    fn try_enter_embedded_kanban(&mut self) {
+        let board = kanban::build_board(
+            &self.kanban_config,
+            &self.tree.sessions,
+            &self.kanban_placements,
+        );
+        let (col, card) = self.resolve_kanban_focus(&board);
+        let Some(&idx) = board.get(col).and_then(|c| c.get(card)) else {
+            return; // empty column
+        };
+        self.enter_embedded_session(idx);
+    }
+
+    /// Spawn the embedded PTY for the session at `idx` in the tree.
+    /// Shared by the tree's Tab (right-pane embed) and the board's Tab
+    /// (modal embed) — the exit chord tears it down identically in both.
+    fn enter_embedded_session(&mut self, idx: usize) {
         let Some(session) = self.tree.session(idx) else {
             return;
         };
@@ -1091,18 +1320,23 @@ impl App {
             }
             KeyCode::Right | KeyCode::Char('l') => match self.current_row() {
                 Some(Row::Session(_)) => {
+                    // Sessions skip the NewSession slot — that chip is folder-only.
+                    // NewSession arm snaps back into the session cycle in case state
+                    // drifted in from a folder row across a refresh.
                     self.selected_action = match self.selected_action {
                         SessionAction::Enter => SessionAction::Rename,
                         SessionAction::Rename => SessionAction::Duplicate,
                         SessionAction::Duplicate => SessionAction::Delete,
                         SessionAction::Delete => SessionAction::Delete,
+                        SessionAction::NewSession => SessionAction::Rename,
                     };
                 }
                 Some(Row::Folder(_)) => {
                     // Folder rows have no Duplicate slot — folders are a
                     // pure UI grouping, not a tmux primitive.
                     self.selected_action = match self.selected_action {
-                        SessionAction::Enter => SessionAction::Rename,
+                        SessionAction::Enter => SessionAction::NewSession,
+                        SessionAction::NewSession => SessionAction::Rename,
                         SessionAction::Rename => SessionAction::Delete,
                         SessionAction::Duplicate | SessionAction::Delete => SessionAction::Delete,
                     };
@@ -1116,12 +1350,17 @@ impl App {
                         SessionAction::Rename => SessionAction::Enter,
                         SessionAction::Duplicate => SessionAction::Rename,
                         SessionAction::Delete => SessionAction::Duplicate,
+                        // Stale NewSession from a prior folder row: `h` is
+                        // "move left", so snap to Enter rather than Rename to
+                        // keep the directional intent of the keypress.
+                        SessionAction::NewSession => SessionAction::Enter,
                     };
                 }
                 Some(Row::Folder(_)) => {
                     self.selected_action = match self.selected_action {
                         SessionAction::Enter => SessionAction::Enter,
-                        SessionAction::Rename => SessionAction::Enter,
+                        SessionAction::NewSession => SessionAction::Enter,
+                        SessionAction::Rename => SessionAction::NewSession,
                         SessionAction::Duplicate | SessionAction::Delete => SessionAction::Rename,
                     };
                 }
@@ -1158,7 +1397,27 @@ impl App {
                 }
             }
             KeyCode::Char('n') => {
-                self.state = AppState::CreatingSession(CreateForm::new());
+                // If we're on a folder row (or a session inside one), pre-fill
+                // the modal's prefix from that context so the user only has
+                // to type the leaf. Row::NewSession + None fall through to
+                // the cwd-guessed default — no stale folder prefix leaks
+                // into the placeholder path.
+                let form = match self.current_row() {
+                    Some(Row::Folder(idx)) => self
+                        .tree
+                        .folders
+                        .get(idx)
+                        .map(|f| CreateForm::with_prefix(&f.prefix))
+                        .unwrap_or_else(CreateForm::new),
+                    Some(Row::Session(idx)) => self
+                        .tree
+                        .session(idx)
+                        .and_then(|s| s.prefix.clone())
+                        .map(|p| CreateForm::with_prefix(&p))
+                        .unwrap_or_else(CreateForm::new),
+                    _ => CreateForm::new(),
+                };
+                self.state = AppState::CreatingSession(form);
                 self.input_buffer.clear();
             }
             KeyCode::Char('R') => self.start_rename_selected(),
@@ -1166,6 +1425,13 @@ impl App {
             KeyCode::Char('d') => self.start_delete_selected(),
             KeyCode::Char('H') => {
                 self.state = AppState::HostsList { selected: 0 };
+            }
+            KeyCode::Char('K') => {
+                self.state = AppState::Kanban(KanbanView {
+                    focused_col: 0,
+                    focused_card: 0,
+                    focused_key: None,
+                });
             }
             KeyCode::Char('x') => {
                 // Both opt-in nudges share the `x` key. When both are
@@ -1190,6 +1456,209 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Keymap for the kanban board. Every branch works on a
+    /// freshly-built board with the cursor re-resolved by identity, so a
+    /// background refresh between keypresses can't make a key act on the
+    /// wrong card.
+    fn handle_kanban_key(&mut self, key: KeyEvent) {
+        let board = kanban::build_board(
+            &self.kanban_config,
+            &self.tree.sessions,
+            &self.kanban_placements,
+        );
+        let (col, card) = self.resolve_kanban_focus(&board);
+        let ncols = board.len().max(1);
+
+        // Re-focus a session identity after the cursor moved to
+        // (new_col, new_card); empty column → keep position, clear key.
+        let focus_to = |view: &mut KanbanView,
+                        tree: &Tree,
+                        new_col: usize,
+                        new_card: usize| {
+            view.focused_col = new_col;
+            view.focused_card = new_card;
+            view.focused_key = board
+                .get(new_col)
+                .and_then(|c| c.get(new_card))
+                .and_then(|&si| tree.session(si))
+                .map(|s| (s.machine.clone(), s.raw_name.clone()));
+        };
+
+        match key.code {
+            // `q` means "back to tree" here (vs quit in tree) — the help
+            // bar calls this out.
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('K') => {
+                self.state = AppState::Tree;
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            // Card moves before column nav: Shift+arrows share the
+            // Left/Right key codes.
+            KeyCode::Char('H') => self.move_focused_card(-1),
+            KeyCode::Char('L') => self.move_focused_card(1),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.move_focused_card(-1)
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.move_focused_card(1)
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                let new_col = col.saturating_sub(1);
+                let len = board.get(new_col).map(|c| c.len()).unwrap_or(0);
+                let new_card = if len == 0 { 0 } else { card.min(len - 1) };
+                let tree = &self.tree;
+                if let AppState::Kanban(ref mut view) = self.state {
+                    focus_to(view, tree, new_col, new_card);
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let new_col = (col + 1).min(ncols - 1);
+                let len = board.get(new_col).map(|c| c.len()).unwrap_or(0);
+                let new_card = if len == 0 { 0 } else { card.min(len - 1) };
+                let tree = &self.tree;
+                if let AppState::Kanban(ref mut view) = self.state {
+                    focus_to(view, tree, new_col, new_card);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let new_card = card.saturating_sub(1);
+                let tree = &self.tree;
+                if let AppState::Kanban(ref mut view) = self.state {
+                    focus_to(view, tree, col, new_card);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = board.get(col).map(|c| c.len()).unwrap_or(0);
+                let new_card = if len == 0 { 0 } else { (card + 1).min(len - 1) };
+                let tree = &self.tree;
+                if let AppState::Kanban(ref mut view) = self.state {
+                    focus_to(view, tree, col, new_card);
+                }
+            }
+            KeyCode::Char('g') => {
+                let tree = &self.tree;
+                if let AppState::Kanban(ref mut view) = self.state {
+                    focus_to(view, tree, col, 0);
+                }
+            }
+            KeyCode::Char('G') => {
+                let len = board.get(col).map(|c| c.len()).unwrap_or(0);
+                let tree = &self.tree;
+                if let AppState::Kanban(ref mut view) = self.state {
+                    focus_to(view, tree, col, len.saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => {
+                // Attach. After detach the loop resumes with `state`
+                // still Kanban, so the user lands back on the board.
+                let session = board
+                    .get(col)
+                    .and_then(|c| c.get(card))
+                    .and_then(|&si| self.tree.session(si))
+                    .cloned();
+                if let Some(s) = session {
+                    self.action = AppAction::AttachSession {
+                        name: s.raw_name,
+                        machine: s.machine,
+                    };
+                }
+            }
+            KeyCode::Char('r') => self.refresh(),
+            // Both open the focused card's session *interactively* right
+            // away (a modal hosting the live embedded PTY — type into it
+            // immediately; the exit chord returns to the board). There is
+            // deliberately no read-only preview stop-over on the board,
+            // and `p` does NOT touch the tree's persisted preview-pane
+            // preference.
+            KeyCode::Char('p') | KeyCode::Tab => self.try_enter_embedded_kanban(),
+            _ => {}
+        }
+    }
+
+    /// Move the focused card one manual column left or right.
+    ///
+    /// The auto-active column is fenced at the operation boundary in both
+    /// directions (safe under custom column orders, not just directional
+    /// skipping): a Working card is pinned — a user move would be
+    /// silently reverted by the next reconcile tick, so it's refused
+    /// loudly instead — and a card crossing over auto-active skips it as
+    /// a target. Moving *into* the auto-awaiting column removes the
+    /// placement (auto-awaiting IS the "no manual placement" state, which
+    /// makes "back to default" expressible with the same keys).
+    fn move_focused_card(&mut self, dir: isize) {
+        let board = kanban::build_board(
+            &self.kanban_config,
+            &self.tree.sessions,
+            &self.kanban_placements,
+        );
+        let (col, card) = self.resolve_kanban_focus(&board);
+        let Some(&session_idx) = board.get(col).and_then(|c| c.get(card)) else {
+            return; // empty column
+        };
+        let Some(session) = self.tree.session(session_idx) else {
+            return;
+        };
+        let key = (session.machine.clone(), session.raw_name.clone());
+
+        let active_idx = self.kanban_config.auto_active_idx();
+        let awaiting_idx = self.kanban_config.auto_awaiting_idx();
+        if col == active_idx {
+            self.error_message =
+                Some("Claude is working — session stays in Active until it stops".to_string());
+            return;
+        }
+
+        let ncols = self.kanban_config.columns.len() as isize;
+        let mut target = col as isize + dir;
+        while target >= 0 && target < ncols && target == active_idx as isize {
+            target += dir;
+        }
+        if target < 0 || target >= ncols {
+            return;
+        }
+        let target = target as usize;
+
+        if target == awaiting_idx {
+            self.kanban_placements.remove(&key);
+        } else {
+            let column_id = self.kanban_config.columns[target].id.clone();
+            self.kanban_placements.insert(key.clone(), column_id);
+        }
+
+        // User-initiated change: a failed save deserves a banner.
+        if let Err(e) = self.persist_kanban_placements() {
+            self.error_message = Some(format!("failed to save kanban state: {}", e));
+        }
+
+        // Follow the card to its new column.
+        if let AppState::Kanban(ref mut view) = self.state {
+            view.focused_col = target;
+            view.focused_key = Some(key);
+            // focused_card re-resolves from focused_key on the next
+            // build; keep a sane positional fallback meanwhile.
+            view.focused_card = 0;
+        }
+        let board = kanban::build_board(
+            &self.kanban_config,
+            &self.tree.sessions,
+            &self.kanban_placements,
+        );
+        let (new_col, new_card) = self.resolve_kanban_focus(&board);
+        if let AppState::Kanban(ref mut view) = self.state {
+            view.focused_col = new_col;
+            view.focused_card = new_card;
+        }
+    }
+
+    fn start_new_session_in_folder(&mut self, folder_idx: usize) {
+        let Some(folder) = self.tree.folders.get(folder_idx) else {
+            return;
+        };
+        self.state = AppState::CreatingSession(CreateForm::with_prefix(&folder.prefix));
+        self.input_buffer.clear();
     }
 
     fn start_rename_selected(&mut self) {
@@ -1259,6 +1728,7 @@ impl App {
                         machine: session.machine.clone(),
                         name: session.raw_name.clone(),
                     },
+                    alternate: None,
                 });
             }
             Some(Row::Folder(idx)) => {
@@ -1266,28 +1736,50 @@ impl App {
                     return;
                 };
                 let prefix = folder.prefix.clone();
-                // Build rename targets that strip the `{prefix}/` portion of
-                // each child's name (folder dissolves; sessions stay alive).
-                let targets: Vec<(Machine, String, String)> = folder
+                // Build both action shapes from the same folder so the confirm
+                // modal can offer "delete + kill" (primary) and "dissolve"
+                // (alternate) without re-walking the tree.
+                let rename_targets: Vec<(Machine, String, String)> = folder
                     .sessions
                     .iter()
                     .filter_map(|&i| self.tree.sessions.get(i))
                     .map(|s| (s.machine.clone(), s.raw_name.clone(), s.leaf.clone()))
                     .collect();
+                let kill_targets: Vec<(Machine, String)> = rename_targets
+                    .iter()
+                    .map(|(m, raw, _)| (m.clone(), raw.clone()))
+                    .collect();
+                let n = kill_targets.len();
                 let mut body = vec![format!(
-                    "Dissolve folder \"{}\" — strip \"{}/\" from {} session{}:",
+                    "Delete folder \"{}\" — kill {} session{}:",
                     prefix,
-                    prefix,
-                    targets.len(),
-                    if targets.len() == 1 { "" } else { "s" }
+                    n,
+                    if n == 1 { "" } else { "s" }
                 )];
-                for (m, from, to) in &targets {
-                    body.push(format!("  • {} → {} ({})", from, to, m.label()));
+                for (m, raw) in &kill_targets {
+                    body.push(format!("  • {} ({})", raw, m.label()));
                 }
+                body.push(String::new());
+                body.push(format!(
+                    "All windows and unsaved work in those {} session{} will be lost.",
+                    n,
+                    if n == 1 { "" } else { "s" }
+                ));
                 self.state = AppState::Confirming(PendingConfirm {
-                    title: "Dissolve folder".to_string(),
+                    title: "Delete folder".to_string(),
                     body,
-                    action: PendingAction::DissolveFolder { prefix, targets },
+                    action: PendingAction::DeleteFolder {
+                        prefix: prefix.clone(),
+                        targets: kill_targets,
+                    },
+                    alternate: Some(ConfirmAlternate {
+                        key: 's',
+                        label: "dissolve (keep sessions)".to_string(),
+                        action: PendingAction::DissolveFolder {
+                            prefix,
+                            targets: rename_targets,
+                        },
+                    }),
                 });
             }
             _ => {}
@@ -1301,6 +1793,7 @@ impl App {
                     self.tree.toggle_folder(idx);
                     self.persist_folder_expansion();
                 }
+                SessionAction::NewSession => self.start_new_session_in_folder(idx),
                 SessionAction::Rename => self.start_rename_selected(),
                 SessionAction::Delete => self.start_delete_selected(),
                 // Folder rows can't reach Duplicate via cycling; the arm
@@ -1313,17 +1806,24 @@ impl App {
                     None => return,
                 };
                 match self.selected_action {
-                    SessionAction::Enter => {
-                        // The same-session-no-op case is decided in
-                        // main.rs::attach_outcome: when the user picks the
-                        // session they're already in (only reachable from
-                        // inside-tmux), the loop treats it as a no-op and
-                        // keeps the picker on screen — switch-client to
-                        // self would be silent anyway.
+                    // The same-session-no-op case is decided in
+                    // main.rs::attach_outcome: when the user picks the
+                    // session they're already in (only reachable from
+                    // inside-tmux), the loop treats it as a no-op and
+                    // keeps the picker on screen — switch-client to
+                    // self would be silent anyway.
+                    //
+                    // NewSession is reachable here only if a refresh
+                    // demoted a folder while its NewSession chip was
+                    // active; the session row doesn't render that chip,
+                    // so falling through to attach (rather than dead-Enter)
+                    // gives the keypress a sensible default.
+                    SessionAction::Enter | SessionAction::NewSession => {
                         self.action = AppAction::AttachSession {
                             name: session.raw_name,
                             machine: session.machine,
                         };
+                        self.selected_action = SessionAction::Enter;
                     }
                     SessionAction::Rename => {
                         self.state = AppState::RenamingSession {
@@ -1351,6 +1851,17 @@ impl App {
         };
         match result {
             Ok(()) => {
+                // Drop the kanban placement eagerly (the observed-machine
+                // prune would catch it next refresh; this keeps state.toml
+                // tidy immediately). Only on success — a failed kill means
+                // the session still exists.
+                if self
+                    .kanban_placements
+                    .remove(&(machine.clone(), name.to_string()))
+                    .is_some()
+                {
+                    let _ = self.persist_kanban_placements();
+                }
                 self.refresh();
                 self.selected_action = SessionAction::Enter;
             }
@@ -1363,14 +1874,63 @@ impl App {
     /// to "rename N sessions, possibly across multiple hosts".
     fn execute_renames(&mut self, targets: Vec<(Machine, String, String)>) {
         let mut errors: Vec<String> = Vec::new();
+        let mut placements_dirty = false;
         for (machine, from, to) in &targets {
             let result = match self.backend(machine) {
                 Some(b) => b.rename_session(from, to),
                 None => Err(format!("unknown host: {}", machine.label())),
             };
-            if let Err(e) = result {
-                errors.push(format!("{}: {}", from, e));
+            match result {
+                // Migrate the kanban placement per-target, only after that
+                // target's tmux call succeeded — a failed rename means the
+                // old name still exists, and migrating it anyway would
+                // orphan the entry for the observed-machine prune to eat.
+                Ok(()) => {
+                    if let Some(col) = self
+                        .kanban_placements
+                        .remove(&(machine.clone(), from.clone()))
+                    {
+                        self.kanban_placements
+                            .insert((machine.clone(), to.clone()), col);
+                        placements_dirty = true;
+                    }
+                }
+                Err(e) => errors.push(format!("{}: {}", from, e)),
             }
+        }
+        if placements_dirty {
+            let _ = self.persist_kanban_placements();
+        }
+        if !errors.is_empty() {
+            self.error_message = Some(errors.join("; "));
+        }
+        self.refresh();
+        self.selected_action = SessionAction::Enter;
+    }
+
+    /// Kill a batch of sessions across machines. Errors are collected so one
+    /// missing session (e.g. killed externally between modal-open and confirm)
+    /// doesn't abort the rest of the batch.
+    fn execute_kill_sessions(&mut self, targets: Vec<(Machine, String)>) {
+        let mut errors: Vec<String> = Vec::new();
+        let mut placements_dirty = false;
+        for (machine, name) in &targets {
+            let result = match self.backend(machine) {
+                Some(b) => b.kill_session(name),
+                None => Err(format!("unknown host: {}", machine.label())),
+            };
+            match result {
+                Ok(()) => {
+                    placements_dirty |= self
+                        .kanban_placements
+                        .remove(&(machine.clone(), name.clone()))
+                        .is_some();
+                }
+                Err(e) => errors.push(format!("{}: {}", name, e)),
+            }
+        }
+        if placements_dirty {
+            let _ = self.persist_kanban_placements();
         }
         if !errors.is_empty() {
             self.error_message = Some(errors.join("; "));
@@ -1389,8 +1949,72 @@ impl App {
             KeyCode::Esc => {
                 self.state = AppState::Tree;
             }
-            KeyCode::Tab | KeyCode::Down => form.focus = form.focus.next(),
-            KeyCode::BackTab | KeyCode::Up => form.focus = form.focus.prev(),
+            // Tab steps through every option in order: each available machine,
+            // then Prefix, then Name. Past the last field it wraps back to the
+            // first machine. This lets users navigate the whole modal without
+            // touching arrows. ↑↓ keeps the field-only jump (Machine → Prefix
+            // → Name) for users who want to skip machine cycling.
+            //
+            // If `form.machine` is stale (e.g. user deleted a host while the
+            // modal was open), normalize back to Local before stepping so the
+            // Tab cycle is consistent regardless of how we got here.
+            KeyCode::Tab => {
+                if form.focus == CreateField::Machine
+                    && !machines.iter().any(|m| m == &form.machine)
+                {
+                    form.machine = machines.first().cloned().unwrap_or(Machine::Local);
+                }
+                match form.focus {
+                    CreateField::Machine => {
+                        let last_idx = machines.len().saturating_sub(1);
+                        let cur_idx = machines
+                            .iter()
+                            .position(|m| m == &form.machine)
+                            .unwrap_or(0);
+                        if machines.is_empty() || cur_idx >= last_idx {
+                            form.focus = CreateField::Prefix;
+                        } else {
+                            form.machine = machines[cur_idx + 1].clone();
+                        }
+                    }
+                    CreateField::Prefix => form.focus = CreateField::Name,
+                    CreateField::Name => {
+                        form.focus = CreateField::Machine;
+                        if let Some(first) = machines.first() {
+                            form.machine = first.clone();
+                        }
+                    }
+                }
+            }
+            KeyCode::BackTab => {
+                if form.focus == CreateField::Machine
+                    && !machines.iter().any(|m| m == &form.machine)
+                {
+                    form.machine = machines.first().cloned().unwrap_or(Machine::Local);
+                }
+                match form.focus {
+                    CreateField::Machine => {
+                        let cur_idx = machines
+                            .iter()
+                            .position(|m| m == &form.machine)
+                            .unwrap_or(0);
+                        if cur_idx == 0 {
+                            form.focus = CreateField::Name;
+                        } else {
+                            form.machine = machines[cur_idx - 1].clone();
+                        }
+                    }
+                    CreateField::Prefix => {
+                        form.focus = CreateField::Machine;
+                        if let Some(last) = machines.last() {
+                            form.machine = last.clone();
+                        }
+                    }
+                    CreateField::Name => form.focus = CreateField::Prefix,
+                }
+            }
+            KeyCode::Down => form.focus = form.focus.next(),
+            KeyCode::Up => form.focus = form.focus.prev(),
             KeyCode::Enter => {
                 if form.is_valid() {
                     let snapshot = form.clone();
@@ -1699,49 +2323,69 @@ impl App {
                 to: new_prefix,
                 targets,
             },
+            alternate: None,
         });
         self.input_buffer.clear();
     }
 
     fn handle_confirming_key(&mut self, key: KeyEvent) {
+        // Pull both the primary action and the optional alternate up front.
+        // The alternate key is matched after the cancel/confirm keys so it
+        // can't accidentally hijack Esc/n/y/Enter.
+        let (primary, alternate) = match self.state {
+            AppState::Confirming(ref c) => (Some(c.action.clone()), c.alternate.clone()),
+            _ => (None, None),
+        };
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.state = AppState::Tree;
             }
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let action = if let AppState::Confirming(ref c) = self.state {
-                    c.action.clone()
-                } else {
-                    return;
-                };
+                let Some(action) = primary else { return };
                 self.state = AppState::Tree;
-                match action {
-                    PendingAction::KillSession { machine, name } => {
-                        self.execute_kill_session(machine, &name);
-                    }
-                    PendingAction::DissolveFolder { targets, .. } => {
-                        self.execute_renames(targets);
-                    }
-                    PendingAction::RenameFolder { targets, .. } => {
-                        self.execute_renames(targets);
-                    }
-                    PendingAction::DeleteHost { idx } => {
-                        let mut tentative = self.config.clone();
-                        tentative.remove(idx);
-                        match tentative.save() {
-                            Ok(()) => {
-                                self.config = tentative;
-                                self.refresh();
-                            }
-                            Err(e) => self.error_message = Some(e),
-                        }
-                        self.state = AppState::HostsList {
-                            selected: idx.saturating_sub(1),
-                        };
+                self.dispatch_confirm_action(action);
+            }
+            KeyCode::Char(ch) => {
+                if let Some(alt) = alternate {
+                    if ch == alt.key {
+                        self.state = AppState::Tree;
+                        self.dispatch_confirm_action(alt.action);
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn dispatch_confirm_action(&mut self, action: PendingAction) {
+        match action {
+            PendingAction::KillSession { machine, name } => {
+                self.execute_kill_session(machine, &name);
+            }
+            PendingAction::DeleteFolder { targets, .. } => {
+                self.execute_kill_sessions(targets);
+            }
+            PendingAction::DissolveFolder { targets, .. } => {
+                self.execute_renames(targets);
+            }
+            PendingAction::RenameFolder { targets, .. } => {
+                self.execute_renames(targets);
+            }
+            PendingAction::DeleteHost { idx } => {
+                let mut tentative = self.config.clone();
+                tentative.remove(idx);
+                match tentative.save() {
+                    Ok(()) => {
+                        self.config = tentative;
+                        self.refresh();
+                    }
+                    Err(e) => self.error_message = Some(e),
+                }
+                self.state = AppState::HostsList {
+                    selected: idx.saturating_sub(1),
+                };
+            }
         }
     }
 
@@ -1765,6 +2409,16 @@ impl App {
         };
         match result {
             Ok(()) => {
+                // Carry the kanban placement across the rename so a Done
+                // session doesn't reset to auto-awaiting.
+                if let Some(col) = self
+                    .kanban_placements
+                    .remove(&(machine.clone(), original.clone()))
+                {
+                    self.kanban_placements
+                        .insert((machine.clone(), new_name.clone()), col);
+                    let _ = self.persist_kanban_placements();
+                }
                 self.state = AppState::Tree;
                 self.input_buffer.clear();
                 self.selected_action = SessionAction::Enter;
@@ -1830,6 +2484,7 @@ impl App {
                         title: "Delete host".to_string(),
                         body,
                         action: PendingAction::DeleteHost { idx: *selected },
+                        alternate: None,
                     });
                 }
             }
@@ -1843,6 +2498,29 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// A host was renamed in the host form: re-key every kanban placement
+    /// from the old host name to the new one. (Host *deletion* deliberately
+    /// preserves placements — the machine is never observed afterward, so
+    /// the entries are inert and survive a re-add of the same host.)
+    fn migrate_host_placements(&mut self, old: &str, new: &str) {
+        let keys: Vec<(Machine, String)> = self
+            .kanban_placements
+            .keys()
+            .filter(|(m, _)| matches!(m, Machine::Remote(n) if n == old))
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        for key in keys {
+            if let Some(col) = self.kanban_placements.remove(&key) {
+                self.kanban_placements
+                    .insert((Machine::Remote(new.to_string()), key.1), col);
+            }
+        }
+        let _ = self.persist_kanban_placements();
     }
 
     fn install_remote_hooks(&mut self, host_name: &str) {
@@ -1887,6 +2565,11 @@ impl App {
                     let host = form.to_host();
                     let host_name = host.name.clone();
                     let editing_idx = form.editing_idx;
+                    // Captured before the upsert so a host *rename* can
+                    // migrate kanban placements keyed by the old name.
+                    let old_host_name = editing_idx
+                        .and_then(|i| self.config.hosts.get(i))
+                        .map(|h| h.name.clone());
                     // Save-then-commit: mutate a clone, write to disk first,
                     // and only swap into self.config if both succeed. Keeps
                     // disk and memory in sync even if the save fails.
@@ -1897,6 +2580,11 @@ impl App {
                     {
                         Ok(()) => {
                             self.config = tentative;
+                            if let Some(old) = old_host_name {
+                                if old != host_name {
+                                    self.migrate_host_placements(&old, &host_name);
+                                }
+                            }
                             // Auto-install ADE hooks on the new/edited host
                             // so live status detection just works. Result
                             // surfaces in the hosts screen banner.

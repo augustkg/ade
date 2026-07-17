@@ -31,8 +31,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         app.state,
         AppState::HostsList { .. } | AppState::HostForm(_)
     );
+    let in_kanban_view = matches!(app.state, AppState::Kanban(_));
     if in_hosts_view {
         render_hosts_list(frame, chunks[1], app);
+    } else if in_kanban_view {
+        // Full-width board; the preview pane split is tree-only.
+        render_kanban(frame, chunks[1], app);
     } else if app.preview_pane_enabled {
         // 40/60 split: tree on the left at 40%, preview pane on the
         // right at 60%. The preview gets the larger share because it's
@@ -96,6 +100,12 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     if let AppState::Confirming(ref c) = app.state {
         render_confirm_modal(frame, c);
+    }
+
+    // The board's modal is the embedded terminal itself (`p`/Tab jumps
+    // straight into the focused session — no read-only stop-over).
+    if matches!(app.state, AppState::Kanban(_)) && app.embedded_active() {
+        render_kanban_embed_modal(frame, app);
     }
 
     if let Some(ref error) = app.error_message {
@@ -285,6 +295,11 @@ fn render_folder_row(
         } else {
             Style::default().fg(inactive_color)
         };
+        let new_style = if selected_action == SessionAction::NewSession {
+            Style::default().fg(theme::BASE).bg(theme::GREEN)
+        } else {
+            Style::default().fg(inactive_color)
+        };
         let rename_style = if selected_action == SessionAction::Rename {
             Style::default().fg(theme::BASE).bg(theme::PEACH)
         } else {
@@ -298,6 +313,8 @@ fn render_folder_row(
 
         spans.push(Span::raw("  "));
         spans.push(Span::styled(" Toggle ", toggle_style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(" New ", new_style));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(" Rename ", rename_style));
         spans.push(Span::raw(" "));
@@ -536,6 +553,18 @@ fn render_preview_pane(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    render_preview_snapshot(
+        frame,
+        inner,
+        app,
+        "Move the cursor to a session row to preview it here.",
+    );
+}
+
+/// The ambient-snapshot body of the tree's side preview pane: latest
+/// capture for `preview_target()`, or a dim placeholder. (The kanban
+/// board has no ambient preview — its modal is the embedded PTY.)
+fn render_preview_snapshot(frame: &mut Frame, inner: Rect, app: &App, empty_msg: &str) {
     // Each arm renders its own Paragraph so we don't have to unify the
     // `Text` type across `ansi_to_tui` (returns `ratatui_core::Text`) and
     // direct ratatui::text::Text construction. `Paragraph::new` accepts
@@ -546,22 +575,84 @@ fn render_preview_pane(frame: &mut Frame, area: Rect, app: &App) {
             inner,
         );
     };
+    // When the captured pane is taller than the available area, show the
+    // TAIL — a terminal's action (the prompt, latest output) lives at the
+    // bottom, and clipping there made the preview look frozen mid-scroll.
+    // Trailing blank rows are ignored so the anchor doesn't scroll past
+    // the real content.
+    let tail_scroll = |content_lines: u16| content_lines.saturating_sub(inner.height);
     match app.preview_target() {
-        None => placeholder(frame, "Move the cursor to a session row to preview it here."),
+        None => placeholder(frame, empty_msg),
         Some(ref key) => match app.preview_pane.get(key) {
             None => placeholder(frame, "Loading preview…"),
             Some(capture) => match &capture.body {
                 Ok(ansi) => match ansi.as_bytes().into_text() {
-                    Ok(text) => frame.render_widget(Paragraph::new(text), inner),
-                    Err(_) => frame.render_widget(
-                        Paragraph::new(ansi.clone()).style(Style::default().fg(theme::TEXT)),
-                        inner,
-                    ),
+                    Ok(text) => {
+                        let content_lines = text
+                            .lines
+                            .iter()
+                            .rposition(|l| {
+                                l.spans.iter().any(|s| !s.content.trim().is_empty())
+                            })
+                            .map(|i| i as u16 + 1)
+                            .unwrap_or(0);
+                        frame.render_widget(
+                            Paragraph::new(text).scroll((tail_scroll(content_lines), 0)),
+                            inner,
+                        );
+                    }
+                    Err(_) => {
+                        let content_lines = ansi
+                            .lines()
+                            .collect::<Vec<_>>()
+                            .iter()
+                            .rposition(|l| !l.trim().is_empty())
+                            .map(|i| i as u16 + 1)
+                            .unwrap_or(0);
+                        frame.render_widget(
+                            Paragraph::new(ansi.clone())
+                                .style(Style::default().fg(theme::TEXT))
+                                .scroll((tail_scroll(content_lines), 0)),
+                            inner,
+                        );
+                    }
                 },
                 Err(e) => placeholder(frame, &format!("preview unavailable: {}", e)),
             },
         },
     }
+}
+
+/// The board's session modal: a centered overlay hosting the live
+/// embedded PTY for the focused card. It exists only while embedded —
+/// `p`/Tab enters it directly in the writable state (no read-only
+/// preview stop-over), and the exit chord `Ctrl+Space Space` returns
+/// to the board. Border mirrors the tree's embedded pane: peach =
+/// keystrokes flow to the session, mauve = chord prefix armed.
+fn render_kanban_embed_modal(frame: &mut Frame, app: &App) {
+    let area = centered_rect(72, 70, frame.area());
+    frame.render_widget(Clear, area);
+    let title = match app.preview_target() {
+        Some(ref key) => format!(" embedded · {} ", key.name),
+        None => " embedded ".to_string(),
+    };
+    let border_color = if app.embedded_chord_pending() {
+        theme::MAUVE
+    } else {
+        theme::PEACH
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    render_embedded_grid(frame, inner, app);
 }
 
 /// Render the live vt100 grid of the embedded PTY into `area`. Also
@@ -595,6 +686,174 @@ fn render_embedded_grid(frame: &mut Frame, area: Rect, app: &App) {
         Err(_) => Vec::new(),
     };
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Kanban board: one bordered column per configured kanban column, cards
+/// are sessions. When more columns are configured than fit at
+/// `MIN_KANBAN_COL_WIDTH`, a sliding window of columns is rendered —
+/// positioned so the focused column is always visible — and the edge
+/// column titles carry `‹ +N` / `+N ›` markers for what's off-screen.
+/// The window is derived from the focus each frame; no scroll state.
+fn render_kanban(frame: &mut Frame, area: Rect, app: &App) {
+    const MIN_KANBAN_COL_WIDTH: u16 = 24;
+
+    let board = crate::kanban::build_board(
+        &app.kanban_config,
+        &app.tree.sessions,
+        &app.kanban_placements,
+    );
+    let (focused_col, focused_card) = app.resolve_kanban_focus(&board);
+
+    let ncols = board.len();
+    if ncols == 0 {
+        return;
+    }
+    let max_visible = ((area.width / MIN_KANBAN_COL_WIDTH).max(1) as usize).min(ncols);
+    // Slice first, then split the area — laying out every column and only
+    // annotating the edges would still violate the minimum width.
+    let mut first = focused_col.saturating_sub(max_visible - 1);
+    first = first.min(ncols - max_visible);
+    let visible = first..(first + max_visible);
+    let hidden_left = first;
+    let hidden_right = ncols - visible.end;
+
+    let constraints = vec![Constraint::Ratio(1, max_visible as u32); max_visible];
+    let slots = Layout::horizontal(constraints).split(area);
+
+    for (slot, col_idx) in visible.clone().enumerate() {
+        let column = &app.kanban_config.columns[col_idx];
+        let cards = &board[col_idx];
+        let is_focused = col_idx == focused_col;
+
+        let mut title_spans: Vec<Span> = Vec::new();
+        if slot == 0 && hidden_left > 0 {
+            title_spans.push(Span::styled(
+                format!(" ‹ +{} ", hidden_left),
+                Style::default().fg(theme::OVERLAY1),
+            ));
+        }
+        title_spans.push(Span::styled(
+            format!(" {} ({}) ", column.name, cards.len()),
+            Style::default()
+                .fg(if is_focused {
+                    theme::MAUVE
+                } else {
+                    theme::SUBTEXT1
+                })
+                .add_modifier(Modifier::BOLD),
+        ));
+        if !matches!(column.kind, crate::kanban::ColumnKind::Manual) {
+            title_spans.push(Span::styled(
+                "· auto ",
+                Style::default().fg(theme::OVERLAY0),
+            ));
+        }
+        if slot + 1 == max_visible && hidden_right > 0 {
+            title_spans.push(Span::styled(
+                format!(" +{} › ", hidden_right),
+                Style::default().fg(theme::OVERLAY1),
+            ));
+        }
+
+        let block = Block::default()
+            .title(Line::from(title_spans))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if is_focused {
+                theme::MAUVE
+            } else {
+                theme::SURFACE1
+            }));
+
+        if cards.is_empty() {
+            let empty = List::new(vec![ListItem::new(Line::from(Span::styled(
+                "  — empty —",
+                Style::default().fg(theme::OVERLAY0),
+            )))])
+            .block(block);
+            frame.render_widget(empty, slots[slot]);
+            continue;
+        }
+
+        let items: Vec<ListItem> = cards
+            .iter()
+            .filter_map(|&si| app.tree.session(si))
+            .map(|s| {
+                let is_current = matches!(s.machine, Machine::Local)
+                    && app.tree.current_session.as_deref() == Some(s.raw_name.as_str());
+                render_kanban_card(s, is_current)
+            })
+            .collect();
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(
+                Style::default()
+                    .bg(theme::SURFACE0)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▌");
+
+        let mut state = ListState::default();
+        if is_focused {
+            state.select(Some(focused_card.min(cards.len() - 1)));
+        }
+        frame.render_stateful_widget(list, slots[slot], &mut state);
+    }
+}
+
+/// Two-line card: the session name on the first line, its metadata (host,
+/// claude chip, `· here` marker) right underneath — the session-row
+/// vocabulary minus the per-row action chips, since actions on the board
+/// are global keys, not a cursor-cycled chip.
+fn render_kanban_card(session: &Session, is_current: bool) -> ListItem<'static> {
+    let dot = if session.attached { "●" } else { "○" };
+    let dot_color = if session.attached {
+        theme::GREEN
+    } else {
+        theme::OVERLAY1
+    };
+
+    let name_line = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(dot.to_string(), Style::default().fg(dot_color)),
+        Span::raw(" "),
+        // Full raw_name — folders don't exist on the board.
+        Span::styled(
+            session.raw_name.clone(),
+            Style::default().fg(theme::SUBTEXT1),
+        ),
+    ]);
+
+    // Metadata line, aligned under the name (past the dot column).
+    let mut meta_spans: Vec<Span<'static>> = vec![
+        Span::raw("   "),
+        Span::styled(
+            session.machine.label().to_string(),
+            Style::default().fg(machine_color(&session.machine)),
+        ),
+    ];
+
+    // Same chip policy as the tree rows (see render_session_row).
+    let chip_state = session.claude.or({
+        if session.claude_present && session.claude_context_pct.is_some() {
+            Some(ClaudeState::Idle)
+        } else {
+            None
+        }
+    });
+    if let Some(state) = chip_state {
+        meta_spans.push(Span::raw("  "));
+        meta_spans.push(claude_chip(state, session.claude_context_pct));
+    }
+
+    if is_current {
+        meta_spans.push(Span::raw("  "));
+        meta_spans.push(Span::styled(
+            " · here ",
+            Style::default().fg(theme::SUBTEXT0).bg(theme::SURFACE1),
+        ));
+    }
+
+    ListItem::new(vec![name_line, Line::from(meta_spans)])
 }
 
 fn render_hosts_list(frame: &mut Frame, area: Rect, app: &App) {
@@ -911,6 +1170,23 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let help_text = match app.state {
+        AppState::Kanban(_) => vec![
+            Span::raw(" "),
+            key("←→/hl"),
+            txt(" column  "),
+            key("↑↓/jk"),
+            txt(" card  "),
+            key("H/L"),
+            txt(" move card  "),
+            key("⏎"),
+            txt(" attach  "),
+            key("p/Tab"),
+            txt(" open session  "),
+            key("r"),
+            txt(" refresh  "),
+            key("K/q/Esc"),
+            txt(" back to tree"),
+        ],
         AppState::Tree => vec![
             Span::raw(" "),
             key("↑↓/jk"),
@@ -933,6 +1209,8 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
             txt(" duplicate  "),
             key("d"),
             txt(" delete  "),
+            key("K"),
+            txt(" kanban  "),
             key("H"),
             txt(" hosts  "),
             key("r"),
@@ -942,7 +1220,9 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
         ],
         AppState::CreatingSession(_) => vec![
             Span::raw(" "),
-            key("Tab/↑↓"),
+            key("Tab"),
+            txt(" next  "),
+            key("↑↓"),
             txt(" field  "),
             key("←→"),
             txt(" host  "),
@@ -1346,7 +1626,7 @@ fn render_confirm_modal(frame: &mut Frame, c: &PendingConfirm) {
         lines.push(Line::from(Span::styled(line.clone(), style)));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
+    let mut hotkeys: Vec<Span> = vec![
         Span::styled(
             " y ",
             Style::default()
@@ -1357,7 +1637,19 @@ fn render_confirm_modal(frame: &mut Frame, c: &PendingConfirm) {
         Span::raw(" confirm    "),
         Span::styled(" n ", Style::default().fg(theme::BASE).bg(theme::OVERLAY1)),
         Span::raw(" cancel"),
-    ]));
+    ];
+    if let Some(alt) = &c.alternate {
+        hotkeys.push(Span::raw("    "));
+        hotkeys.push(Span::styled(
+            format!(" {} ", alt.key),
+            Style::default()
+                .fg(theme::BASE)
+                .bg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ));
+        hotkeys.push(Span::raw(format!(" {}", alt.label)));
+    }
+    lines.push(Line::from(hotkeys));
 
     let p = Paragraph::new(lines).style(Style::default().fg(theme::TEXT));
     frame.render_widget(p, inner);

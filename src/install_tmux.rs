@@ -481,25 +481,7 @@ fn parse_tmux_reload_failure(stderr_bytes: &[u8], status: String) -> ReloadStatu
     }
 }
 
-/// True for any tmux stderr that means "no running server" rather than
-/// "config has a real problem". Two known phrasings:
-///   - `no server running on /tmp/tmux-N/default` — server existed
-///     before, socket deleted.
-///   - `error connecting to /tmp/tmux-N/default (No such file or
-///     directory)` — server never started, socket file absent.
-///
-/// The second pattern requires BOTH substrings together. Matching on
-/// `No such file or directory` alone would misclassify real config
-/// errors like `source-file ~/.tmux.local.conf` (without `-q`) where
-/// the running server fails to load a referenced file. Matching on
-/// `error connecting to` alone would misclassify real
-/// socket-permission errors (`Permission denied` / `Connection
-/// refused`) — those mean "tmux is there but unreachable", not "no
-/// tmux at all".
-fn is_no_server_error(err: &str) -> bool {
-    err.contains("no server running")
-        || (err.contains("error connecting to") && err.contains("No such file or directory"))
-}
+use crate::tmux::is_no_server_error;
 
 fn parse_remote_reload_output(out: &str) -> ReloadStatus {
     let mut lines = out.lines();

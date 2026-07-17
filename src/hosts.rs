@@ -95,6 +95,13 @@ impl Config {
         if host.name.trim().is_empty() {
             return Err("host name cannot be empty".to_string());
         }
+        // Reserved: kanban placements persist `(host, session)` keys where
+        // host "local" means the local machine (`kanban::machine_to_host`).
+        // A remote host literally named "local" would silently cross-wire
+        // the two namespaces.
+        if host.name.trim().eq_ignore_ascii_case("local") {
+            return Err("host name 'local' is reserved".to_string());
+        }
         if host.target.trim().is_empty() {
             return Err("host target cannot be empty".to_string());
         }

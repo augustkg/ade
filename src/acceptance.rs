@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
-use crate::app::{App, AppState, SessionAction};
+use crate::app::{App, AppAction, AppState, CreateField, SessionAction};
 use crate::test_harness::{
     acquire_acceptance_lock, poll_for_capture_contains, poll_until, IsolatedTmux,
 };
@@ -975,6 +975,12 @@ fn acceptance_duplicate_action_cycle_folder_row_skips_duplicate() {
 
     assert_eq!(app.selected_action, SessionAction::Enter);
     app.handle_key(k('l'));
+    assert_eq!(
+        app.selected_action,
+        SessionAction::NewSession,
+        "folder rows expose a NewSession slot after Toggle"
+    );
+    app.handle_key(k('l'));
     assert_eq!(app.selected_action, SessionAction::Rename);
     app.handle_key(k('l'));
     assert_eq!(
@@ -983,9 +989,13 @@ fn acceptance_duplicate_action_cycle_folder_row_skips_duplicate() {
         "folder rows should NOT have a Duplicate slot — l from Rename \
          goes directly to Delete"
     );
-    // Reverse from Delete: skip Duplicate, back to Rename.
+    // Reverse from Delete: skip Duplicate, back to Rename → NewSession → Enter.
     app.handle_key(k('h'));
     assert_eq!(app.selected_action, SessionAction::Rename);
+    app.handle_key(k('h'));
+    assert_eq!(app.selected_action, SessionAction::NewSession);
+    app.handle_key(k('h'));
+    assert_eq!(app.selected_action, SessionAction::Enter);
     drop(app);
     drop(tmux);
 }
@@ -1016,6 +1026,277 @@ fn acceptance_duplicate_y_on_folder_row_is_noop() {
          got {:?}",
         app.state
     );
+    drop(app);
+    drop(tmux);
+}
+
+// ───────────── folder NewSession action (chip + `n` prefill) ─────────────
+
+fn navigate_to_folder(app: &mut App) {
+    for _ in 0..20 {
+        if matches!(app.current_row(), Some(crate::model::Row::Folder(_))) {
+            return;
+        }
+        app.handle_key(key_press(KeyCode::Up, KeyModifiers::NONE));
+    }
+    panic!("did not reach a Folder row after 20 up-presses");
+}
+
+#[test]
+fn acceptance_folder_new_chip_opens_modal_with_prefix() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("proj/a", 80, 24).expect("new-session proj/a");
+    tmux.new_session("proj/b", 80, 24).expect("new-session proj/b");
+
+    let mut app = App::new();
+    navigate_to_folder(&mut app);
+
+    // l once → NewSession chip active.
+    app.handle_key(k('l'));
+    assert_eq!(app.selected_action, SessionAction::NewSession);
+
+    app.handle_key(k_enter());
+    match &app.state {
+        AppState::CreatingSession(form) => {
+            assert_eq!(
+                form.prefix.as_str(),
+                "proj",
+                "modal prefix should be folder.prefix"
+            );
+            assert!(form.name.is_empty(), "name should start empty");
+            assert_eq!(
+                form.focus,
+                CreateField::Name,
+                "focus should jump past the pre-filled Prefix"
+            );
+        }
+        other => panic!("expected CreatingSession state, got {:?}", other),
+    }
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_n_on_folder_prefills_prefix() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("proj/a", 80, 24).expect("new-session proj/a");
+    tmux.new_session("proj/b", 80, 24).expect("new-session proj/b");
+
+    let mut app = App::new();
+    navigate_to_folder(&mut app);
+
+    app.handle_key(k('n'));
+    match &app.state {
+        AppState::CreatingSession(form) => {
+            assert_eq!(form.prefix.as_str(), "proj");
+            assert_eq!(form.focus, CreateField::Name);
+        }
+        other => panic!("expected CreatingSession, got {:?}", other),
+    }
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_n_on_session_in_folder_inherits_prefix() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("proj/alpha", 80, 24)
+        .expect("new-session proj/alpha");
+    tmux.new_session("proj/beta", 80, 24)
+        .expect("new-session proj/beta");
+
+    let mut app = App::new();
+    navigate_to_session(&mut app, "proj/alpha");
+
+    app.handle_key(k('n'));
+    match &app.state {
+        AppState::CreatingSession(form) => {
+            assert_eq!(
+                form.prefix.as_str(),
+                "proj",
+                "session inside a folder should inherit the parent prefix"
+            );
+            assert_eq!(form.focus, CreateField::Name);
+        }
+        other => panic!("expected CreatingSession, got {:?}", other),
+    }
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_n_on_toplevel_session_falls_back_to_default() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    // "loose" has no `/` → Session.prefix is None, so the `n` handler
+    // must fall back to CreateForm::new() (cwd-guessed prefix).
+    tmux.new_session("loose", 80, 24).expect("new-session loose");
+
+    let mut app = App::new();
+    navigate_to_session(&mut app, "loose");
+
+    app.handle_key(k('n'));
+    match &app.state {
+        AppState::CreatingSession(_) => {
+            // We can't assert the exact prefix (cwd-dependent), but the
+            // fallback path is taken iff no panic — the prior implementation
+            // would have unconditionally called CreateForm::new() too.
+        }
+        other => panic!("expected CreatingSession, got {:?}", other),
+    }
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_stale_new_session_on_session_row_attaches_instead_of_deadkey() {
+    // Regression: if a folder is demoted to a plain session by a refresh
+    // (e.g. a sibling was renamed out so only one prefixed session remains —
+    // though in this constructed scenario we just stash the action manually)
+    // while its NewSession chip is the selected action, pressing Enter on
+    // the now-session row should attach rather than silently no-op.
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("solo", 80, 24).expect("new-session solo");
+
+    let mut app = App::new();
+    navigate_to_session(&mut app, "solo");
+
+    // Stash the stale chip state.
+    app.selected_action = SessionAction::NewSession;
+    app.handle_key(k_enter());
+
+    match &app.action {
+        AppAction::AttachSession { name, .. } => {
+            assert_eq!(name, "solo", "Enter on stale NewSession should attach");
+        }
+        other => panic!("expected AttachSession, got {:?}", other),
+    }
+    // Action should also normalize back to Enter for subsequent keypresses.
+    assert_eq!(app.selected_action, SessionAction::Enter);
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_create_modal_tab_cycles_machines_then_fields() {
+    // Tab in the create-session modal should step through every option in
+    // order — each available machine, then Prefix, then Name — so a user
+    // can navigate the whole modal without arrow keys.
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+
+    let mut app = App::new();
+    // Inject two fake remotes so available_machines() returns three entries.
+    app.config.hosts = vec![
+        crate::hosts::Host {
+            name: "alpha".to_string(),
+            kind: crate::hosts::HostKind::Ssh,
+            target: "alpha.example".to_string(),
+            ssh_args: vec![],
+        },
+        crate::hosts::Host {
+            name: "beta".to_string(),
+            kind: crate::hosts::HostKind::Ssh,
+            target: "beta.example".to_string(),
+            ssh_args: vec![],
+        },
+    ];
+
+    // Open the modal directly so the test doesn't depend on tree state.
+    app.state = AppState::CreatingSession(crate::app::CreateForm::new());
+    // Reset to a known starting point: Machine field, Local selected.
+    if let AppState::CreatingSession(ref mut form) = app.state {
+        form.focus = CreateField::Machine;
+        form.machine = crate::model::Machine::Local;
+    }
+
+    let tab = key_press(KeyCode::Tab, KeyModifiers::NONE);
+
+    // Tab 1: Local → alpha (still on Machine).
+    app.handle_key(tab);
+    match &app.state {
+        AppState::CreatingSession(f) => {
+            assert_eq!(f.focus, CreateField::Machine);
+            assert_eq!(f.machine.label(), "alpha");
+        }
+        other => panic!("expected CreatingSession, got {:?}", other),
+    }
+
+    // Tab 2: alpha → beta (still on Machine).
+    app.handle_key(tab);
+    if let AppState::CreatingSession(ref f) = app.state {
+        assert_eq!(f.focus, CreateField::Machine);
+        assert_eq!(f.machine.label(), "beta");
+    }
+
+    // Tab 3: at last machine → focus moves to Prefix (machine stays beta).
+    app.handle_key(tab);
+    if let AppState::CreatingSession(ref f) = app.state {
+        assert_eq!(f.focus, CreateField::Prefix);
+        assert_eq!(f.machine.label(), "beta");
+    }
+
+    // Tab 4: Prefix → Name.
+    app.handle_key(tab);
+    if let AppState::CreatingSession(ref f) = app.state {
+        assert_eq!(f.focus, CreateField::Name);
+    }
+
+    // Tab 5: Name → Machine, resetting to the first machine.
+    app.handle_key(tab);
+    if let AppState::CreatingSession(ref f) = app.state {
+        assert_eq!(f.focus, CreateField::Machine);
+        assert_eq!(f.machine.label(), "Local");
+    }
+
+    // Shift+Tab from Machine[0] wraps backward to Name.
+    let back_tab = key_press(KeyCode::BackTab, KeyModifiers::NONE);
+    app.handle_key(back_tab);
+    if let AppState::CreatingSession(ref f) = app.state {
+        assert_eq!(f.focus, CreateField::Name);
+    }
+
+    // Shift+Tab from Name → Prefix.
+    app.handle_key(back_tab);
+    if let AppState::CreatingSession(ref f) = app.state {
+        assert_eq!(f.focus, CreateField::Prefix);
+    }
+
+    // Shift+Tab from Prefix → Machine, snapping to the last machine.
+    app.handle_key(back_tab);
+    if let AppState::CreatingSession(ref f) = app.state {
+        assert_eq!(f.focus, CreateField::Machine);
+        assert_eq!(f.machine.label(), "beta");
+    }
+
+    // Shift+Tab from Machine[last] retreats to the previous machine.
+    app.handle_key(back_tab);
+    if let AppState::CreatingSession(ref f) = app.state {
+        assert_eq!(f.focus, CreateField::Machine);
+        assert_eq!(f.machine.label(), "alpha");
+    }
+
+    // Stale machine: simulate a host being deleted while the modal is open.
+    // Tab should normalize back to Local before stepping (so the next stop
+    // is alpha, the first remote), rather than skipping Local.
+    if let AppState::CreatingSession(ref mut f) = app.state {
+        f.focus = CreateField::Machine;
+        f.machine = crate::model::Machine::Remote("ghost".to_string());
+    }
+    app.handle_key(tab);
+    if let AppState::CreatingSession(ref f) = app.state {
+        assert_eq!(f.focus, CreateField::Machine);
+        assert_eq!(
+            f.machine.label(),
+            "alpha",
+            "stale machine should normalize to Local then advance to first remote"
+        );
+    }
+
     drop(app);
     drop(tmux);
 }
@@ -1261,3 +1542,609 @@ fn remote_duplicate_rejects_unsafe_names() {
     assert!(r.duplicate_session("", "dup", false).is_err());
 }
 
+// ───────────── folder delete / dissolve (3-way confirm) ─────────────
+//
+// Two sessions sharing a `proj/` prefix form a folder. Pressing `d` on
+// the folder row should open a confirm modal whose primary action kills
+// the sessions and whose alternate (`s`) renames them to strip the
+// prefix. Cancel paths (Esc, n) must leave tmux untouched.
+
+fn navigate_to_first_folder(app: &mut App) {
+    for _ in 0..20 {
+        if matches!(app.current_row(), Some(crate::model::Row::Folder(_))) {
+            return;
+        }
+        app.handle_key(key_press(KeyCode::Up, KeyModifiers::NONE));
+    }
+    panic!("did not reach a folder row after 20 up-presses");
+}
+
+#[test]
+fn acceptance_folder_d_opens_delete_with_dissolve_alternate() {
+    use crate::app::{ConfirmAlternate, PendingAction, PendingConfirm};
+
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("proj/a", 80, 24).expect("new proj/a");
+    tmux.new_session("proj/b", 80, 24).expect("new proj/b");
+
+    let mut app = App::new();
+    navigate_to_first_folder(&mut app);
+    app.handle_key(k('d'));
+
+    match &app.state {
+        AppState::Confirming(PendingConfirm {
+            title,
+            action: PendingAction::DeleteFolder { prefix, targets },
+            alternate:
+                Some(ConfirmAlternate {
+                    key: alt_key,
+                    action: PendingAction::DissolveFolder {
+                        prefix: alt_prefix,
+                        ..
+                    },
+                    ..
+                }),
+            ..
+        }) => {
+            assert_eq!(title, "Delete folder");
+            assert_eq!(prefix, "proj");
+            assert_eq!(targets.len(), 2);
+            let names: Vec<&str> = targets.iter().map(|(_, n)| n.as_str()).collect();
+            assert!(names.contains(&"proj/a") && names.contains(&"proj/b"));
+            assert_eq!(*alt_key, 's');
+            assert_eq!(alt_prefix, "proj");
+        }
+        other => panic!(
+            "expected Confirming(DeleteFolder, alt=DissolveFolder), got {:?}",
+            other
+        ),
+    }
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_folder_d_then_enter_kills_all_sessions() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("proj/a", 80, 24).expect("new proj/a");
+    tmux.new_session("proj/b", 80, 24).expect("new proj/b");
+
+    let mut app = App::new();
+    navigate_to_first_folder(&mut app);
+    app.handle_key(k('d'));
+    app.handle_key(k_enter());
+
+    assert!(
+        matches!(app.state, AppState::Tree),
+        "should be back in Tree, got {:?}",
+        app.state
+    );
+    assert!(!tmux.has_session("proj/a"), "proj/a should be killed");
+    assert!(!tmux.has_session("proj/b"), "proj/b should be killed");
+    assert!(
+        app.error_message.is_none(),
+        "no error expected: {:?}",
+        app.error_message
+    );
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_folder_d_then_s_dissolves_and_keeps_sessions() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("proj/a", 80, 24).expect("new proj/a");
+    tmux.new_session("proj/b", 80, 24).expect("new proj/b");
+
+    let mut app = App::new();
+    navigate_to_first_folder(&mut app);
+    app.handle_key(k('d'));
+    app.handle_key(k('s'));
+
+    assert!(matches!(app.state, AppState::Tree));
+    assert!(!tmux.has_session("proj/a"), "proj/a should be renamed");
+    assert!(!tmux.has_session("proj/b"), "proj/b should be renamed");
+    assert!(tmux.has_session("a"), "renamed `a` should be alive");
+    assert!(tmux.has_session("b"), "renamed `b` should be alive");
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_folder_d_then_esc_leaves_tmux_untouched() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("proj/a", 80, 24).expect("new proj/a");
+    tmux.new_session("proj/b", 80, 24).expect("new proj/b");
+
+    let mut app = App::new();
+    navigate_to_first_folder(&mut app);
+    app.handle_key(k('d'));
+    app.handle_key(k_esc());
+
+    assert!(matches!(app.state, AppState::Tree));
+    assert!(tmux.has_session("proj/a"));
+    assert!(tmux.has_session("proj/b"));
+    drop(app);
+    drop(tmux);
+}
+
+// ───────────── kanban board ─────────────
+
+use crate::kanban;
+use crate::model::Machine;
+use crate::state::{PlacementEntry, State};
+
+fn k_upper(c: char) -> KeyEvent {
+    key_press(KeyCode::Char(c), KeyModifiers::SHIFT)
+}
+
+/// Column indices of the default kanban config, resolved by id so the
+/// tests don't hardcode positions.
+fn default_col(app: &App, id: &str) -> usize {
+    app.kanban_config
+        .idx_of_id(id)
+        .unwrap_or_else(|| panic!("default config should have column '{}'", id))
+}
+
+fn board_of(app: &App) -> Vec<Vec<usize>> {
+    kanban::build_board(&app.kanban_config, &app.tree.sessions, &app.kanban_placements)
+}
+
+/// Names of the sessions in the given board column.
+fn col_names(app: &App, board: &[Vec<usize>], col: usize) -> Vec<String> {
+    board[col]
+        .iter()
+        .filter_map(|&si| app.tree.session(si))
+        .map(|s| s.raw_name.clone())
+        .collect()
+}
+
+/// Seed a manual placement into the isolated state.toml BEFORE App::new
+/// (which loads placements exactly once at startup).
+fn seed_placement(session: &str, column: &str) {
+    let mut state = State::load();
+    state.kanban.placements.push(PlacementEntry {
+        host: "local".to_string(),
+        session: session.to_string(),
+        column: column.to_string(),
+    });
+    state.save().expect("seed placement save");
+}
+
+/// Launch a fake `claude` (a tiny compiled sleeper — copying or
+/// symlinking `/bin/sleep` doesn't survive macOS: a copied platform
+/// binary is killed by AMFI, and `pane_current_command` resolves a
+/// symlink to the real image name) in the session's pane, wait until
+/// tmux reports it as the foreground command, then write a hook-style
+/// status file for that pane. Returns the pane id. `cc` is guaranteed
+/// wherever `cargo test` runs — rustc needs it to link.
+fn fake_claude(tmux: &IsolatedTmux, session: &str, state_json: &str) -> String {
+    let home = std::path::PathBuf::from(std::env::var("HOME").expect("HOME set"));
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).expect("mk fake bin dir");
+    let fake = bin.join("claude");
+    if !fake.exists() {
+        let src = home.join("fake_claude.c");
+        std::fs::write(&src, "#include <unistd.h>\nint main(void){sleep(300);return 0;}\n")
+            .expect("write fake claude source");
+        let out = std::process::Command::new("cc")
+            .arg("-o")
+            .arg(&fake)
+            .arg(&src)
+            .output()
+            .expect("run cc");
+        assert!(
+            out.status.success(),
+            "cc failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    tmux.send_keys(session, "PATH=$HOME/bin:$PATH claude\r")
+        .expect("launch fake claude");
+    let ok = poll_until(Duration::from_secs(3), || {
+        tmux.pane_current_command(session)
+            .map(|c| c == "claude")
+            .unwrap_or(false)
+    });
+    assert!(ok, "fake claude never became the foreground command");
+
+    let pane_id = tmux.pane_id(session).expect("pane id");
+    write_status(&pane_id, state_json);
+    pane_id
+}
+
+/// Write `~/.cache/ade/claude-status/<pane_id>.json` the way the hooks do.
+fn write_status(pane_id: &str, state_json: &str) {
+    let home = std::path::PathBuf::from(std::env::var("HOME").expect("HOME set"));
+    let dir = home.join(".cache").join("ade").join("claude-status");
+    std::fs::create_dir_all(&dir).expect("mk status dir");
+    std::fs::write(dir.join(format!("{}.json", pane_id)), state_json)
+        .expect("write status file");
+}
+
+#[test]
+fn acceptance_kanban_enter_exit_and_default_column() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("kana", 80, 24).expect("new kana");
+    tmux.new_session("kanb", 80, 24).expect("new kanb");
+
+    let mut app = App::new();
+    app.handle_key(k_upper('K'));
+    assert!(
+        matches!(app.state, AppState::Kanban(_)),
+        "K should enter the kanban board, got {:?}",
+        app.state
+    );
+
+    // No Claude anywhere, no placements → both sessions sit in the
+    // auto-awaiting column; every other column is empty.
+    let board = board_of(&app);
+    let awaiting = default_col(&app, "awaiting");
+    assert_eq!(col_names(&app, &board, awaiting), vec!["kana", "kanb"]);
+    for (i, col) in board.iter().enumerate() {
+        if i != awaiting {
+            assert!(col.is_empty(), "column {} should be empty", i);
+        }
+    }
+
+    app.handle_key(k_esc());
+    assert!(matches!(app.state, AppState::Tree), "Esc returns to tree");
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_kanban_move_card_persists_and_survives_restart() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("kanmove", 80, 24).expect("new kanmove");
+
+    let mut app = App::new();
+    app.handle_key(k_upper('K'));
+    // Board opens on column 0 (Idle, empty). Step right to awaiting,
+    // where the session sits.
+    app.handle_key(k('l'));
+    // One move right: the auto-active column is skipped as a target, so
+    // the card lands directly in Done.
+    app.handle_key(k_upper('L'));
+
+    let done = default_col(&app, "done");
+    assert_eq!(
+        app.kanban_placements
+            .get(&(Machine::Local, "kanmove".to_string()))
+            .map(String::as_str),
+        Some("done"),
+        "L from awaiting should place the card in done (skipping active)"
+    );
+    let board = board_of(&app);
+    assert_eq!(col_names(&app, &board, done), vec!["kanmove"]);
+    // Focus followed the card.
+    let (fcol, fcard) = app.resolve_kanban_focus(&board);
+    assert_eq!((fcol, fcard), (done, 0), "cursor should follow the moved card");
+
+    // Persisted?
+    let on_disk = State::load();
+    assert_eq!(
+        on_disk.kanban.placements,
+        vec![PlacementEntry {
+            host: "local".to_string(),
+            session: "kanmove".to_string(),
+            column: "done".to_string(),
+        }]
+    );
+
+    // Survives a full app restart.
+    drop(app);
+    let app2 = App::new();
+    let board2 = board_of(&app2);
+    assert_eq!(
+        col_names(&app2, &board2, default_col(&app2, "done")),
+        vec!["kanmove"],
+        "placement should survive App restart via state.toml"
+    );
+
+    // Moving back left into awaiting removes the placement entirely
+    // ("back to default" is expressible).
+    let mut app2 = app2;
+    app2.handle_key(k_upper('K'));
+    app2.handle_key(k('l')); // idle → awaiting (empty now)... 
+    // Navigate focus onto the done column instead of assuming: resolve by
+    // stepping right until the focused column is `done`.
+    for _ in 0..app2.kanban_config.columns.len() {
+        let b = board_of(&app2);
+        let (c, _) = app2.resolve_kanban_focus(&b);
+        if c == default_col(&app2, "done") {
+            break;
+        }
+        app2.handle_key(k('l'));
+    }
+    app2.handle_key(k_upper('H'));
+    assert!(
+        app2.kanban_placements.is_empty(),
+        "moving into auto-awaiting should remove the placement"
+    );
+    assert!(State::load().kanban.placements.is_empty());
+    drop(app2);
+    drop(tmux);
+}
+
+#[cfg(unix)]
+#[test]
+fn acceptance_kanban_working_forces_active_clears_manual_and_pins_card() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("kanwork", 80, 24).expect("new kanwork");
+
+    // Fake Claude working in the pane + a pre-seeded manual Done
+    // placement — the Working precedence must win and CLEAR it.
+    let pane_id = fake_claude(&tmux, "kanwork", r#"{"state":"working"}"#);
+    seed_placement("kanwork", "done");
+
+    let mut app = App::new(); // refresh + reconcile run inside
+    let s = app
+        .tree
+        .sessions
+        .iter()
+        .find(|s| s.raw_name == "kanwork")
+        .expect("kanwork in tree");
+    assert_eq!(
+        s.claude,
+        Some(crate::claude_status::ClaudeState::Working),
+        "fake claude + working status file should read as Working"
+    );
+
+    let board = board_of(&app);
+    let active = default_col(&app, "active");
+    assert_eq!(
+        col_names(&app, &board, active),
+        vec!["kanwork"],
+        "working session belongs to the auto-active column"
+    );
+    assert!(
+        app.kanban_placements.is_empty(),
+        "Working must clear the manual Done placement"
+    );
+    assert!(
+        State::load().kanban.placements.is_empty(),
+        "the cleared placement must be persisted"
+    );
+
+    // A Working card is pinned: moving it out of Active is refused loudly.
+    app.handle_key(k_upper('K'));
+    for _ in 0..app.kanban_config.columns.len() {
+        let b = board_of(&app);
+        let (c, _) = app.resolve_kanban_focus(&b);
+        if c == active {
+            break;
+        }
+        app.handle_key(k('l'));
+    }
+    app.handle_key(k_upper('L'));
+    assert!(
+        app.kanban_placements.is_empty(),
+        "blocked move must not create a placement"
+    );
+    assert!(
+        app.error_message.is_some(),
+        "blocked move should explain itself in the footer"
+    );
+
+    // Claude stops (hook writes idle): the card falls to Awaiting human.
+    write_status(&pane_id, r#"{"state":"idle"}"#);
+    app.refresh();
+    let board = board_of(&app);
+    assert_eq!(
+        col_names(&app, &board, default_col(&app, "awaiting")),
+        vec!["kanwork"],
+        "after Working ends the card falls to auto-awaiting"
+    );
+    assert!(board[active].is_empty());
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_kanban_rename_migrates_placement() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("kanren", 80, 24).expect("new kanren");
+    seed_placement("kanren", "verified");
+
+    let mut app = App::new();
+    // Cursor starts on the only session row; rename via the tree flow.
+    app.handle_key(k_upper('R'));
+    assert!(
+        matches!(app.state, AppState::RenamingSession { .. }),
+        "R should open the rename modal, got {:?}",
+        app.state
+    );
+    // input_buffer is prefilled with "kanren"; append a suffix.
+    type_str(&mut app, "2");
+    app.handle_key(k_enter());
+
+    assert!(tmux.has_session("kanren2"), "session should be renamed");
+    assert_eq!(
+        app.kanban_placements
+            .get(&(Machine::Local, "kanren2".to_string()))
+            .map(String::as_str),
+        Some("verified"),
+        "placement should migrate to the new session name"
+    );
+    let on_disk = State::load();
+    assert_eq!(on_disk.kanban.placements.len(), 1);
+    assert_eq!(on_disk.kanban.placements[0].session, "kanren2");
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_kanban_kill_prunes_placement() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("kankill", 80, 24).expect("new kankill");
+    tmux.new_session("kankeep", 80, 24).expect("new kankeep");
+    seed_placement("kankill", "done");
+    seed_placement("kankeep", "done");
+
+    let mut app = App::new();
+    // Navigate the cursor onto kankill (sessions sort alphabetically:
+    // kankeep, kankill — so one Down from the top).
+    let mut steps = 0;
+    loop {
+        if let Some(crate::model::Row::Session(idx)) = app.current_row() {
+            if app.tree.session(idx).map(|s| s.raw_name.as_str()) == Some("kankill") {
+                break;
+            }
+        }
+        assert!(steps < 10, "never found kankill row");
+        app.handle_key(k_down());
+        steps += 1;
+    }
+    app.handle_key(k('d'));
+    app.handle_key(k_enter());
+
+    assert!(!tmux.has_session("kankill"));
+    assert!(
+        !app.kanban_placements
+            .contains_key(&(Machine::Local, "kankill".to_string())),
+        "killed session's placement should be dropped"
+    );
+    assert_eq!(
+        app.kanban_placements
+            .get(&(Machine::Local, "kankeep".to_string()))
+            .map(String::as_str),
+        Some("done"),
+        "surviving session's placement must be untouched"
+    );
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_kanban_unobserved_machine_placements_survive_refresh() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("kanlocal", 80, 24).expect("new kanlocal");
+
+    // A host that can't be reached (BatchMode ssh to an invalid target
+    // fails fast). Its machine is never in RefreshResult::observed, so
+    // its placements must never be pruned — even though its session
+    // obviously isn't in the tree.
+    let mut hosts = crate::hosts::Config::default();
+    hosts
+        .upsert(
+            crate::hosts::Host {
+                name: "ghost".to_string(),
+                kind: crate::hosts::HostKind::Ssh,
+                target: "invalid.host.ade.test".to_string(),
+                ssh_args: vec![],
+            },
+            None,
+        )
+        .expect("add ghost host");
+    hosts.save().expect("save hosts.toml");
+
+    let mut state = State::load();
+    state.kanban.placements.push(PlacementEntry {
+        host: "ghost".to_string(),
+        session: "far/away".to_string(),
+        column: "done".to_string(),
+    });
+    state.kanban.placements.push(PlacementEntry {
+        host: "local".to_string(),
+        session: "kanlocal".to_string(),
+        column: "verified".to_string(),
+    });
+    state.save().expect("seed placements");
+
+    let mut app = App::new(); // refresh runs; ghost errors out
+    app.refresh(); // and once more for good measure
+
+    assert_eq!(
+        app.kanban_placements
+            .get(&(Machine::Remote("ghost".to_string()), "far/away".to_string()))
+            .map(String::as_str),
+        Some("done"),
+        "placement on an unobserved (unreachable) machine must survive"
+    );
+    assert_eq!(
+        app.kanban_placements
+            .get(&(Machine::Local, "kanlocal".to_string()))
+            .map(String::as_str),
+        Some("verified"),
+        "live local placement must survive too"
+    );
+    drop(app);
+    drop(tmux);
+}
+
+#[cfg(unix)]
+#[test]
+fn acceptance_kanban_tab_embeds_and_chord_returns_to_board() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("kanembed", 80, 24).expect("new kanembed");
+    let _ = poll_for_capture_contains(&tmux, "kanembed", "$ ", Duration::from_secs(2))
+        .expect("prompt up");
+
+    let mut app = App::new();
+    app.handle_key(k_upper('K'));
+    app.handle_key(k('l')); // idle → awaiting, where the card sits
+    app.handle_key(k_tab());
+    assert!(
+        app.embedded_active(),
+        "Tab on a focused card should enter embedded mode"
+    );
+    assert!(
+        matches!(app.state, AppState::Kanban(_)),
+        "embedding must not leave the kanban state"
+    );
+
+    // Type into the embedded session and see it land in the real pane.
+    let _ = poll_for_embedded_grid_contains(&app, "$", Duration::from_secs(3))
+        .expect("embedded grid shows prompt");
+    type_str(&mut app, "echo kanban-embed-ok");
+    app.handle_key(k_enter());
+    let cap = poll_for_capture_contains(
+        &tmux,
+        "kanembed",
+        "kanban-embed-ok",
+        Duration::from_secs(3),
+    )
+    .expect("typed command reaches the session");
+    assert!(cap.contains("kanban-embed-ok"));
+
+    // Exit chord returns to the board, not the tree.
+    app.handle_key(k_ctrl_space());
+    app.handle_key(k(' '));
+    assert!(!app.embedded_active(), "chord should exit embedded mode");
+    assert!(
+        matches!(app.state, AppState::Kanban(_)),
+        "after the chord the user lands back on the board"
+    );
+
+    // `p` is an alias for the same immediate-interactive entry — there is
+    // no read-only preview state on the board, and it must not flip the
+    // tree's persisted preview-pane preference.
+    let pane_pref_before = app.preview_pane_enabled;
+    app.handle_key(k('p'));
+    assert!(
+        app.embedded_active(),
+        "p should enter the writable embedded state directly"
+    );
+    assert_eq!(
+        app.preview_pane_enabled, pane_pref_before,
+        "p on the board must not toggle the tree preview preference"
+    );
+    app.handle_key(k_ctrl_space());
+    app.handle_key(k(' '));
+    assert!(!app.embedded_active());
+    assert!(matches!(app.state, AppState::Kanban(_)));
+    drop(app);
+    drop(tmux);
+}

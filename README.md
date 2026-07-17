@@ -6,7 +6,7 @@ Browse, create, rename, and attach to tmux sessions on your laptop and any SSH/M
 
 ## Features
 
-- **Folders** — sessions sharing a `prefix/` (e.g. `work/api`, `work/db`) auto-group under a collapsible `work/` folder. Toggle with `o`/`␣`/Enter; collapsed state persists across launches. Folder-level rename cascades to every child; dissolve strips the prefix from each child without killing them.
+- **Folders** — sessions sharing a `prefix/` (e.g. `work/api`, `work/db`) auto-group under a collapsible `work/` folder. Toggle with `o`/`␣`/Enter; collapsed state persists across launches. Folder-level rename cascades to every child; `d` opens a 3-way prompt to delete the folder and kill every session inside it (default), or dissolve it (strip the prefix; sessions keep running).
 - **Tmux clipboard, fixed** — `ade install-tmux-config` ships the canonical tmux config that makes drag-select-to-copy work end-to-end, including through mosh (where the default tmux `Ms` capability silently drops). Idempotent; local and remote.
 - **Cross-machine** — local plus every configured SSH/Mosh host in one tree. Manage hosts in-app with `H` or in `~/.config/ade/hosts.toml`.
 - **Live Claude status** — sessions running Claude Code show a `claude` chip with the live context-window percentage (e.g. `claude · 72%`), so you can spot a near-compact session on any remote at a glance. Working sessions render bright peach; idle sessions with context data render a dim chip; sessions awaiting a permission prompt render red `claude · approve`. Powered by `ade install-hooks`; detects wrapped/nested Claude via a process-tree walk.
@@ -78,11 +78,84 @@ ADE also surfaces a one-time peach `Tip` banner inside the TUI when it notices t
 | `Enter` | Attach to session (or toggle folder) |
 | `n` | New session |
 | `R` | Rename session or folder |
-| `d` | Delete session or dissolve folder |
+| `d` | Delete session, or on a folder open a confirm with: Enter = delete + kill all sessions, `s` = dissolve (keep sessions), Esc = cancel |
+| `K` | Kanban board |
 | `H` | Hosts list |
 | `r` | Refresh |
 | `x` | Dismiss the tmux-config nudge |
 | `q` / `Esc` | Quit |
+
+## Kanban board
+
+Press `K` in the tree to see every session as a card in a workflow column:
+
+| Column (default) | Kind | Meaning |
+|---|---|---|
+| Idle | manual | Backlog — started work you parked again |
+| Awaiting human | auto | Claude Code isn't running in the session, or it's running but waiting on you (idle prompt / permission approval). Default for unplaced sessions. |
+| Active | auto | Claude is working right now |
+| Done | manual | You moved it here |
+| Verified done | manual | You checked the work and moved it here |
+
+The two auto columns are driven by the same hooks that power the `claude`
+chips — no manual bookkeeping. The moment Claude starts working in a
+session, its card jumps to Active and any manual placement (even Done) is
+cleared; when it stops, the card falls to Awaiting human until you place it
+again. A working card is pinned — it can't be moved out of Active by hand.
+
+| Key | Action |
+|---|---|
+| `h` / `l` / `←→` | Focus column |
+| `j` / `k` / `↑↓` | Focus card |
+| `H` / `L` (or `Shift+←→`) | Move focused card left / right (skips Active; moving into Awaiting human clears the manual placement) |
+| `g` / `G` | Top / bottom of column |
+| `Enter` | Attach to session |
+| `p` / `Tab` | Open the focused card's session in a modal — immediately interactive, type straight into it; `Ctrl+Space Space` returns to the board (same chord as the tree's embedded pane) |
+| `r` | Refresh |
+| `K` / `q` / `Esc` | Back to tree |
+
+### Customizing columns — `~/.config/ade/kanban.toml`
+
+Columns are renamable, reorderable, and extra **manual** columns can be
+added. The file is optional; missing means the defaults above. ADE never
+rewrites it, so comments survive. The defaults, spelled out:
+
+```toml
+[[columns]]
+id = "idle"          # stable key — placements reference it; don't change after use
+name = "Idle"        # display name — rename freely
+kind = "manual"
+
+[[columns]]
+id = "awaiting"
+name = "Awaiting human"
+kind = "auto-awaiting"   # exactly one required
+
+[[columns]]
+id = "active"
+name = "Active"
+kind = "auto-active"     # exactly one required
+
+[[columns]]
+id = "done"
+name = "Done"
+kind = "manual"
+
+[[columns]]
+id = "verified"
+name = "Verified done"
+kind = "manual"
+```
+
+Rules: exactly one `auto-awaiting` and one `auto-active` column (renamable
+and reorderable, but their hook-bound semantics can't be remapped); any
+number of `manual` columns. An invalid file falls back to the defaults
+with a warning banner — manual placements referencing your custom columns
+are preserved (shown under Awaiting human) until the file is fixed.
+
+Manual placements are stored in `state.toml` keyed by `(host, session
+name)`; renaming a session or host inside ADE migrates them, renaming a
+session outside ADE resets it to the automatic columns.
 
 ## Tmux keybindings (installed by `ade install-tmux-config`)
 
@@ -111,5 +184,6 @@ Press these from inside any tmux session that has ADE's tmux config sourced:
 ## Config files
 
 - `~/.config/ade/hosts.toml` — host list (managed in-app or by hand)
+- `~/.config/ade/kanban.toml` — kanban column layout (by hand; optional, defaults apply)
 - `~/.config/ade/tmux.conf` — managed tmux clipboard snippet (written by `install-tmux-config`)
-- `~/.config/ade/state.toml` — persisted UI prefs (collapsed folders, dismissed nudges)
+- `~/.config/ade/state.toml` — persisted UI prefs (collapsed folders, dismissed nudges, kanban placements)
