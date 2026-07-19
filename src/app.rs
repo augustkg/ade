@@ -267,6 +267,23 @@ pub struct KanbanView {
     pub focused_col: usize,
     pub focused_card: usize,
     pub focused_key: Option<(Machine, String)>,
+    /// `Some` while the folder-filter picker overlay is open (`f`).
+    /// Kept inside the view (not a separate `AppState` variant) so the
+    /// board renders underneath and its focus survives untouched.
+    pub picker: Option<FilterPicker>,
+}
+
+/// Cursor state of the folder-filter picker. Rows are derived fresh each
+/// frame/keypress by `App::kanban_filter_rows` — row 0 is "(no folder)",
+/// the rest are folder prefixes. The cursor is stored by *identity*
+/// (`None` = the "(no folder)" row, `Some(prefix)` = that folder row),
+/// not by index — a background refresh can add/remove folder rows, and a
+/// positional cursor would let Space toggle a different bucket than the
+/// one highlighted. The index is derived per frame/keypress; a vanished
+/// prefix falls back to row 0.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterPicker {
+    pub selected: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -466,6 +483,9 @@ pub struct App {
     /// via `persist_kanban_placements`. Never rebuilt from disk mid-run —
     /// render and key handling must not do file I/O.
     pub kanban_placements: HashMap<(Machine, String), String>,
+    /// Folder-level board filter (see `state::KanbanFilterState`).
+    /// Authoritative in-memory copy, same lifecycle as the placements.
+    pub kanban_filter: crate::state::KanbanFilterState,
 }
 
 impl Default for App {
@@ -486,6 +506,8 @@ impl App {
         };
         let persisted = State::load();
         let kanban_placements = kanban::entries_to_map(&persisted.kanban.placements);
+        let mut kanban_filter = persisted.kanban.filter.clone();
+        kanban_filter.canonicalize();
         let mut expanded_memory: HashMap<String, bool> = HashMap::new();
         for prefix in &persisted.folders.closed {
             expanded_memory.insert(prefix.clone(), false);
@@ -522,6 +544,7 @@ impl App {
             prior_demoted: HashSet::new(),
             kanban_config,
             kanban_placements,
+            kanban_filter,
         };
         app.refresh();
         app
@@ -634,8 +657,70 @@ impl App {
             self.selected_index = n - 1;
         }
 
-        self.reconcile_kanban(&observed);
+        // Kanban: apply external intents (the `ade kanban` CLI's inbox),
+        // then reconcile; persist at most once, and acknowledge the
+        // intent files only after that save succeeded — a failed save
+        // leaves them in the inbox for retry next refresh. Any pending
+        // intent FORCES a save attempt, even when it's a memory no-op:
+        // after a failed save the retained intent is already reflected in
+        // memory, and a changed-only gate would ack it without the disk
+        // ever catching up (Codex implementation review).
+        let intent_paths = self.apply_kanban_intents();
+        let reconcile_changed = self.reconcile_kanban(&observed);
+        let save_ok = if !intent_paths.is_empty() || reconcile_changed {
+            self.persist_kanban_placements().is_ok()
+        } else {
+            true
+        };
+        if save_ok {
+            kanban::remove_intents(&intent_paths);
+        }
+
         self.dispatch_notifications();
+    }
+
+    /// Drain the kanban intent inbox into the in-memory placements.
+    /// Intents arrive sorted by publish order, so a later intent for the
+    /// same session wins. The caller persists and acknowledges the
+    /// returned (= applied) paths.
+    ///
+    /// Intents for a session whose Claude is Working right now are
+    /// **deferred**, not applied: left in the inbox, unacknowledged,
+    /// until the work stops. Applying immediately would be pointless —
+    /// reconcile's Working-pin clears the placement in the same pass —
+    /// and the headline flow is exactly "Claude marks its own session
+    /// done at the end of a turn", which reaches this code while the
+    /// turn's `working` status is still on disk. Deferring turns that
+    /// into "lands in Done the moment the work stops".
+    fn apply_kanban_intents(&mut self) -> Vec<std::path::PathBuf> {
+        let intents = kanban::read_intents();
+        let mut paths = Vec::with_capacity(intents.len());
+        for (path, intent) in intents {
+            let machine = if intent.host == "local" {
+                Machine::Local
+            } else {
+                Machine::Remote(intent.host.clone())
+            };
+            let working_now = self.tree.sessions.iter().any(|s| {
+                s.machine == machine
+                    && s.raw_name == intent.session
+                    && s.claude == Some(ClaudeState::Working)
+            });
+            if working_now {
+                continue; // defer: file stays in the inbox for a later tick
+            }
+            let key = (machine, intent.session.clone());
+            match intent.column {
+                Some(column) => {
+                    self.kanban_placements.insert(key, column);
+                }
+                None => {
+                    self.kanban_placements.remove(&key);
+                }
+            }
+            paths.push(path);
+        }
+        paths
     }
 
     /// Kanban bookkeeping after every refresh (sync or background):
@@ -652,9 +737,10 @@ impl App {
     ///     temporarily broken kanban.toml must not destroy them.
     /// (c) Re-resolve the board cursor by session identity.
     ///
-    /// Saves at most once, and only when something actually changed — the
-    /// 2s steady state writes nothing.
-    fn reconcile_kanban(&mut self, observed: &[Machine]) {
+    /// Returns whether the placements changed; the caller
+    /// (`apply_refresh_result`) folds this into a single save per refresh
+    /// — the 2s steady state writes nothing.
+    fn reconcile_kanban(&mut self, observed: &[Machine]) -> bool {
         let mut dirty = false;
 
         // (a) Working precedence.
@@ -687,6 +773,7 @@ impl App {
                 &self.kanban_config,
                 &self.tree.sessions,
                 &self.kanban_placements,
+                &self.kanban_filter,
             );
             let (col, card) = self.resolve_kanban_focus(&board);
             if let AppState::Kanban(ref mut view) = self.state {
@@ -695,11 +782,7 @@ impl App {
             }
         }
 
-        if dirty {
-            // Background reconcile: best-effort save, no error banner —
-            // a transient I/O failure will retry on the next change.
-            let _ = self.persist_kanban_placements();
-        }
+        dirty
     }
 
     /// Resolve the kanban cursor to concrete `(col, card)` indices for the
@@ -1103,6 +1186,7 @@ impl App {
                 &self.kanban_config,
                 &self.tree.sessions,
                 &self.kanban_placements,
+                &self.kanban_filter,
             );
             let (col, card) = self.resolve_kanban_focus(&board);
             let &si = board.get(col)?.get(card)?;
@@ -1212,6 +1296,7 @@ impl App {
             &self.kanban_config,
             &self.tree.sessions,
             &self.kanban_placements,
+            &self.kanban_filter,
         );
         let (col, card) = self.resolve_kanban_focus(&board);
         let Some(&idx) = board.get(col).and_then(|c| c.get(card)) else {
@@ -1431,6 +1516,7 @@ impl App {
                     focused_col: 0,
                     focused_card: 0,
                     focused_key: None,
+                    picker: None,
                 });
             }
             KeyCode::Char('x') => {
@@ -1463,10 +1549,15 @@ impl App {
     /// background refresh between keypresses can't make a key act on the
     /// wrong card.
     fn handle_kanban_key(&mut self, key: KeyEvent) {
+        // Filter-picker overlay shadows the board keymap while open.
+        if matches!(&self.state, AppState::Kanban(v) if v.picker.is_some()) {
+            return self.handle_kanban_filter_key(key);
+        }
         let board = kanban::build_board(
             &self.kanban_config,
             &self.tree.sessions,
             &self.kanban_placements,
+            &self.kanban_filter,
         );
         let (col, card) = self.resolve_kanban_focus(&board);
         let ncols = board.len().max(1);
@@ -1574,7 +1665,155 @@ impl App {
             // and `p` does NOT touch the tree's persisted preview-pane
             // preference.
             KeyCode::Char('p') | KeyCode::Tab => self.try_enter_embedded_kanban(),
+            KeyCode::Char('f') => {
+                if let AppState::Kanban(ref mut view) = self.state {
+                    view.picker = Some(FilterPicker { selected: None });
+                }
+            }
+            // Clear the folder filter without opening the picker (the
+            // summary bar advertises this). No-op when inactive.
+            KeyCode::Char('c') => {
+                if self.kanban_filter.is_active() {
+                    self.kanban_filter = crate::state::KanbanFilterState::default();
+                    if let Err(e) = self.persist_kanban_filter() {
+                        self.error_message = Some(format!("failed to save filter: {}", e));
+                    }
+                    self.reanchor_kanban_focus();
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Rows of the folder-filter picker: index 0 is the "(no folder)"
+    /// bucket (`None`), the rest are folder prefixes — the union of what
+    /// the tree currently shows and what the saved filter references, so
+    /// a selected-but-currently-absent folder stays visible and can be
+    /// unticked. Sorted, stable across refreshes.
+    pub fn kanban_filter_rows(&self) -> Vec<Option<String>> {
+        let mut prefixes: std::collections::BTreeSet<String> = self
+            .tree
+            .sessions
+            .iter()
+            .filter_map(|s| s.prefix.clone())
+            .collect();
+        prefixes.extend(self.kanban_filter.folders.iter().cloned());
+        let mut rows = vec![None];
+        rows.extend(prefixes.into_iter().map(Some));
+        rows
+    }
+
+    /// Keymap of the filter-picker overlay. Toggles apply and persist
+    /// immediately (same pattern as the other prefs); `c` clears the
+    /// whole filter back to show-all; Esc/`f`/`q` close the picker.
+    /// Resolve the picker's identity cursor to a row index for the
+    /// current row set — falling back to row 0 ("(no folder)", which
+    /// always exists) when the remembered prefix vanished.
+    pub fn kanban_picker_index(&self, rows: &[Option<String>]) -> usize {
+        let selected = match &self.state {
+            AppState::Kanban(v) => v.picker.as_ref().map(|p| p.selected.clone()),
+            _ => None,
+        };
+        selected
+            .and_then(|sel| rows.iter().position(|r| *r == sel))
+            .unwrap_or(0)
+    }
+
+    fn handle_kanban_filter_key(&mut self, key: KeyEvent) {
+        let rows = self.kanban_filter_rows();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('f') | KeyCode::Char('q') => {
+                if let AppState::Kanban(ref mut view) = self.state {
+                    view.picker = None;
+                }
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let idx = self.kanban_picker_index(&rows).saturating_sub(1);
+                if let AppState::Kanban(ref mut view) = self.state {
+                    if let Some(p) = view.picker.as_mut() {
+                        p.selected = rows[idx].clone();
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let idx = (self.kanban_picker_index(&rows) + 1).min(rows.len() - 1);
+                if let AppState::Kanban(ref mut view) = self.state {
+                    if let Some(p) = view.picker.as_mut() {
+                        p.selected = rows[idx].clone();
+                    }
+                }
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                // Toggle by IDENTITY — never by row index, which a
+                // background refresh can shift under the cursor.
+                let selected = match &self.state {
+                    AppState::Kanban(v) => v.picker.as_ref().map(|p| p.selected.clone()),
+                    _ => None,
+                };
+                let Some(selected) = selected else { return };
+                match &selected {
+                    None => self.kanban_filter.loose = !self.kanban_filter.loose,
+                    Some(prefix) => {
+                        if let Some(pos) =
+                            self.kanban_filter.folders.iter().position(|f| f == prefix)
+                        {
+                            self.kanban_filter.folders.remove(pos);
+                        } else {
+                            self.kanban_filter.folders.push(prefix.clone());
+                        }
+                    }
+                }
+                self.kanban_filter.canonicalize();
+                if let Err(e) = self.persist_kanban_filter() {
+                    self.error_message = Some(format!("failed to save filter: {}", e));
+                }
+                self.reanchor_kanban_focus();
+            }
+            KeyCode::Char('c') => {
+                self.kanban_filter = crate::state::KanbanFilterState::default();
+                if let Err(e) = self.persist_kanban_filter() {
+                    self.error_message = Some(format!("failed to save filter: {}", e));
+                }
+                self.reanchor_kanban_focus();
+            }
+            _ => {}
+        }
+    }
+
+    /// Mirror the in-memory filter to `state.toml` (merge semantics, like
+    /// the placements).
+    fn persist_kanban_filter(&self) -> Result<(), String> {
+        let mut state = State::load();
+        state.kanban.filter = self.kanban_filter.clone();
+        state.save()
+    }
+
+    /// After a filter change, snap the board cursor onto what is actually
+    /// visible. `resolve_kanban_focus` already falls back positionally
+    /// when `focused_key` is filtered out — but the stale hidden key must
+    /// then be REPLACED with the visible fallback card's identity (or
+    /// cleared), otherwise re-enabling that folder later would teleport
+    /// focus back to the long-hidden card. (Codex design review.)
+    fn reanchor_kanban_focus(&mut self) {
+        let board = kanban::build_board(
+            &self.kanban_config,
+            &self.tree.sessions,
+            &self.kanban_placements,
+            &self.kanban_filter,
+        );
+        let (col, card) = self.resolve_kanban_focus(&board);
+        let key = board
+            .get(col)
+            .and_then(|c| c.get(card))
+            .and_then(|&si| self.tree.session(si))
+            .map(|s| (s.machine.clone(), s.raw_name.clone()));
+        if let AppState::Kanban(ref mut view) = self.state {
+            view.focused_col = col;
+            view.focused_card = card;
+            view.focused_key = key;
         }
     }
 
@@ -1593,6 +1832,7 @@ impl App {
             &self.kanban_config,
             &self.tree.sessions,
             &self.kanban_placements,
+            &self.kanban_filter,
         );
         let (col, card) = self.resolve_kanban_focus(&board);
         let Some(&session_idx) = board.get(col).and_then(|c| c.get(card)) else {
@@ -1645,6 +1885,7 @@ impl App {
             &self.kanban_config,
             &self.tree.sessions,
             &self.kanban_placements,
+            &self.kanban_filter,
         );
         let (new_col, new_card) = self.resolve_kanban_focus(&board);
         if let AppState::Kanban(ref mut view) = self.state {

@@ -32,6 +32,51 @@ pub struct KanbanState {
     /// of the file.
     #[serde(default)]
     pub placements: Vec<PlacementEntry>,
+    /// Folder-level board filter (`f` on the board). Default = inactive.
+    #[serde(default)]
+    pub filter: KanbanFilterState,
+}
+
+/// Which folder buckets the kanban board shows. Empty (default) means
+/// **no filter — show every session**; anything selected means show only
+/// the selected buckets. There is deliberately no "active but empty"
+/// state: unticking everything in the picker returns to show-all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KanbanFilterState {
+    /// Include sessions without a folder prefix (`Tree::loose`
+    /// vocabulary; the UI calls this "(no folder)").
+    #[serde(default)]
+    pub loose: bool,
+    /// Folder prefixes to include. Not trimmed — prefixes may
+    /// legitimately carry whitespace; only truly empty strings are
+    /// dropped by `canonicalize`.
+    #[serde(default)]
+    pub folders: Vec<String>,
+}
+
+impl KanbanFilterState {
+    pub fn is_active(&self) -> bool {
+        self.loose || !self.folders.is_empty()
+    }
+
+    /// Does a session with this folder prefix pass the filter?
+    pub fn matches_prefix(&self, prefix: Option<&str>) -> bool {
+        if !self.is_active() {
+            return true;
+        }
+        match prefix {
+            None => self.loose,
+            Some(p) => self.folders.iter().any(|f| f == p),
+        }
+    }
+
+    /// Drop empty strings, dedup, sort — for stable state.toml output and
+    /// sane picker rows after hand edits. Never trims.
+    pub fn canonicalize(&mut self) {
+        self.folders.retain(|f| !f.is_empty());
+        self.folders.sort();
+        self.folders.dedup();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -202,6 +247,46 @@ mod tests {
         let body = "[tmux_install_nudge]\ndismissed = true\n";
         let state: State = toml::from_str(body).unwrap();
         assert!(state.kanban.placements.is_empty());
+    }
+
+    #[test]
+    fn missing_kanban_filter_defaults_inactive() {
+        // state.toml files written before the filter shipped must load
+        // with the filter off (show all).
+        let body = "[[kanban.placements]]\nhost = \"local\"\nsession = \"x\"\ncolumn = \"done\"\n";
+        let state: State = toml::from_str(body).unwrap();
+        assert!(!state.kanban.filter.is_active());
+        assert!(state.kanban.filter.matches_prefix(None));
+        assert!(state.kanban.filter.matches_prefix(Some("anything")));
+    }
+
+    #[test]
+    fn kanban_filter_round_trips_and_matches() {
+        let mut original = State::default();
+        original.kanban.filter.loose = true;
+        original.kanban.filter.folders = vec!["archie".to_string()];
+        let serialized = toml::to_string_pretty(&original).unwrap();
+        let restored: State = toml::from_str(&serialized).unwrap();
+        let f = &restored.kanban.filter;
+        assert!(f.is_active());
+        assert!(f.matches_prefix(None), "loose selected");
+        assert!(f.matches_prefix(Some("archie")));
+        assert!(!f.matches_prefix(Some("work")), "unselected folder hidden");
+    }
+
+    #[test]
+    fn kanban_filter_canonicalize_dedups_sorts_keeps_whitespace() {
+        let mut f = KanbanFilterState {
+            loose: false,
+            folders: vec![
+                "work".to_string(),
+                "".to_string(),
+                " archie ".to_string(),
+                "work".to_string(),
+            ],
+        };
+        f.canonicalize();
+        assert_eq!(f.folders, vec![" archie ".to_string(), "work".to_string()]);
     }
 
     #[test]

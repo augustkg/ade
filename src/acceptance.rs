@@ -1691,7 +1691,12 @@ fn default_col(app: &App, id: &str) -> usize {
 }
 
 fn board_of(app: &App) -> Vec<Vec<usize>> {
-    kanban::build_board(&app.kanban_config, &app.tree.sessions, &app.kanban_placements)
+    kanban::build_board(
+        &app.kanban_config,
+        &app.tree.sessions,
+        &app.kanban_placements,
+        &app.kanban_filter,
+    )
 }
 
 /// Names of the sessions in the given board column.
@@ -2145,6 +2150,283 @@ fn acceptance_kanban_tab_embeds_and_chord_returns_to_board() {
     app.handle_key(k(' '));
     assert!(!app.embedded_active());
     assert!(matches!(app.state, AppState::Kanban(_)));
+    drop(app);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_kanban_folder_filter_toggles_persists_and_reanchors() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("archie/api", 80, 24).expect("new archie/api");
+    tmux.new_session("work/db", 80, 24).expect("new work/db");
+    tmux.new_session("loose1", 80, 24).expect("new loose1");
+
+    let mut app = App::new();
+    app.handle_key(k_upper('K'));
+    let awaiting = default_col(&app, "awaiting");
+
+    // No filter: everything visible, in tree order — folder groups
+    // first (alphabetical), loose sessions last.
+    let board = board_of(&app);
+    assert_eq!(
+        col_names(&app, &board, awaiting),
+        vec!["archie/api", "work/db", "loose1"]
+    );
+
+    // Focus the archie card (first in the awaiting column), then filter
+    // it out: the cursor must re-anchor onto a visible card, not keep
+    // pointing at the hidden one.
+    app.handle_key(k('l'));
+    if let AppState::Kanban(ref v) = app.state {
+        assert_eq!(
+            v.focused_key,
+            Some((Machine::Local, "archie/api".to_string()))
+        );
+    } else {
+        panic!("expected kanban state");
+    }
+
+    app.handle_key(k('f')); // open picker: rows = [(no folder), archie, work]
+    app.handle_key(k(' ')); // toggle row 0 = (no folder) → loose-only filter
+    assert!(app.kanban_filter.loose);
+    let board = board_of(&app);
+    assert_eq!(col_names(&app, &board, awaiting), vec!["loose1"]);
+    if let AppState::Kanban(ref v) = app.state {
+        assert_eq!(
+            v.focused_key,
+            Some((Machine::Local, "loose1".to_string())),
+            "focus must re-anchor to a visible card when the old one is filtered out"
+        );
+        assert!(v.picker.is_some(), "picker stays open across toggles");
+    } else {
+        panic!("expected kanban state");
+    }
+
+    // Add the archie folder → the requested "no folder + archie" combo.
+    app.handle_key(k('j'));
+    app.handle_key(k(' '));
+    assert_eq!(app.kanban_filter.folders, vec!["archie".to_string()]);
+    let board = board_of(&app);
+    assert_eq!(
+        col_names(&app, &board, awaiting),
+        vec!["archie/api", "loose1"]
+    );
+
+    app.handle_key(k_esc()); // close picker
+    if let AppState::Kanban(ref v) = app.state {
+        assert!(v.picker.is_none());
+    }
+
+    // Persisted, and survives a restart.
+    let on_disk = State::load();
+    assert!(on_disk.kanban.filter.loose);
+    assert_eq!(on_disk.kanban.filter.folders, vec!["archie".to_string()]);
+    drop(app);
+    let mut app2 = App::new();
+    app2.handle_key(k_upper('K'));
+    let board = board_of(&app2);
+    assert_eq!(
+        col_names(&app2, &board, default_col(&app2, "awaiting")),
+        vec!["archie/api", "loose1"],
+        "filter must survive an app restart"
+    );
+
+    // `c` on the board clears the filter without opening the picker.
+    app2.handle_key(k('c'));
+    assert!(!app2.kanban_filter.is_active());
+    let board = board_of(&app2);
+    assert_eq!(board[default_col(&app2, "awaiting")].len(), 3);
+    assert!(!State::load().kanban.filter.is_active());
+    drop(app2);
+    drop(tmux);
+}
+
+#[test]
+fn acceptance_kanban_intent_inbox_applies_and_acks() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("archie/scope", 80, 24).expect("new archie/scope");
+
+    let mut app = App::new();
+
+    // Publish two intents for the same session: done, then verified —
+    // later intent wins (filename ordering).
+    kanban::write_intent(&kanban::Intent {
+        host: "local".to_string(),
+        session: "archie/scope".to_string(),
+        column: Some("done".to_string()),
+    })
+    .expect("write intent 1");
+    kanban::write_intent(&kanban::Intent {
+        host: "local".to_string(),
+        session: "archie/scope".to_string(),
+        column: Some("verified".to_string()),
+    })
+    .expect("write intent 2");
+    // A malformed hand-written file must be quarantined, not wedge the inbox.
+    let inbox = kanban::inbox_dir().expect("inbox dir");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::write(inbox.join("zzz-garbage.json"), "not json").unwrap();
+
+    app.refresh();
+
+    assert_eq!(
+        app.kanban_placements
+            .get(&(Machine::Local, "archie/scope".to_string()))
+            .map(String::as_str),
+        Some("verified"),
+        "later intent must win"
+    );
+    // Persisted, acknowledged, quarantined.
+    let on_disk = State::load();
+    assert_eq!(on_disk.kanban.placements.len(), 1);
+    assert_eq!(on_disk.kanban.placements[0].column, "verified");
+    let remaining: Vec<String> = std::fs::read_dir(&inbox)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        remaining.iter().all(|n| !n.ends_with(".json")),
+        "consumed intents must be deleted, got {:?}",
+        remaining
+    );
+    assert!(
+        remaining.iter().any(|n| n.ends_with(".bad")),
+        "malformed intent must be quarantined as .bad, got {:?}",
+        remaining
+    );
+
+    // A clear intent removes the placement again.
+    kanban::write_intent(&kanban::Intent {
+        host: "local".to_string(),
+        session: "archie/scope".to_string(),
+        column: None,
+    })
+    .expect("write clear intent");
+    app.refresh();
+    assert!(app.kanban_placements.is_empty());
+    assert!(State::load().kanban.placements.is_empty());
+    drop(app);
+    drop(tmux);
+}
+
+#[cfg(unix)]
+#[test]
+fn acceptance_kanban_intent_deferred_while_working_then_lands_in_done() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("kanintent", 80, 24).expect("new kanintent");
+    let pane_id = fake_claude(&tmux, "kanintent", r#"{"state":"working"}"#);
+
+    let mut app = App::new();
+    // "Mark this done" issued while the session is still Working — the
+    // primary Claude-marks-itself-done flow.
+    kanban::write_intent(&kanban::Intent {
+        host: "local".to_string(),
+        session: "kanintent".to_string(),
+        column: Some("done".to_string()),
+    })
+    .expect("write intent");
+
+    app.refresh();
+    // Deferred: card stays in Active, no placement, intent file retained.
+    let board = board_of(&app);
+    assert_eq!(
+        col_names(&app, &board, default_col(&app, "active")),
+        vec!["kanintent"]
+    );
+    assert!(app.kanban_placements.is_empty(), "intent must be deferred");
+    let inbox = kanban::inbox_dir().expect("inbox dir");
+    let pending = std::fs::read_dir(&inbox)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .count();
+    assert_eq!(pending, 1, "deferred intent must stay in the inbox");
+
+    // Work stops → the held move applies: card lands directly in Done.
+    write_status(&pane_id, r#"{"state":"idle"}"#);
+    app.refresh();
+    let board = board_of(&app);
+    assert_eq!(
+        col_names(&app, &board, default_col(&app, "done")),
+        vec!["kanintent"],
+        "held intent must apply the moment the work stops"
+    );
+    assert!(board[default_col(&app, "awaiting")].is_empty());
+    let pending = std::fs::read_dir(&inbox)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .count();
+    assert_eq!(pending, 0, "applied intent must be acknowledged");
+    assert_eq!(State::load().kanban.placements.len(), 1);
+    drop(app);
+    drop(tmux);
+}
+
+#[cfg(unix)]
+#[test]
+fn acceptance_kanban_intent_retained_until_save_succeeds() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("kandur", 80, 24).expect("new kandur");
+
+    let mut app = App::new();
+    kanban::write_intent(&kanban::Intent {
+        host: "local".to_string(),
+        session: "kandur".to_string(),
+        column: Some("done".to_string()),
+    })
+    .expect("write intent");
+
+    // Make the config dir unwritable so the state.toml save fails.
+    let cfg_dir = crate::state::State::path().unwrap().parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let orig = std::fs::metadata(&cfg_dir).unwrap().permissions();
+    std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    app.refresh();
+    // Applied in memory, but the save failed — the intent must survive
+    // for retry, and (the Codex-caught bug) the retry must FORCE a save
+    // even though re-applying is a memory no-op.
+    assert_eq!(
+        app.kanban_placements
+            .get(&(Machine::Local, "kandur".to_string()))
+            .map(String::as_str),
+        Some("done")
+    );
+    let inbox = kanban::inbox_dir().expect("inbox dir");
+    let pending = std::fs::read_dir(&inbox)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .count();
+    assert_eq!(pending, 1, "intent must be retained while the save fails");
+
+    // Heal the directory: the retained intent now forces the persist.
+    std::fs::set_permissions(&cfg_dir, orig).unwrap();
+    app.refresh();
+    assert_eq!(
+        State::load()
+            .kanban
+            .placements
+            .iter()
+            .find(|p| p.session == "kandur")
+            .map(|p| p.column.as_str()),
+        Some("done"),
+        "retained intent must reach disk once saving works again"
+    );
+    let pending = std::fs::read_dir(&inbox)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .count();
+    assert_eq!(pending, 0);
     drop(app);
     drop(tmux);
 }

@@ -47,6 +47,7 @@ fn main() -> Result<()> {
             "install-hooks" => return run_install_hooks(&argv[2..]),
             "install-tmux-config" => return run_install_tmux(&argv[2..]),
             "debug" => return run_debug(&argv[2..]),
+            "kanban" => return run_kanban(&argv[2..]),
             "--help" | "-h" | "help" => {
                 print_usage();
                 return Ok(());
@@ -92,8 +93,142 @@ fn print_usage() {
          \x20\x20ade install-tmux-config --all          Install on local + every host in hosts.toml\n\
          \x20\x20ade install-tmux-config --uninstall    Remove the tmux clipboard config (use --all for everywhere)\n\
          \x20\x20ade debug claude [--host H]            Diagnose why ADE does/doesn't see Claude per pane\n\
-         \x20\x20ade help                               Show this message"
+         \x20\x20ade kanban move <column> [--session S] Move a session's kanban card to a manual column\n\
+         \x20\x20ade kanban clear [--session S]         Return a session's card to the automatic columns\n\
+         \x20\x20ade help                               Show this message\n\
+         \n\
+         `ade kanban` defaults to the tmux session it runs inside — so a Claude Code\n\
+         session can mark itself done. A running ADE picks the change up within ~2s;\n\
+         otherwise it applies at the next launch. Local sessions only."
     );
+}
+
+/// `ade kanban move <column> [--session S]` / `ade kanban clear [--session S]`.
+/// Publishes an intent file for the running (or next) ADE instance to
+/// consume — never writes state.toml directly, the App owns that file.
+fn run_kanban(args: &[String]) -> Result<()> {
+    fn fail(msg: &str) -> ! {
+        eprintln!("Error: {}", msg);
+        std::process::exit(2);
+    }
+    fn parse_session(args: &[String], mut i: usize) -> Option<String> {
+        let mut session = None;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--session" => {
+                    if i + 1 >= args.len() {
+                        fail("--session requires a value");
+                    }
+                    session = Some(args[i + 1].clone());
+                    i += 2;
+                }
+                other => fail(&format!("unknown argument '{}'", other)),
+            }
+        }
+        session
+    }
+    /// The tmux session this process runs inside, via `display-message`.
+    fn current_session() -> Option<String> {
+        if std::env::var_os("TMUX").is_none() {
+            return None;
+        }
+        let out = std::process::Command::new("tmux")
+            .args(["display-message", "-p", "#{session_name}"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+    fn session_exists(name: &str) -> bool {
+        std::process::Command::new("tmux")
+            .args(["has-session", "-t", &format!("={}", name)])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    fn resolve_session(explicit: Option<String>) -> String {
+        let session = explicit.or_else(current_session).unwrap_or_else(|| {
+            fail(
+                "not inside a tmux session — pass --session <name> \
+                 (this command targets local tmux sessions)",
+            )
+        });
+        if !session_exists(&session) {
+            fail(&format!("no local tmux session named '{}'", session));
+        }
+        session
+    }
+
+    if args.is_empty() {
+        fail("`ade kanban` requires a subcommand: move <column> | clear");
+    }
+    match args[0].as_str() {
+        "move" => {
+            if args.len() < 2 || args[1].starts_with("--") {
+                fail("usage: ade kanban move <column> [--session S]");
+            }
+            // Strict config: refuse to resolve against silently-defaulted
+            // columns when the user's kanban.toml is broken.
+            let cfg = match kanban::KanbanConfig::load_result() {
+                Ok(c) => c,
+                Err(e) => fail(&e),
+            };
+            let column = match cfg.resolve_manual_column(&args[1]) {
+                Ok(c) => c.clone(),
+                Err(e) => fail(&e),
+            };
+            let session = resolve_session(parse_session(args, 2));
+            let intent = kanban::Intent {
+                host: "local".to_string(),
+                session: session.clone(),
+                column: Some(column.id.clone()),
+            };
+            if let Err(e) = kanban::write_intent(&intent) {
+                fail(&e);
+            }
+            println!(
+                "kanban: '{}' → {}. A running ADE applies this within ~2s \
+                 (otherwise at next launch).",
+                session, column.name
+            );
+            println!(
+                "note: if Claude is actively working in the session, the move is \
+                 held and applied the moment the work stops."
+            );
+        }
+        "clear" => {
+            let session = resolve_session(parse_session(args, 1));
+            let intent = kanban::Intent {
+                host: "local".to_string(),
+                session: session.clone(),
+                column: None,
+            };
+            if let Err(e) = kanban::write_intent(&intent) {
+                fail(&e);
+            }
+            println!(
+                "kanban: '{}' returned to automatic columns. A running ADE \
+                 applies this within ~2s (otherwise at next launch).",
+                session
+            );
+            println!(
+                "note: if Claude is actively working in the session, the change \
+                 is held and applied the moment the work stops."
+            );
+        }
+        other => fail(&format!(
+            "unknown kanban subcommand '{}': use move <column> | clear",
+            other
+        )),
+    }
+    Ok(())
 }
 
 fn run_debug(args: &[String]) -> Result<()> {

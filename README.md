@@ -111,6 +111,8 @@ again. A working card is pinned — it can't be moved out of Active by hand.
 | `g` / `G` | Top / bottom of column |
 | `Enter` | Attach to session |
 | `p` / `Tab` | Open the focused card's session in a modal — immediately interactive, type straight into it; `Ctrl+Space Space` returns to the board (same chord as the tree's embedded pane) |
+| `f` | Folder filter picker — tick which groups to show: `(no folder)` and/or any folder prefixes (e.g. loose sessions + the `archie/` folder). Nothing ticked = show everything. Persisted; a summary bar appears above the board while active |
+| `c` | Clear the folder filter (also available inside the picker) |
 | `r` | Refresh |
 | `K` / `q` / `Esc` | Back to tree |
 
@@ -157,6 +159,21 @@ Manual placements are stored in `state.toml` keyed by `(host, session
 name)`; renaming a session or host inside ADE migrates them, renaming a
 session outside ADE resets it to the automatic columns.
 
+### Moving cards from the command line (and from Claude)
+
+`ade kanban move <column>` moves the card of the tmux session it runs
+inside — so a Claude Code session can mark itself done when you tell it
+to ("mark this as done" → `ade kanban move done`). `--session <name>`
+targets another local session; `ade kanban clear` returns a card to the
+automatic columns. Columns resolve by id or display name; only manual
+columns are valid targets.
+
+The CLI never writes state directly — it drops an intent file in
+`~/.cache/ade/kanban-inbox/` which the running ADE consumes within ~2s
+(or at the next launch). A user-level Claude Code skill
+(`~/.claude/skills/ade-kanban/SKILL.md`) teaches Claude to call this
+when you ask. Local sessions only for now.
+
 ## Tmux keybindings (installed by `ade install-tmux-config`)
 
 Press these from inside any tmux session that has ADE's tmux config sourced:
@@ -178,6 +195,8 @@ Press these from inside any tmux session that has ADE's tmux config sourced:
 | `ade install-tmux-config [--host H]` | Install tmux clipboard config |
 | `ade install-tmux-config --all` | Install tmux config on local + every host |
 | `ade install-tmux-config --uninstall` | Remove the tmux clipboard config |
+| `ade kanban move <column> [--session S]` | Move a session's kanban card to a manual column (defaults to the tmux session it runs inside) |
+| `ade kanban clear [--session S]` | Return a session's card to the automatic columns |
 | `ade debug claude [--host H]` | Diagnose Claude detection per pane (shows `· NN%` per session) |
 | `ade help` | Show usage |
 

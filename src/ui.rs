@@ -108,6 +108,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_kanban_embed_modal(frame, app);
     }
 
+    if matches!(&app.state, AppState::Kanban(v) if v.picker.is_some()) {
+        render_kanban_filter_modal(frame, app);
+    }
+
     if let Some(ref error) = app.error_message {
         render_error_popup(frame, error);
     }
@@ -623,6 +627,81 @@ fn render_preview_snapshot(frame: &mut Frame, inner: Rect, app: &App, empty_msg:
     }
 }
 
+/// Folder-filter picker: checkbox list over the board. Row 0 is the
+/// "(no folder)" bucket, then every known folder prefix (union of the
+/// live tree and the saved filter, so an absent-but-selected folder can
+/// still be unticked). Nothing ticked = no filter = every session shows.
+fn render_kanban_filter_modal(frame: &mut Frame, app: &App) {
+    let rows = app.kanban_filter_rows();
+    let selected_idx = app.kanban_picker_index(&rows);
+    let area = centered_rect(40, 60, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(Span::styled(
+            " filter folders ",
+            Style::default()
+                .fg(theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::MAUVE));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| {
+            let (ticked, label) = match row {
+                None => (app.kanban_filter.loose, "(no folder)".to_string()),
+                Some(prefix) => (
+                    app.kanban_filter.folders.iter().any(|f| f == prefix),
+                    format!("{}/", prefix),
+                ),
+            };
+            let mark = if ticked { "[x]" } else { "[ ]" };
+            ListItem::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    mark.to_string(),
+                    Style::default().fg(if ticked {
+                        theme::GREEN
+                    } else {
+                        theme::OVERLAY1
+                    }),
+                ),
+                Span::raw(" "),
+                Span::styled(label, Style::default().fg(theme::SUBTEXT1)),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(theme::SURFACE0)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▌");
+    let mut state = ListState::default();
+    state.select(Some(selected_idx));
+    frame.render_stateful_widget(list, chunks[0], &mut state);
+
+    let footer = if app.kanban_filter.is_active() {
+        "showing only ticked groups"
+    } else {
+        "nothing ticked — showing all sessions"
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {}", footer),
+            Style::default().fg(theme::OVERLAY1),
+        )),
+        chunks[1],
+    );
+}
+
 /// The board's session modal: a centered overlay hosting the live
 /// embedded PTY for the focused card. It exists only while embedded —
 /// `p`/Tab enters it directly in the writable state (no read-only
@@ -701,8 +780,34 @@ fn render_kanban(frame: &mut Frame, area: Rect, app: &App) {
         &app.kanban_config,
         &app.tree.sessions,
         &app.kanban_placements,
+        &app.kanban_filter,
     );
     let (focused_col, focused_card) = app.resolve_kanban_focus(&board);
+
+    // Active folder filter: carve a one-line summary bar off the top so
+    // it's impossible to mistake a filtered board for the whole picture.
+    // (Hidden while the picker overlay is open — the picker says it all.)
+    let picker_open = matches!(&app.state, AppState::Kanban(v) if v.picker.is_some());
+    let area = if app.kanban_filter.is_active() && !picker_open {
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).split(area);
+        let mut parts: Vec<String> = Vec::new();
+        if app.kanban_filter.loose {
+            parts.push("(no folder)".to_string());
+        }
+        parts.extend(app.kanban_filter.folders.iter().cloned());
+        let line = Line::from(vec![
+            Span::styled(
+                " filter: ",
+                Style::default().fg(theme::PEACH).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(parts.join(" + "), Style::default().fg(theme::SUBTEXT1)),
+            Span::styled("  — f to edit, c to clear", Style::default().fg(theme::OVERLAY1)),
+        ]);
+        frame.render_widget(Paragraph::new(line), rows[0]);
+        rows[1]
+    } else {
+        area
+    };
 
     let ncols = board.len();
     if ncols == 0 {
@@ -774,15 +879,34 @@ fn render_kanban(frame: &mut Frame, area: Rect, app: &App) {
             continue;
         }
 
-        let items: Vec<ListItem> = cards
-            .iter()
-            .filter_map(|&si| app.tree.session(si))
-            .map(|s| {
-                let is_current = matches!(s.machine, Machine::Local)
-                    && app.tree.current_session.as_deref() == Some(s.raw_name.as_str());
-                render_kanban_card(s, is_current)
-            })
-            .collect();
+        // Visual folder grouping, tree-style: a `▼ folder` header row
+        // before each folder's run of cards (the board sort keeps a
+        // folder's cards adjacent), cards inside a folder indented and
+        // showing only their leaf name, loose cards full-width below.
+        // Header rows are display-only — the cursor lives on cards, so
+        // the selected *card* index is mapped to its List item index.
+        let mut items: Vec<ListItem> = Vec::with_capacity(cards.len() * 2);
+        let mut highlight_item: Option<usize> = None;
+        let mut current_header: Option<&str> = None;
+        for (card_idx, &si) in cards.iter().enumerate() {
+            let Some(s) = app.tree.session(si) else {
+                continue;
+            };
+            match s.prefix.as_deref() {
+                Some(prefix) if current_header != Some(prefix) => {
+                    items.push(render_kanban_folder_header(prefix));
+                    current_header = Some(prefix);
+                }
+                Some(_) => {}
+                None => current_header = None,
+            }
+            if is_focused && card_idx == focused_card.min(cards.len() - 1) {
+                highlight_item = Some(items.len());
+            }
+            let is_current = matches!(s.machine, Machine::Local)
+                && app.tree.current_session.as_deref() == Some(s.raw_name.as_str());
+            items.push(render_kanban_card(s, s.prefix.is_some(), is_current));
+        }
         let list = List::new(items)
             .block(block)
             .highlight_style(
@@ -794,38 +918,59 @@ fn render_kanban(frame: &mut Frame, area: Rect, app: &App) {
 
         let mut state = ListState::default();
         if is_focused {
-            state.select(Some(focused_card.min(cards.len() - 1)));
+            state.select(highlight_item);
         }
         frame.render_stateful_widget(list, slots[slot], &mut state);
     }
 }
 
+/// Non-selectable folder header row inside a kanban column — the board's
+/// version of the tree's `▼ prefix` rows. Always "expanded": columns
+/// have no collapse, the chevron is purely the shared visual vocabulary.
+fn render_kanban_folder_header(prefix: &str) -> ListItem<'static> {
+    ListItem::new(Line::from(vec![
+        Span::raw(" "),
+        Span::styled("▼", Style::default().fg(theme::OVERLAY2)),
+        Span::raw(" "),
+        Span::styled(
+            prefix.to_string(),
+            Style::default()
+                .fg(theme::SUBTEXT1)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]))
+}
+
 /// Two-line card: the session name on the first line, its metadata (host,
 /// claude chip, `· here` marker) right underneath — the session-row
 /// vocabulary minus the per-row action chips, since actions on the board
-/// are global keys, not a cursor-cycled chip.
-fn render_kanban_card(session: &Session, is_current: bool) -> ListItem<'static> {
+/// are global keys, not a cursor-cycled chip. Cards inside a folder
+/// (`in_folder`) are indented under their header row and show only the
+/// leaf name, mirroring the tree.
+fn render_kanban_card(session: &Session, in_folder: bool, is_current: bool) -> ListItem<'static> {
     let dot = if session.attached { "●" } else { "○" };
     let dot_color = if session.attached {
         theme::GREEN
     } else {
         theme::OVERLAY1
     };
+    let indent = if in_folder { "   " } else { " " };
+    let display_name = if in_folder {
+        session.leaf.clone()
+    } else {
+        session.raw_name.clone()
+    };
 
     let name_line = Line::from(vec![
-        Span::raw(" "),
+        Span::raw(indent),
         Span::styled(dot.to_string(), Style::default().fg(dot_color)),
         Span::raw(" "),
-        // Full raw_name — folders don't exist on the board.
-        Span::styled(
-            session.raw_name.clone(),
-            Style::default().fg(theme::SUBTEXT1),
-        ),
+        Span::styled(display_name, Style::default().fg(theme::SUBTEXT1)),
     ]);
 
     // Metadata line, aligned under the name (past the dot column).
     let mut meta_spans: Vec<Span<'static>> = vec![
-        Span::raw("   "),
+        Span::raw(if in_folder { "     " } else { "   " }),
         Span::styled(
             session.machine.label().to_string(),
             Style::default().fg(machine_color(&session.machine)),
@@ -1170,6 +1315,17 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let help_text = match app.state {
+        AppState::Kanban(ref view) if view.picker.is_some() => vec![
+            Span::raw(" "),
+            key("↑↓/jk"),
+            txt(" nav  "),
+            key("␣/⏎"),
+            txt(" toggle  "),
+            key("c"),
+            txt(" clear filter  "),
+            key("Esc/f"),
+            txt(" close"),
+        ],
         AppState::Kanban(_) => vec![
             Span::raw(" "),
             key("←→/hl"),
@@ -1182,6 +1338,8 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
             txt(" attach  "),
             key("p/Tab"),
             txt(" open session  "),
+            key("f"),
+            txt(" filter  "),
             key("r"),
             txt(" refresh  "),
             key("K/q/Esc"),
