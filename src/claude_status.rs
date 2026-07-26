@@ -79,9 +79,11 @@ pub enum Provenance {
 /// deliberately excluded.
 ///
 /// `model` is the alias Claude Code reports for the session — e.g.
-/// `claude-opus-4-7` for the 200k default or `claude-opus-4-7[1m]` for the
-/// 1M-context variant. `context_window_pct` reads the `[1m]` suffix to
-/// pick the right divisor.
+/// `claude-opus-4-8` or `claude-haiku-4-5-20251001`. `context_window_pct`
+/// maps the model *family* to the right context-window size (all current
+/// Claude models are 1M-context except Haiku, which is 200K); the `[1m]`
+/// suffix Claude Code sometimes appends is only used as a backstop for
+/// model strings whose family we don't recognize.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextUsage {
     pub tokens: u64,
@@ -112,23 +114,46 @@ pub struct Reading {
 /// Mirror Claude Code's own status-line indicator: percentage of the model's
 /// full context window currently occupied by the latest assistant turn's
 /// input. Clamped to 100 so a near-overflow session reads `100%` instead of
-/// `247%` while we wait for SessionStart to write a corrected model alias.
+/// `247%`.
 ///
-/// 1M detection: the v3 SessionStart hook captures Claude Code's `model`
-/// field verbatim, which carries the literal `[1m]` suffix for 1M-context
-/// runs (https://code.claude.com/docs/en/model-config). If we haven't seen
-/// a SessionStart yet (session predates the v3 install), we fall back to
-/// 200k and silently bump to 1M when observed tokens exceed it — that
-/// can't be a false positive because no 200k session can produce >200k
-/// tokens.
+/// Window sizing is by **model family**, not by the `[1m]` marker. Every
+/// current Claude model is 1M-context *except* Haiku 4.5 (200K). The `[1m]`
+/// suffix is a Claude Code harness marker (present only on some runs) rather
+/// than a model tier, so keying the divisor on it under-reported ~5x for the
+/// common case of a 1M model whose status file dropped the suffix and was
+/// sitting under 200K tokens. See `context_window_size` for the mapping.
 pub fn context_window_pct(usage: &ContextUsage) -> u8 {
-    let window: u64 = if usage.model.contains("[1m]") || usage.tokens > 200_000 {
+    let window = context_window_size(&usage.model, usage.tokens);
+    let pct = (usage.tokens.saturating_mul(100) / window).min(100);
+    pct as u8
+}
+
+/// Pick the full context-window size (tokens) for a Claude `model` alias.
+///
+/// Family lookup, in priority order:
+/// - any `haiku` model => 200_000 (the only 200K-context current model)
+/// - `opus` / `sonnet` / `fable` => 1_000_000
+/// - otherwise (unrecognized model string) fall back to the legacy
+///   heuristics: a literal `[1m]` marker or an already-observed token count
+///   above 200K => 1_000_000; else the conservative 200_000.
+///
+/// The fallback exists so a genuinely unknown model alias can never
+/// *under*-report — an unrecognized 1M model still bumps to 1M as soon as
+/// its usage crosses 200K, exactly as the old `[1m]`/overflow heuristic did.
+pub fn context_window_size(model: &str, tokens: u64) -> u64 {
+    let m = model.to_ascii_lowercase();
+    if m.contains("haiku") {
+        return 200_000;
+    }
+    if m.contains("opus") || m.contains("sonnet") || m.contains("fable") {
+        return 1_000_000;
+    }
+    // Unknown family: backstops only.
+    if m.contains("[1m]") || tokens > 200_000 {
         1_000_000
     } else {
         200_000
-    };
-    let pct = (usage.tokens.saturating_mul(100) / window).min(100);
-    pct as u8
+    }
 }
 
 /// Read every `*.json` file under `~/.cache/ade/claude-status/` and return a
@@ -492,10 +517,11 @@ mod tests {
     }
 
     #[test]
-    fn context_window_pct_200k_baseline() {
+    fn context_window_pct_200k_baseline_haiku() {
+        // Haiku is the only 200K-context current model. 50k / 200k = 25%.
         let usage = ContextUsage {
             tokens: 50_000,
-            model: "claude-opus-4-7".to_string(),
+            model: "claude-haiku-4-5-20251001".to_string(),
             session_id: "x".to_string(),
         };
         assert_eq!(context_window_pct(&usage), 25);
@@ -508,16 +534,14 @@ mod tests {
             model: "claude-opus-4-7[1m]".to_string(),
             session_id: "x".to_string(),
         };
-        // 200k / 1M = 20%, NOT 100% — the suffix flips the divisor.
+        // 200k / 1M = 20%, NOT 100% — opus is a 1M family.
         assert_eq!(context_window_pct(&usage), 20);
     }
 
     #[test]
     fn context_window_pct_1m_via_overflow_heuristic() {
         // No `[1m]` suffix on the model, but tokens already exceed 200k.
-        // The only way that's possible is a 1M session whose status file
-        // was written before SessionStart fired with the correct alias.
-        // Fall back to 1M so the chip doesn't get stuck at 100%.
+        // opus is a 1M family, so this divides by 1M regardless.
         let usage = ContextUsage {
             tokens: 350_000,
             model: "claude-opus-4-7".to_string(),
@@ -534,6 +558,87 @@ mod tests {
             session_id: "x".to_string(),
         };
         assert_eq!(context_window_pct(&usage), 100);
+    }
+
+    // --- Model-family denominator fix (Deliverable A) ---
+    //
+    // Regression coverage for the bug where a 1M-context model under 200K
+    // tokens was divided by 200K (over-reporting ~5x) because the `[1m]`
+    // marker is dropped in most real status files. Window is now chosen by
+    // model family: haiku => 200K, opus/sonnet/fable => 1M, unknown =>
+    // legacy `[1m]`/overflow backstop.
+
+    fn usage_at(model: &str, tokens: u64) -> ContextUsage {
+        ContextUsage {
+            tokens,
+            model: model.to_string(),
+            session_id: "x".to_string(),
+        }
+    }
+
+    #[test]
+    fn context_window_pct_opus_no_suffix_under_200k_is_family_1m() {
+        // The core bug: 150K on a real 1M opus with NO `[1m]` suffix must
+        // read 15%, not the old buggy ~75% (150k/200k).
+        assert_eq!(
+            context_window_pct(&usage_at("claude-opus-4-8", 150_000)),
+            15
+        );
+    }
+
+    #[test]
+    fn context_window_pct_opus_with_suffix_under_200k_matches_no_suffix() {
+        // Suffix present or not, the family drives the divisor: same 15%.
+        assert_eq!(
+            context_window_pct(&usage_at("claude-opus-4-8[1m]", 150_000)),
+            15
+        );
+    }
+
+    #[test]
+    fn context_window_pct_opus_high_tokens_stays_correct() {
+        // This case was already correct under the old code (overflow
+        // heuristic) and must STAY correct: 950k / 1M = 95%.
+        assert_eq!(
+            context_window_pct(&usage_at("claude-opus-4-8", 950_000)),
+            95
+        );
+    }
+
+    #[test]
+    fn context_window_pct_sonnet_and_fable_are_1m() {
+        // Both real families seen in the wild; both 1M.
+        assert_eq!(
+            context_window_pct(&usage_at("claude-sonnet-4-6", 150_000)),
+            15
+        );
+        assert_eq!(context_window_pct(&usage_at("claude-fable-5", 150_000)), 15);
+    }
+
+    #[test]
+    fn context_window_pct_haiku_is_200k() {
+        // Haiku 4.5 is genuinely 200K: 150k / 200k = 75%.
+        assert_eq!(
+            context_window_pct(&usage_at("claude-haiku-4-5-20251001", 150_000)),
+            75
+        );
+    }
+
+    #[test]
+    fn context_window_pct_unknown_model_backstop() {
+        // Unrecognized family: fall back to the conservative 200K default
+        // below the overflow threshold (150k/200k = 75%)...
+        assert_eq!(
+            context_window_pct(&usage_at("some-future-model", 150_000)),
+            75
+        );
+        // ...but bump to 1M once tokens exceed 200K so it can't get stuck
+        // at 100% (300k/1M = 30%). This preserves the old anti-under-report
+        // safety for genuinely unknown strings.
+        assert_eq!(
+            context_window_pct(&usage_at("some-future-model", 300_000)),
+            30
+        );
     }
 
     #[test]

@@ -82,6 +82,7 @@ impl TmuxBackend for LocalTmux {
                 s.claude_demoted = rollup.demoted;
                 s.claude_present = rollup.present;
                 s.claude_context_pct = rollup.context_pct;
+                s.claude_usage = rollup.context_usage.clone();
             }
         }
 

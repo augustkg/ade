@@ -198,7 +198,21 @@ Press these from inside any tmux session that has ADE's tmux config sourced:
 | `ade kanban move <column> [--session S]` | Move a session's kanban card to a manual column (defaults to the tmux session it runs inside) |
 | `ade kanban clear [--session S]` | Return a session's card to the automatic columns |
 | `ade debug claude [--host H]` | Diagnose Claude detection per pane (shows `· NN%` per session) |
+| `ade sessions --json [--local]` | Print the full cross-host session inventory as JSON (stdout) |
+| `ade status --json [--local]` | Print a Claude monitor summary (totals, worst context %, sessions needing you) as JSON |
 | `ade help` | Show usage |
+
+### JSON output (`--json`)
+
+`ade sessions --json` and `ade status --json` are non-interactive: they reuse the
+same cross-host collection the TUI uses (local + every configured host; add
+`--local` to skip remote polling), print JSON to **stdout**, send any logs or
+per-host errors to **stderr**, and exit 0 on success. They're the stable
+contract other tools build on — see the module docs in `src/json_out.rs` for the
+full schema.
+
+- `sessions --json` → `{ sessions: [ { machine, name, prefix, leaf, session_id, windows, attached, claude: { state, context_pct, model, ctx_tokens, session_id } | null } ], errors: [ { machine, error } ] }`
+- `status --json` → `{ totals: { sessions, working, idle, awaiting_approval }, worst_context_pct, needs_you: [ { machine, name, session_id } ], sessions: [ { machine, name, session_id, state, context_pct } ], errors }`
 
 ## Config files
 

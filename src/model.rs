@@ -74,17 +74,25 @@ pub struct Session {
     pub claude_context_pct: Option<u8>,
 }
 
+/// Split a raw tmux session name into `(folder_prefix, leaf)` on the first
+/// `/`. Folder/leaf separator is `/`: tmux silently rewrites `:` and `.` in
+/// session names, so `:` is unusable as a grouping convention; `/` passes
+/// through untouched. A name with no `/` (or an empty side) is all-leaf.
+///
+/// Shared by `Session::from_tmux` (TUI tree grouping) and `json_out` (the
+/// `prefix`/`leaf` fields of `ade sessions --json`) so both split identically.
+pub fn split_prefix_leaf(name: &str) -> (Option<String>, String) {
+    match name.split_once('/') {
+        Some((p, l)) if !p.is_empty() && !l.is_empty() => {
+            (Some(p.to_string()), l.to_string())
+        }
+        _ => (None, name.to_string()),
+    }
+}
+
 impl Session {
     pub fn from_tmux(s: tmux::Session, machine: Machine) -> Self {
-        // Folder/leaf separator is `/`. tmux silently rewrites `:` and `.`
-        // in session names, so `:` is unusable as a grouping convention; `/`
-        // passes through untouched.
-        let (prefix, leaf) = match s.name.split_once('/') {
-            Some((p, l)) if !p.is_empty() && !l.is_empty() => {
-                (Some(p.to_string()), l.to_string())
-            }
-            _ => (None, s.name.clone()),
-        };
+        let (prefix, leaf) = split_prefix_leaf(&s.name);
         Self {
             raw_name: s.name,
             session_id: s.session_id,
