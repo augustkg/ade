@@ -14,6 +14,12 @@
 //! additively; do not rename or repurpose existing ones. `serde_json`
 //! preserves declaration order, so the field order here is the wire order.
 //!
+//! Consumers MUST parse this stream with a strict JSON parser. `serde_json`
+//! does not escape the U+2028 / U+2029 line separators, which are valid in
+//! JSON strings but are line terminators in JavaScript source; a hostile tmux
+//! session name containing one could break a naive JS `eval` or `<script>`
+//! embed of the payload. This is a downstream-robustness note, not an ADE bug.
+//!
 //! ## `ade sessions --json`
 //!
 //! ```json
@@ -37,10 +43,17 @@
 //!     }
 //!   ],
 //!   "errors": [                      // per-host collection failures (never dropped)
-//!     { "machine": "web", "error": "web unreachable" }
+//!     { "machine": "web", "error": "unreachable" }
 //!   ]
 //! }
 //! ```
+//!
+//! `errors[].error` is an **enumerated reason**, not the raw failure text:
+//! one of `"unreachable" | "auth_failed" | "tmux_error" | "timeout" |
+//! "error"`. The raw per-host string (for remote hosts, the first line of SSH
+//! stderr) can carry the internal hostname / IP / username, so it is
+//! classified down to a coarse reason before it reaches the wire; the friendly
+//! host label stays in `machine`. The field name `error` is unchanged.
 //!
 //! `claude` is present whenever the session has a Claude pane (working, idle,
 //! or awaiting approval). `state` is `"idle"` for a Claude sitting at the
@@ -66,7 +79,7 @@
 //!     { "machine": "local", "name": "archie/api", "session_id": "$3",
 //!       "state": "working", "context_pct": 15 }
 //!   ],
-//!   "errors": [ { "machine": "web", "error": "web unreachable" } ]
+//!   "errors": [ { "machine": "web", "error": "unreachable" } ]
 //! }
 //! ```
 //!
@@ -194,12 +207,46 @@ fn claude_dto(s: &TmuxSession) -> Option<ClaudeDto> {
     })
 }
 
+/// Map a raw per-host error string (often the first line of SSH stderr, which
+/// can contain the real internal hostname / IP / username) to a coarse,
+/// enumerated reason. This keeps the raw target out of the JSON feed while the
+/// `machine` field still carries the *friendly* host label. Matching is
+/// case-insensitive and self-contained; the return value never echoes any part
+/// of the input.
+fn classify_error_reason(raw: &str) -> &'static str {
+    let r = raw.to_ascii_lowercase();
+    if r.contains("permission denied") || r.contains("publickey") || r.contains("authentication") {
+        "auth_failed"
+    } else if r.contains("no route")
+        || r.contains("connection refused")
+        || r.contains("timed out")
+        || r.contains("could not resolve")
+        || r.contains("name or service not known")
+        || r.contains("unreachable")
+    {
+        "unreachable"
+    } else if r.contains("no server running")
+        || r.contains("no sessions")
+        || r.contains("no current session")
+        || r.contains("tmux")
+    {
+        "tmux_error"
+    } else if r.contains("timeout") {
+        "timeout"
+    } else {
+        "error"
+    }
+}
+
 fn errors_dto(errors: &[(Machine, String)]) -> Vec<HostErrorDto> {
     errors
         .iter()
         .map(|(machine, error)| HostErrorDto {
             machine: machine.title_label().to_string(),
-            error: error.clone(),
+            // Never emit the raw error text: for remote hosts it is SSH stderr
+            // and leaks the internal hostname / IP / user. The friendly label
+            // lives in `machine`; the wire value is an enumerated reason only.
+            error: classify_error_reason(error).to_string(),
         })
         .collect()
 }
@@ -477,7 +524,68 @@ mod tests {
         let out = build_sessions_output(&[], &errs);
         let v = serde_json::to_value(&out).unwrap();
         assert_eq!(v["errors"][0]["machine"], "web");
-        assert_eq!(v["errors"][0]["error"], "web unreachable");
+        // The raw string is sanitized to an enumerated reason on the wire.
+        assert_eq!(v["errors"][0]["error"], "unreachable");
+    }
+
+    #[test]
+    fn classify_error_reason_maps_representative_strings() {
+        // Auth failures (case-insensitive), incl. real SSH stderr shapes.
+        assert_eq!(
+            classify_error_reason("user@10.0.3.14: Permission denied (publickey)."),
+            "auth_failed"
+        );
+        assert_eq!(
+            classify_error_reason("Authentication failed."),
+            "auth_failed"
+        );
+        // Unreachable variants.
+        assert_eq!(
+            classify_error_reason("ssh: connect to host int-box.corp port 22: No route to host"),
+            "unreachable"
+        );
+        assert_eq!(
+            classify_error_reason("connect to host 10.0.3.14 port 22: Connection refused"),
+            "unreachable"
+        );
+        assert_eq!(
+            classify_error_reason("ssh: Could not resolve hostname int-box.corp"),
+            "unreachable"
+        );
+        assert_eq!(
+            classify_error_reason("connect to host int-box.corp port 22: Connection timed out"),
+            "unreachable"
+        );
+        // tmux-side errors.
+        assert_eq!(
+            classify_error_reason("no server running on /tmp/tmux-1000/default"),
+            "tmux_error"
+        );
+        assert_eq!(classify_error_reason("no sessions"), "tmux_error");
+        // Explicit timeout wording (not the "timed out" connection phrase).
+        assert_eq!(
+            classify_error_reason("host poll exceeded timeout"),
+            "timeout"
+        );
+        // Anything unrecognized falls back to the generic reason.
+        assert_eq!(classify_error_reason("weird unexpected failure"), "error");
+    }
+
+    #[test]
+    fn classify_error_reason_never_leaks_host_ip_or_user() {
+        // A realistic SSH auth failure carrying an internal IP and username.
+        let raw = "user@10.0.3.14: Permission denied (publickey).";
+        let reason = classify_error_reason(raw);
+        assert_eq!(reason, "auth_failed");
+        assert!(!reason.contains("10.0.3.14"), "must not leak the IP");
+        assert!(!reason.contains("user@"), "must not leak the user");
+
+        // Same guarantee for an internal hostname in an unreachable error.
+        let raw2 = "ssh: connect to host int-box.corp port 22: No route to host";
+        let reason2 = classify_error_reason(raw2);
+        assert_eq!(reason2, "unreachable");
+        assert!(!reason2.contains("int-box.corp"), "must not leak the host");
+        assert!(!reason2.contains("22"), "must not leak the port");
     }
 
     #[test]
