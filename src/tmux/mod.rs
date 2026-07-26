@@ -405,13 +405,16 @@ mod claude_rollup_tests {
                 ClaudeState::Idle,
                 Some(ContextUsage {
                     tokens: 50_000,
-                    model: "claude-opus-4-7".to_string(),
+                    // Haiku is a real 200K model, so 50k => 25%. (An opus
+                    // alias here would be 5% now that the divisor is
+                    // family-based — see claude_status::context_window_size.)
+                    model: "claude-haiku-4-5-20251001".to_string(),
                     session_id: "s".to_string(),
                 }),
             ),
         );
         let out = map_claude_states(&panes, &statuses, &HashSet::new());
         let rollup = out.get("sess").expect("rollup");
-        assert_eq!(rollup.context_pct, Some(25), "50k of 200k = 25%");
+        assert_eq!(rollup.context_pct, Some(25), "50k of 200k (haiku) = 25%");
     }
 }
