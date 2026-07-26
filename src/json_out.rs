@@ -38,6 +38,7 @@
 //!         "context_pct": 15,         // 0..=100, or null if no usage seen yet
 //!         "model": "claude-opus-4-8",// or null
 //!         "ctx_tokens": 150000,      // latest-turn input+cache tokens, or null
+//!         "ctx_window": 1000000,     // model's full context window (tokens), or null
 //!         "session_id": "c7d9-..."   // Claude session UUID, or null
 //!       }
 //!     }
@@ -57,9 +58,12 @@
 //!
 //! `claude` is present whenever the session has a Claude pane (working, idle,
 //! or awaiting approval). `state` is `"idle"` for a Claude sitting at the
-//! prompt. `context_pct`/`model`/`ctx_tokens`/`session_id` are `null` when no
-//! status file with usage data has been written yet (legacy hook, or no
-//! assistant turn has happened).
+//! prompt. `context_pct`/`model`/`ctx_tokens`/`ctx_window`/`session_id` are
+//! `null` when no status file with usage data has been written yet (legacy
+//! hook, or no assistant turn has happened). `ctx_window` is the full
+//! context-window size (tokens) ADE divides `ctx_tokens` by to get
+//! `context_pct`; it is exposed so consumers can compute headroom
+//! (`ctx_window - ctx_tokens`) without hard-coding per-model window sizes.
 //!
 //! ## `ade status --json`
 //!
@@ -94,7 +98,7 @@
 
 use serde::Serialize;
 
-use crate::claude_status::ClaudeState;
+use crate::claude_status::{context_window_size, ClaudeState};
 use crate::hosts::Config;
 use crate::model::{split_prefix_leaf, Machine};
 use crate::refresh::{refresh_all, RefreshResult};
@@ -115,6 +119,7 @@ pub struct ClaudeDto {
     pub context_pct: Option<u8>,
     pub model: Option<String>,
     pub ctx_tokens: Option<u64>,
+    pub ctx_window: Option<u64>,
     pub session_id: Option<String>,
 }
 
@@ -190,19 +195,21 @@ fn claude_dto(s: &TmuxSession) -> Option<ClaudeDto> {
         return None;
     }
     let state = s.claude.map(state_str).unwrap_or("idle");
-    let (model, ctx_tokens, session_id) = match &s.claude_usage {
+    let (model, ctx_tokens, ctx_window, session_id) = match &s.claude_usage {
         Some(u) => (
             Some(u.model.clone()),
             Some(u.tokens),
+            Some(context_window_size(&u.model, u.tokens)),
             Some(u.session_id.clone()),
         ),
-        None => (None, None, None),
+        None => (None, None, None, None),
     };
     Some(ClaudeDto {
         state,
         context_pct: s.claude_context_pct,
         model,
         ctx_tokens,
+        ctx_window,
         session_id,
     })
 }
@@ -501,6 +508,8 @@ mod tests {
         assert_eq!(api["claude"]["context_pct"], 15);
         assert_eq!(api["claude"]["model"], "claude-opus-4-8");
         assert_eq!(api["claude"]["ctx_tokens"], 150_000);
+        // opus is a 1M-context family, so the window is 1M and 150k/1M = 15%.
+        assert_eq!(api["claude"]["ctx_window"], 1_000_000);
         assert_eq!(api["claude"]["session_id"], "c7d9-uuid");
 
         // Plain shell: null claude, null prefix.
@@ -641,7 +650,32 @@ mod tests {
         assert_eq!(claude["state"], "idle");
         assert!(claude["model"].is_null());
         assert!(claude["ctx_tokens"].is_null());
+        assert!(claude["ctx_window"].is_null());
         assert!(claude["session_id"].is_null());
         assert!(claude["context_pct"].is_null());
+    }
+
+    #[test]
+    fn sessions_ctx_window_reflects_model_family() {
+        // ctx_window exposes the denominator ADE uses for context_pct, keyed by
+        // model family: Haiku is 200K-context, opus/sonnet/fable are 1M. This
+        // lets a consumer compute headroom without a per-model table of its own.
+        let haiku = with_claude(
+            sess("h", "$7"),
+            Some(ClaudeState::Working),
+            Some(50),
+            Some(usage("claude-haiku-4-5-20251001", 100_000, "hk-uuid")),
+        );
+        let opus = with_claude(
+            sess("o", "$8"),
+            Some(ClaudeState::Working),
+            Some(10),
+            Some(usage("claude-opus-4-8", 100_000, "op-uuid")),
+        );
+        let pm = vec![(Machine::Local, vec![haiku, opus])];
+        let out = build_sessions_output(&pm, &[]);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["sessions"][0]["claude"]["ctx_window"], 200_000);
+        assert_eq!(v["sessions"][1]["claude"]["ctx_window"], 1_000_000);
     }
 }

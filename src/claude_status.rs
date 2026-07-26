@@ -140,7 +140,7 @@ pub fn context_window_pct(usage: &ContextUsage) -> u8 {
 /// The fallback exists so a genuinely unknown model alias can never
 /// *under*-report — an unrecognized 1M model still bumps to 1M as soon as
 /// its usage crosses 200K, exactly as the old `[1m]`/overflow heuristic did.
-fn context_window_size(model: &str, tokens: u64) -> u64 {
+pub fn context_window_size(model: &str, tokens: u64) -> u64 {
     let m = model.to_ascii_lowercase();
     if m.contains("haiku") {
         return 200_000;
