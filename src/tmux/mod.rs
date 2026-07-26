@@ -1,7 +1,7 @@
 pub mod local;
 pub mod remote;
 
-use crate::claude_status::{self, ClaudeState, Provenance, Reading};
+use crate::claude_status::{self, ClaudeState, ContextUsage, Provenance, Reading};
 use crate::hosts::Host;
 use crate::model::Machine;
 
@@ -39,11 +39,21 @@ pub struct Session {
     /// hasn't fired yet (legacy v2 install, or Claude session started
     /// before its first assistant turn).
     pub claude_context_pct: Option<u8>,
+    /// Full token-usage snapshot (model alias, token count, Claude session
+    /// UUID) for the pane that produced `claude_context_pct`. Carried
+    /// alongside the percentage purely so the non-interactive JSON output
+    /// (`ade sessions --json` / `ade status --json`) can surface the raw
+    /// numbers; the TUI itself only renders the percentage. `None` whenever
+    /// `claude_context_pct` is `None`.
+    pub claude_usage: Option<ContextUsage>,
 }
 
 /// Per-session rollup of every Claude pane in that session — produced by
 /// `map_claude_states` and merged into `Session` fields by the backend.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+///
+/// Not `Copy`: `context_usage` owns `String`s. It's only ever read by
+/// reference out of the per-session map, so `Clone` is sufficient.
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ClaudeRollup {
     pub state: Option<ClaudeState>,
     pub demoted: bool,
@@ -58,6 +68,10 @@ pub struct ClaudeRollup {
     /// data (legacy v2 hook install, or no assistant turn has happened
     /// yet). Used by the UI to render `claude · NN%`.
     pub context_pct: Option<u8>,
+    /// Usage snapshot of the pane that produced `context_pct` (the highest
+    /// one). Kept so the JSON output can report `model` / `ctx_tokens` /
+    /// Claude `session_id`. Moves in lockstep with `context_pct`.
+    pub context_usage: Option<ContextUsage>,
 }
 
 pub trait TmuxBackend {
@@ -165,6 +179,7 @@ pub(crate) fn parse_session_line(line: &str) -> Option<Session> {
             claude_demoted: false,
             claude_present: false,
             claude_context_pct: None,
+            claude_usage: None,
         })
     } else {
         None
@@ -292,10 +307,18 @@ pub(crate) fn map_claude_states(
         // nothing.
         if let Some(usage) = reading.usage.as_ref() {
             let pct = claude_status::context_window_pct(usage);
+            // Capture the usage snapshot of whichever pane wins the max, so
+            // the JSON output's model/ctx_tokens/session_id line up with the
+            // percentage the UI shows (`>=` keeps the later pane on a tie —
+            // arbitrary but deterministic given map insertion isn't ordered).
+            let take = entry.context_pct.map(|cur| pct >= cur).unwrap_or(true);
             entry.context_pct = Some(match entry.context_pct {
                 Some(cur) => cur.max(pct),
                 None => pct,
             });
+            if take {
+                entry.context_usage = Some(usage.clone());
+            }
         }
     }
     out

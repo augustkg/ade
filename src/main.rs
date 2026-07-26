@@ -9,6 +9,7 @@ mod embedded_term;
 mod hosts;
 mod install_hooks;
 mod install_tmux;
+mod json_out;
 mod kanban;
 mod model;
 mod notifications;
@@ -48,6 +49,11 @@ fn main() -> Result<()> {
             "install-tmux-config" => return run_install_tmux(&argv[2..]),
             "debug" => return run_debug(&argv[2..]),
             "kanban" => return run_kanban(&argv[2..]),
+            // Non-interactive JSON inventory / monitor summary. Both diverge
+            // (print to stdout and `std::process::exit`) — they never start
+            // the TUI and never return.
+            "sessions" => json_out::run_sessions(&argv[2..]),
+            "status" => json_out::run_status(&argv[2..]),
             "--help" | "-h" | "help" => {
                 print_usage();
                 return Ok(());
@@ -95,6 +101,8 @@ fn print_usage() {
          \x20\x20ade debug claude [--host H]            Diagnose why ADE does/doesn't see Claude per pane\n\
          \x20\x20ade kanban move <column> [--session S] Move a session's kanban card to a manual column\n\
          \x20\x20ade kanban clear [--session S]         Return a session's card to the automatic columns\n\
+         \x20\x20ade sessions --json [--local]          Print the full cross-host session inventory as JSON\n\
+         \x20\x20ade status --json [--local]            Print a Claude monitor summary as JSON\n\
          \x20\x20ade help                               Show this message\n\
          \n\
          `ade kanban` defaults to the tmux session it runs inside — so a Claude Code\n\
