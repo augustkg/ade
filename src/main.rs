@@ -13,7 +13,9 @@ mod json_out;
 mod kanban;
 mod model;
 mod notifications;
+mod peek;
 mod preview_pane;
+mod prompt_snapshot;
 mod refresh;
 mod ssh_io;
 mod state;
@@ -54,6 +56,9 @@ fn main() -> Result<()> {
             // the TUI and never return.
             "sessions" => json_out::run_sessions(&argv[2..]),
             "status" => json_out::run_status(&argv[2..]),
+            // Local-only: what is a session asking + a transcript recap, for
+            // the HUD. Diverges (prints + exits) like sessions/status.
+            "peek" => peek::run_peek(&argv[2..]),
             "--help" | "-h" | "help" => {
                 print_usage();
                 return Ok(());
@@ -103,6 +108,7 @@ fn print_usage() {
          \x20\x20ade kanban clear [--session S]         Return a session's card to the automatic columns\n\
          \x20\x20ade sessions --json [--local]          Print the full cross-host session inventory as JSON\n\
          \x20\x20ade status --json [--local]            Print a Claude monitor summary as JSON\n\
+         \x20\x20ade peek <session> --json              Print what a local session is asking + a transcript recap\n\
          \x20\x20ade help                               Show this message\n\
          \n\
          `ade kanban` defaults to the tmux session it runs inside — so a Claude Code\n\
