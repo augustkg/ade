@@ -33,6 +33,7 @@
 //!       "session_id": "$3",          // tmux #{session_id} (stable across rename)
 //!       "windows": 2,
 //!       "attached": false,
+//!       "last_activity": 1785000000, // unix secs of last session activity, or null
 //!       "claude": {                  // null when no Claude pane in the session
 //!         "state": "working",        // "working" | "idle" | "awaiting_approval"
 //!         "context_pct": 15,         // 0..=100, or null if no usage seen yet
@@ -133,6 +134,9 @@ pub struct SessionDto {
     pub session_id: String,
     pub windows: u32,
     pub attached: bool,
+    /// Unix seconds of the session's last activity (tmux `#{session_activity}`),
+    /// or null when unavailable. Lets consumers order most-recently-used first.
+    pub last_activity: Option<u64>,
     pub claude: Option<ClaudeDto>,
 }
 
@@ -278,6 +282,7 @@ pub fn build_sessions_output(
                 session_id: s.session_id.clone(),
                 windows: s.windows,
                 attached: s.attached,
+                last_activity: s.last_activity,
                 claude: claude_dto(s),
             });
         }
@@ -437,6 +442,7 @@ mod tests {
             session_id: sid.to_string(),
             windows: 1,
             attached: false,
+            last_activity: None,
             claude: None,
             claude_demoted: false,
             claude_present: false,
@@ -522,6 +528,21 @@ mod tests {
         let deploy = &sessions[2];
         assert_eq!(deploy["machine"], "web");
         assert_eq!(deploy["claude"]["state"], "awaiting_approval");
+    }
+
+    #[test]
+    fn sessions_output_carries_last_activity() {
+        // last_activity flows from tmux #{session_activity} straight to the wire
+        // so the HUD can order most-recently-used first.
+        let mut s = sess("archie/api", "$3");
+        s.last_activity = Some(1_785_000_000);
+        let out = build_sessions_output(&[(Machine::Local, vec![s])], &[]);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["sessions"][0]["last_activity"], 1_785_000_000u64);
+        // Absent on a session with no activity data.
+        let out2 = build_sessions_output(&[(Machine::Local, vec![sess("x", "$9")])], &[]);
+        let v2 = serde_json::to_value(&out2).unwrap();
+        assert!(v2["sessions"][0]["last_activity"].is_null());
     }
 
     #[test]

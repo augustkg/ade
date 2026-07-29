@@ -7,7 +7,7 @@ use std::process::Command;
 pub struct LocalTmux;
 
 const LIST_FORMAT: &str =
-    "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_id}";
+    "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_id}\t#{session_activity}";
 const PANE_FORMAT: &str =
     "#{session_name}\t#{pane_current_command}\t#{pane_id}\t#{pane_pid}\t#{session_id}";
 

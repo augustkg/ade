@@ -53,7 +53,7 @@ const REMOTE_LIST_CMD: &str = concat!(
     // connecting to` TOGETHER WITH `No such file or directory` —
     // `error connecting to` alone also covers Permission denied /
     // Connection refused, which are real failures.
-    "ls_out=$(tmux list-sessions -F '#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_id}' 2>&1); ls_code=$?; ",
+    "ls_out=$(tmux list-sessions -F '#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_id}\t#{session_activity}' 2>&1); ls_code=$?; ",
     "if [ \"$ls_code\" -eq 0 ]; then echo '---ADE-LS-OK---'; printf '%s\\n' \"$ls_out\"; ",
     "elif printf '%s' \"$ls_out\" | grep -q 'no server running'; then echo '---ADE-LS-OK---'; ",
     "elif printf '%s' \"$ls_out\" | grep -q 'error connecting to' && printf '%s' \"$ls_out\" | grep -q 'No such file or directory'; then echo '---ADE-LS-OK---'; ",
