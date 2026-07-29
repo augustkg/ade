@@ -16,6 +16,11 @@ pub struct Session {
     pub session_id: String,
     pub windows: u32,
     pub attached: bool,
+    /// tmux's `#{session_activity}` — unix seconds of the session's most
+    /// recent activity (any pane output/input). Surfaced so consumers (the
+    /// HUD) can order sessions most-recently-used first. `None` when the
+    /// backend's list format omits the column or it fails to parse.
+    pub last_activity: Option<u64>,
     /// `Some(state)` when at least one pane in this session has `claude` as
     /// its foreground process AND that pane's status file says it's
     /// `Working` or `AwaitingApproval`. Populated by the backend after
@@ -175,6 +180,9 @@ pub(crate) fn parse_session_line(line: &str) -> Option<Session> {
             windows: parts[1].parse().unwrap_or(0),
             attached: parts[2] == "1",
             session_id: parts[3].to_string(),
+            // Optional 5th column (`#{session_activity}`); backends on the
+            // older 4-field format leave it absent → None.
+            last_activity: parts.get(4).and_then(|s| s.parse::<u64>().ok()),
             claude: None,
             claude_demoted: false,
             claude_present: false,
