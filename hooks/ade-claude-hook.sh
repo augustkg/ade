@@ -43,6 +43,32 @@ DIR="$HOME/.cache/ade/claude-status"
 mkdir -p "$DIR" || exit 0
 CURRENT_FILE="$DIR/$PANE.json"
 
+# ── Prompt snapshot (isolated content dir, awaiting_approval only) ─────────
+# When Claude asks for approval, snapshot the visible pane so the HUD can show
+# WHAT is being asked — not just the "awaiting_approval" label. Written to a
+# SEPARATE dir from the status metadata so session *content* can be locked
+# down or wiped on its own. Raw text only (no `-e`, so escapes are dropped at
+# the source); `ade peek` sanitises + parses. Bounded to the last 8 KiB so a
+# huge pane can't bloat the cache. On any non-awaiting state the prompt is
+# answered/gone, so the stale snapshot is removed — freshness is thus tied to
+# the same hook that drives state: a snapshot exists iff the pane is (as of
+# the last hook) awaiting. This runs before the seq-race logic below so a
+# permission prompt is always captured regardless of the status-file tiebreak.
+PROMPT_DIR="$HOME/.cache/ade/claude-prompt"
+PROMPT_FILE="$PROMPT_DIR/$PANE.txt"
+if [ "$STATE" = "awaiting_approval" ]; then
+    if mkdir -p "$PROMPT_DIR" 2>/dev/null; then
+        PTMP="$PROMPT_FILE.tmp.$$"
+        if tmux capture-pane -p -t "$PANE" 2>/dev/null | tail -c 8192 > "$PTMP" 2>/dev/null && [ -s "$PTMP" ]; then
+            mv "$PTMP" "$PROMPT_FILE" 2>/dev/null || rm -f "$PTMP" 2>/dev/null
+        else
+            rm -f "$PTMP" 2>/dev/null
+        fi
+    fi
+else
+    rm -f "$PROMPT_FILE" 2>/dev/null
+fi
+
 # ── Step 1: capture SEQ before any expensive I/O ──────────────────────────
 # SEQ reflects HOOK ENTRY TIME, not completion time. Linux `date` supports
 # %N (nanoseconds); BSD `date` doesn't and emits the literal "N", which we
@@ -161,6 +187,12 @@ AT=$(date -u +%FT%TZ 2>/dev/null)
 TMP="$DIR/$PANE.json.tmp.$$"
 {
     printf '{"state":"%s","at":"%s","seq":%s' "$STATE" "$AT" "$SEQ"
+    # Persist the transcript path so `ade peek` can tail it for a recap without
+    # re-deriving it from the cwd. Linux paths carry no JSON-critical chars in
+    # practice (same assumption the string fields below already make).
+    if [ -n "$TRANSCRIPT" ]; then
+        printf ',"transcript_path":"%s"' "$TRANSCRIPT"
+    fi
     if [ -n "$CTX_TOKENS" ] && [ "$CTX_TOKENS" -gt 0 ] 2>/dev/null && [ -n "$MODEL" ] && [ -n "$SESSION_ID" ]; then
         printf ',"ctx_tokens":%s,"model":"%s","session_id":"%s"' "$CTX_TOKENS" "$MODEL" "$SESSION_ID"
     fi
