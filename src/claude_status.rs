@@ -98,17 +98,32 @@ pub struct ContextUsage {
 ///
 /// `seq` is a monotonic-ish integer written by the v3 hook script
 /// (nanoseconds since epoch on hosts whose `date` supports `+%N`; seconds
-/// plus a random suffix elsewhere). It exists so that two concurrent hook
-/// firings for the same pane — e.g. a slow `working` racing a fast `idle`
-/// — produce a deterministic winner: the one with the higher `seq` wins.
-/// `None` for legacy v2 files (no ordering data available); callers treat
-/// `None` as "always loses to any `Some`".
+/// plus a random suffix elsewhere). Two uses: (1) a race-tiebreaker between
+/// concurrent hook firings for the same pane — the higher `seq` wins,
+/// `None` "always loses"; (2) on the *remote* path it doubles as the
+/// last-activity timestamp — `parse_remote_statuses` runs it through
+/// `seq_to_activity` to populate `last_activity`, since remote readings have
+/// no file mtime. `None` for legacy v2 files (no ordering data).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
     pub state: ClaudeState,
     pub provenance: Provenance,
     pub usage: Option<ContextUsage>,
     pub seq: Option<u128>,
+    /// Filesystem mtime of the status file this reading came from — i.e.
+    /// when the hook last wrote it, which is the moment the user submitted a
+    /// prompt or Claude finished a turn. This is ADE's "last active" signal:
+    /// `Tree::group` sorts folders by the most-recent activity across their
+    /// sessions so the session you just typed into floats to the top.
+    ///
+    /// For locally-read files this is the file mtime (`read_local_statuses`
+    /// `stat`s it directly). For *remote* readings — where the SSH probe
+    /// ships file *contents*, not mtimes — `parse_remote_statuses` derives it
+    /// from `seq` (nanoseconds since epoch) via `seq_to_activity`. `None` for
+    /// synthetic test readings, legacy files without a usable `seq`, and any
+    /// remote `seq` outside the plausible-nanotime window — those sort into
+    /// the alphabetical fallback bucket.
+    pub last_activity: Option<SystemTime>,
 }
 
 /// Mirror Claude Code's own status-line indicator: percentage of the model's
@@ -181,7 +196,11 @@ pub fn read_local_statuses() -> HashMap<String, Reading> {
         let Ok(body) = fs::read_to_string(&path) else {
             continue;
         };
-        if let Some(reading) = parse_status_body(&body) {
+        if let Some(mut reading) = parse_status_body(&body) {
+            // Capture the file's mtime as the pane's "last active" timestamp.
+            // Best-effort: a metadata/mtime failure just leaves it `None`
+            // (the pane then sorts into the alphabetical fallback bucket).
+            reading.last_activity = fs::metadata(&path).and_then(|m| m.modified()).ok();
             out.insert(pane_id, reading);
         }
     }
@@ -214,11 +233,8 @@ pub fn read_local_statuses() -> HashMap<String, Reading> {
 /// "Claude finished" banners that would otherwise fire when TTL just ran.
 pub fn read_local_statuses_with_working_ttl() -> HashMap<String, Reading> {
     let mut out = read_local_statuses();
-    let Some(dir) = status_dir() else {
-        return out;
-    };
     let now = SystemTime::now();
-    for (pane_id, reading) in out.iter_mut() {
+    for reading in out.values_mut() {
         // Only TTL the active states; Idle is already the "nothing to do"
         // state and demoting it again would be a no-op.
         if !matches!(
@@ -227,11 +243,11 @@ pub fn read_local_statuses_with_working_ttl() -> HashMap<String, Reading> {
         ) {
             continue;
         }
-        let path = dir.join(format!("{}.json", pane_id));
-        let Ok(meta) = fs::metadata(&path) else {
-            continue;
-        };
-        let Ok(mtime) = meta.modified() else {
+        // `read_local_statuses` already captured the file mtime into
+        // `last_activity`, so reuse it rather than `stat`ing a second time.
+        // A missing timestamp means we couldn't read the mtime — leave the
+        // active state untouched rather than guess.
+        let Some(mtime) = reading.last_activity else {
             continue;
         };
         let elapsed = now.duration_since(mtime).unwrap_or(Duration::ZERO);
@@ -275,11 +291,39 @@ pub fn parse_remote_statuses(text: &str) -> HashMap<String, Reading> {
         let mut lines = trimmed.lines();
         let Some(pane_id) = lines.next() else { continue };
         let body: String = lines.collect::<Vec<_>>().join("\n");
-        if let Some(reading) = parse_status_body(&body) {
+        if let Some(mut reading) = parse_status_body(&body) {
+            // Remote readings carry no file mtime, so derive the last-active
+            // timestamp from `seq` (nanoseconds since epoch on Linux hooks).
+            // Remote-only on purpose: the local path overwrites
+            // `last_activity` with the real file mtime, which has no
+            // clock-skew exposure.
+            if reading.last_activity.is_none() {
+                reading.last_activity = reading.seq.and_then(seq_to_activity);
+            }
             out.insert(pane_id.trim().to_string(), reading);
         }
     }
     out
+}
+
+/// Convert a hook `seq` into a wall-clock activity time for remote recency
+/// ordering. Linux hooks emit `date +%s%N` nanoseconds; the BSD/string
+/// fallback emits `<seconds><pid>`, which is not a valid nanotime. Gate on a
+/// plausible nanosecond epoch window so most fallback values sort as "no
+/// activity" rather than as a garbage time. This is a heuristic, not a formal
+/// discriminator — an unusually large (9-digit) PID could push a fallback
+/// value into the 19-digit range — but that's acceptable for a UI recency
+/// hint and moot for the confirmed Linux hosts.
+fn seq_to_activity(seq: u128) -> Option<SystemTime> {
+    // ~2001-09-09 .. ~2096-10 in nanoseconds since the Unix epoch.
+    const MIN_NANOS: u128 = 1_000_000_000_000_000_000;
+    const MAX_NANOS: u128 = 4_000_000_000_000_000_000;
+    if !(MIN_NANOS..MAX_NANOS).contains(&seq) {
+        return None;
+    }
+    u64::try_from(seq)
+        .ok()
+        .map(|n| SystemTime::UNIX_EPOCH + Duration::from_nanos(n))
 }
 
 /// Given the output of `ps -A -o pid,ppid,comm` and a list of pane root pids,
@@ -372,6 +416,11 @@ fn parse_status_body(body: &str) -> Option<Reading> {
         provenance: Provenance::Recorded,
         usage,
         seq,
+        // Filled in by `read_local_statuses` from the file mtime; the body
+        // itself carries no trustworthy timestamp (v2's embedded `at` is
+        // deliberately ignored — see the module invariant below). Remote
+        // readings keep this `None`.
+        last_activity: None,
     })
 }
 
@@ -705,6 +754,53 @@ mod tests {
         );
         // All three legacy-shaped entries lack the v3 ctx fields → usage is None.
         assert!(result.values().all(|r| r.usage.is_none()));
+        // No `seq` in any body → no derived remote activity timestamp.
+        assert!(
+            result.values().all(|r| r.last_activity.is_none()),
+            "bodies without seq must yield last_activity None"
+        );
+    }
+
+    #[test]
+    fn seq_to_activity_accepts_ns_and_rejects_fallback() {
+        // A real Linux `date +%s%N` value → Some, round-trips exactly.
+        let ns: u128 = 1_715_600_000_123_456_789;
+        assert_eq!(
+            seq_to_activity(ns),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(ns as u64)),
+        );
+        // BSD/string fallback `<seconds><pid>` (~15 digits) is far below the
+        // nanosecond window → None, so it sorts as "no activity".
+        assert_eq!(seq_to_activity(178_535_071_212_345), None);
+        // Degenerate / out-of-window values → None.
+        assert_eq!(seq_to_activity(0), None);
+        assert_eq!(seq_to_activity(MAX_NANOS_FOR_TEST), None); // == MAX bound (exclusive)
+        assert_eq!(seq_to_activity(u128::MAX), None);
+    }
+
+    // Mirror of the private `MAX_NANOS` bound so the boundary case is pinned.
+    const MAX_NANOS_FOR_TEST: u128 = 4_000_000_000_000_000_000;
+
+    #[test]
+    fn parse_remote_statuses_derives_last_activity_from_valid_seq() {
+        // (a) valid ns seq → Some(last_activity) matching the seq.
+        // (c) fallback-style seq → None (kept separate from the no-seq case).
+        let ns: u128 = 1_715_600_000_123_456_789;
+        let text = format!(
+            "%1\n{{\"state\":\"working\",\"seq\":{ns}}}\n---ADE-STATUS-END---\n\
+             %2\n{{\"state\":\"idle\",\"seq\":178535071212345}}\n---ADE-STATUS-END---\n"
+        );
+        let result = parse_remote_statuses(&text);
+        assert_eq!(
+            result.get("%1").and_then(|r| r.last_activity),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(ns as u64)),
+            "valid ns seq must populate last_activity on the remote path"
+        );
+        assert_eq!(
+            result.get("%2").and_then(|r| r.last_activity),
+            None,
+            "fallback-style seq must not be treated as a timestamp"
+        );
     }
 
     #[test]

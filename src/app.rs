@@ -13,7 +13,7 @@ use crate::install_tmux::InstallStatus;
 use crate::kanban::{self, KanbanConfig};
 use crate::mail;
 use crate::mail_delivery::{self, ComposerState, DeliveryEnv, DeliveryRequest, Gate, Outcome};
-use crate::model::{Machine, Row, Tree};
+use crate::model::{Machine, Row, RowKey, Tree};
 use crate::preview_pane::{PreviewKey, PreviewPane};
 use crate::refresh::{refresh_all, RefreshResult};
 use crate::state::State;
@@ -660,13 +660,27 @@ impl App {
         self.local_tmux_config_status = result.local_tmux_config_status;
         let current_session = result.current_session;
         let observed = result.observed;
+        // Capture the cursor's workstream identity BEFORE rebuilding, so the
+        // recency reorder doesn't leave the highlight on whatever row slid
+        // into the old position (see `RowKey`). Only real workstreams
+        // (folders/sessions) are tracked by identity; the trailing
+        // `NewSession` row is positional — tracking it would glue the cursor
+        // to "New session" on the first populate (the empty tree's only row
+        // is `NewSession`), so it keeps the clamp behavior instead.
+        let prev_key = match self.tree.key_at(self.selected_index) {
+            Some(k @ (RowKey::Folder(_) | RowKey::Session(..))) => Some(k),
+            _ => None,
+        };
         self.tree = Tree::build(result.per_machine, result.errors, &self.expanded_memory);
         self.tree.current_session = current_session;
 
+        // Re-resolve the cursor to the same workstream. If it vanished
+        // (killed, or its folder collapsed) — or was the positional
+        // `NewSession` row — clamp the old index into range.
         let n = self.tree.visible_rows().len().max(1);
-        if self.selected_index >= n {
-            self.selected_index = n - 1;
-        }
+        self.selected_index = prev_key
+            .and_then(|k| self.tree.index_of_key(&k))
+            .unwrap_or_else(|| self.selected_index.min(n - 1));
 
         // Kanban: apply external intents (the `ade kanban` CLI's inbox),
         // then reconcile; persist at most once, and acknowledge the
