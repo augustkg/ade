@@ -11,6 +11,8 @@ use crate::hosts::{Config, Host, HostKind};
 use crate::install_hooks;
 use crate::install_tmux::InstallStatus;
 use crate::kanban::{self, KanbanConfig};
+use crate::mail;
+use crate::mail_delivery::{self, ComposerState, DeliveryEnv, DeliveryRequest, Gate, Outcome};
 use crate::model::{Machine, Row, Tree};
 use crate::preview_pane::{PreviewKey, PreviewPane};
 use crate::refresh::{refresh_all, RefreshResult};
@@ -486,6 +488,14 @@ pub struct App {
     /// Folder-level board filter (see `state::KanbanFilterState`).
     /// Authoritative in-memory copy, same lifecycle as the placements.
     pub kanban_filter: crate::state::KanbanFilterState,
+
+    // ---- Inter-session mail (`src/mail.rs`) ----
+    /// Pending messages awaiting delivery, keyed by recipient
+    /// `(machine, session_name)`. Rebuilt every refresh by `process_mail`
+    /// from the on-disk inbox; render reads it for the `✉ N` chip, and
+    /// `deliver_selected_mail` consumes it on the user's key. P1 recipients
+    /// are always local.
+    pub mail_pending: HashMap<(Machine, String), Vec<mail::Message>>,
 }
 
 impl Default for App {
@@ -545,6 +555,7 @@ impl App {
             kanban_config,
             kanban_placements,
             kanban_filter,
+            mail_pending: HashMap::new(),
         };
         app.refresh();
         app
@@ -676,7 +687,87 @@ impl App {
             kanban::remove_intents(&intent_paths);
         }
 
+        // Mail: rebuild the pending-message view from the inbox (and expire
+        // any long-unroutable messages). Delivery itself is *not* here — it's
+        // an explicit user action (`deliver_selected_mail`), so nothing is
+        // injected into a pane automatically (Track A).
+        self.process_mail();
+
         self.dispatch_notifications();
+    }
+
+    /// Time an undelivered message may sit in the inbox before it's moved to
+    /// dead-letter. Generous on purpose: Track A delivery is human-triggered,
+    /// so a message legitimately waits until someone acts. This is only a
+    /// safety valve against a typo'd / never-appearing recipient wedging the
+    /// inbox — not a delivery deadline.
+    const MAIL_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+    /// Rebuild `mail_pending` from the on-disk inbox, keyed by recipient
+    /// `(machine, session_name)`. Also dead-letters any message whose file
+    /// has sat past `MAIL_TTL` (measured by the file's own mtime, never the
+    /// sender-controlled `created_millis`). Never injects — that's the user's
+    /// explicit action.
+    /// A claim should complete within one keypress (synchronous send-keys).
+    /// Anything sitting in `claimed/` past this is from a crashed router; it
+    /// is moved to dead-letter, never silently re-injected.
+    const MAIL_STALE_CLAIM: Duration = Duration::from_secs(120);
+
+    fn process_mail(&mut self) {
+        let Some(dir) = mail::mail_dir() else {
+            self.mail_pending.clear();
+            return;
+        };
+        // Recover claims stranded by a crashed router (to dead-letter, not
+        // back to the inbox — a stranded claim's send is ambiguous). Surface
+        // the anomaly so a lost/uncertain delivery isn't silent.
+        let recovered = mail::recover_stale_claims(&dir, Self::MAIL_STALE_CLAIM);
+        if recovered > 0 {
+            self.error_message = Some(format!(
+                "mail: recovered {} stranded message(s) to the dead-letter dir \
+                 (a router likely crashed mid-delivery)",
+                recovered
+            ));
+        }
+
+        let mut pending: HashMap<(Machine, String), Vec<mail::Message>> = HashMap::new();
+        for (path, msg) in mail::read_inbox() {
+            // Safety valve: expire messages that have waited too long. Uses
+            // the file's mtime (first-seen), not the sender's timestamp. The
+            // id passed comes from the trusted filename stem (read_inbox has
+            // already verified it matches the payload and is path-safe).
+            let expired = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|age| age > Self::MAIL_TTL)
+                .unwrap_or(false);
+            if expired {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&msg.id);
+                // Only hide it from the pending view once it's actually been
+                // moved out of the inbox; if the move fails, keep showing it
+                // (better visible-and-stale than silently swallowed).
+                if mail::dead_letter(&dir, &path, stem).is_ok() {
+                    continue;
+                }
+            }
+            // P1: all recipients are local.
+            let key = (Machine::Local, msg.to_session.clone());
+            pending.entry(key).or_default().push(msg);
+        }
+        self.mail_pending = pending;
+    }
+
+    /// Number of pending messages queued for a session — drives the `✉ N`
+    /// chip. Cheap in-memory lookup; render must never touch disk.
+    pub fn pending_mail_count(&self, machine: &Machine, session_name: &str) -> usize {
+        self.mail_pending
+            .get(&(machine.clone(), session_name.to_string()))
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     /// Drain the kanban intent inbox into the in-memory placements.
@@ -1508,6 +1599,7 @@ impl App {
             KeyCode::Char('R') => self.start_rename_selected(),
             KeyCode::Char('y') => self.start_duplicate_selected(),
             KeyCode::Char('d') => self.start_delete_selected(),
+            KeyCode::Char('m') => self.deliver_selected_mail(),
             KeyCode::Char('H') => {
                 self.state = AppState::HostsList { selected: 0 };
             }
@@ -1901,6 +1993,102 @@ impl App {
         self.state = AppState::CreatingSession(CreateForm::with_prefix(&folder.prefix));
         self.input_buffer.clear();
     }
+
+    /// Deliver the oldest pending message to the currently-selected session
+    /// (the `m` key). This is the human-triggered final hop of Track A: the
+    /// user is present and chose the moment, which sidesteps the "is it
+    /// really idle / is a human mid-draft" hazards of automatic injection.
+    ///
+    /// Still fail-closed on obviously-unsafe targets: refuse to inject unless
+    /// the recipient has a live Claude pane that is idle at its prompt (not
+    /// Working, not at a permission prompt). One message per keypress.
+    fn deliver_selected_mail(&mut self) {
+        let Some(Row::Session(idx)) = self.current_row() else {
+            return;
+        };
+        // Only the session list acts on a session (mirrors the other
+        // session-action keys); ignore in the title bar.
+        if self.focus_area != FocusArea::SessionList {
+            return;
+        }
+        let Some(session) = self.tree.session(idx) else {
+            return;
+        };
+        let name = session.raw_name.clone();
+        let machine = session.machine.clone();
+        let req = DeliveryRequest {
+            session_name: &name,
+            is_local: matches!(machine, Machine::Local),
+            has_pending_mail: self
+                .mail_pending
+                .get(&(machine.clone(), name.clone()))
+                .map(|v| !v.is_empty())
+                .unwrap_or(false),
+            claude_present: session.claude_present,
+            claude: session.claude,
+        };
+
+        let Some(dir) = mail::mail_dir() else {
+            self.error_message =
+                Some("no $HOME / $XDG_CACHE_HOME — cannot locate the mailbox".to_string());
+            return;
+        };
+
+        // Oldest pending message for this recipient; the in-memory view holds
+        // payloads, not on-disk paths.
+        let Some((path, msg)) = mail::read_inbox()
+            .into_iter()
+            .find(|(_, m)| m.to_session == name)
+        else {
+            self.error_message = Some(format!("no pending mail for '{}'", name));
+            return;
+        };
+
+        let env = TmuxDelivery;
+        let pane_id = match mail_delivery::gate(&env, &req, &msg.to_session_addr) {
+            Gate::Deliver { pane_id } => pane_id,
+            Gate::Refuse(reason) => {
+                self.error_message = Some(reason);
+                return;
+            }
+        };
+
+        // Atomically lease it so a second ADE instance can't also deliver it.
+        let claimed = match mail::claim(&dir, &path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.error_message = Some(format!("mail: {}", e));
+                self.process_mail();
+                return;
+            }
+        };
+
+        self.error_message = Some(match mail_delivery::execute(
+            &env, &dir, &claimed, &msg, &pane_id,
+        ) {
+            Outcome::Delivered => format!(
+                "delivered mail from '{}' to '{}'",
+                msg.from_session, name
+            ),
+            Outcome::DeliveredButNotArchived(e) => format!(
+                "delivered to '{}', but couldn't archive the record: {}",
+                name, e
+            ),
+            Outcome::Ambiguous(e) => format!(
+                "mail delivery to '{}' is uncertain ({}). Not retrying — check \
+                 that session's prompt; the record is held for recovery.",
+                name, e
+            ),
+            Outcome::Requeued(e) => format!("mail delivery failed: {}", e),
+            Outcome::RequeueFailed { send, requeue } => format!(
+                "mail delivery failed ({}) and requeue failed ({}) — message is \
+                 in the claimed/ dir",
+                send, requeue
+            ),
+        });
+        self.process_mail();
+    }
+
 
     fn start_rename_selected(&mut self) {
         match self.current_row() {
@@ -2977,6 +3165,75 @@ fn compute_closed_list(prev_closed: &[String], snapshot: HashMap<String, bool>) 
     out
 }
 
+/// Production `DeliveryEnv`: every method is a live tmux query. Kept as a
+/// zero-sized adapter so the policy in `mail_delivery` stays testable with a
+/// fake while production keeps talking to the real tmux server.
+pub struct TmuxDelivery;
+
+impl DeliveryEnv for TmuxDelivery {
+    /// ONE query for both the session address and every pane across ALL its
+    /// windows. Session-scope (`-s`) is essential: without it `list-panes`
+    /// reports only the active window, so a second window could hide a shell we
+    /// would then type into. Reading the address here (rather than trusting the
+    /// last refresh) is what catches a session killed and recreated between
+    /// refreshes.
+    fn live_session(&self, name: &str) -> Option<(String, Vec<String>)> {
+        let target = format!("={}", name);
+        let out = std::process::Command::new("tmux")
+            .args([
+                "list-panes",
+                "-s",
+                "-t",
+                &target,
+                "-F",
+                "#{pid}:#{session_id}\t#{pane_id}",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut addr = String::new();
+        let mut panes = Vec::new();
+        for line in text.lines() {
+            let mut cols = line.split('\t');
+            let a = cols.next().unwrap_or("").trim();
+            let p = cols.next().unwrap_or("").trim();
+            if p.is_empty() {
+                continue;
+            }
+            // `-s` scopes to one session, so every row carries the same
+            // address; record it once.
+            if addr.is_empty() {
+                addr = a.to_string();
+            }
+            panes.push(p.to_string());
+        }
+        if addr.is_empty() {
+            return None;
+        }
+        Some((addr, panes))
+    }
+
+    fn composer(&self, pane_id: &str) -> ComposerState {
+        match std::process::Command::new("tmux")
+            .args(["capture-pane", "-p", "-t", pane_id])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                mail_delivery::composer_state(&String::from_utf8_lossy(&o.stdout))
+            }
+            // Unreadable pane must not be mistaken for an empty composer.
+            _ => ComposerState::Unknown,
+        }
+    }
+
+    fn send_text(&self, pane_id: &str, text: &str) -> Result<(), crate::tmux::SendTextError> {
+        tmux::local().send_text(pane_id, text)
+    }
+}
+
 /// Decide whether a `(prior, new)` per-session state pair should fire a
 /// "Claude is waiting for you" banner. Mirrors the transition table in
 /// `lets-add-a-new-toasty-narwhal.md`. Per-key suppression rules
@@ -3095,3 +3352,4 @@ mod tests {
         );
     }
 }
+

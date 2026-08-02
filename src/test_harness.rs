@@ -21,6 +21,95 @@ use std::time::{Duration, Instant};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Env var that turns this test binary into a raw-mode pty reader. See
+/// `run_raw_read_probe`.
+pub(crate) const RAW_READ_LOG_ENV: &str = "ADE_RAW_READ_LOG";
+
+/// Turn the current process into a raw-mode reader of fd 0 that records
+/// **read(2) boundaries** to `log`, one line per read:
+/// `READ <len> <escaped-bytes>`.
+///
+/// This exists to test a property nothing else can reach: whether a submit
+/// keystroke arrives in the *same* pty read as the text before it. Claude
+/// Code only treats a carriage return as "submit" when it arrives as its own
+/// read; a CR coalesced into the text's read is interpreted as pasted content
+/// and the message silently never sends (see `LocalTmux::send_text`). A
+/// line-discipline program such as `cat` cannot distinguish the two, so it
+/// cannot guard the invariant — this probe can.
+///
+/// Raw mode is required so the tty layer doesn't buffer by line and thereby
+/// erase the very boundaries we're measuring. `libc` is already a `cfg(unix)`
+/// dependency, so this needs no new crates.
+#[cfg(unix)]
+pub(crate) fn run_raw_read_probe(log: &str) {
+    use std::io::Write;
+
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    unsafe {
+        let fd = 0;
+        let mut term: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut term) != 0 {
+            return;
+        }
+        let original = term;
+        libc::cfmakeraw(&mut term);
+        libc::tcsetattr(fd, libc::TCSANOW, &term);
+
+        // Signal readiness only after raw mode is live, so a test never sends
+        // keys into a pane that is still line-buffered.
+        let _ = writeln!(file, "READY");
+        let _ = file.flush();
+
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+            if n <= 0 {
+                break;
+            }
+            let chunk = &buf[..n as usize];
+            let _ = writeln!(file, "READ {} {:?}", n, String::from_utf8_lossy(chunk));
+            let _ = file.flush();
+            // Ctrl-C ends the probe so the test can tear down deterministically.
+            if chunk.contains(&0x03) {
+                break;
+            }
+        }
+
+        libc::tcsetattr(fd, libc::TCSANOW, &original);
+    }
+}
+
+/// One recorded `read(2)` from the probe log.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RawRead {
+    pub len: usize,
+    /// Bytes as the probe escaped them (Rust debug form, quotes stripped).
+    pub text: String,
+}
+
+/// Parse a probe log into its reads, ignoring the `READY` marker.
+pub(crate) fn parse_raw_read_log(contents: &str) -> Vec<RawRead> {
+    contents
+        .lines()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("READ ")?;
+            let (len, text) = rest.split_once(' ')?;
+            Some(RawRead {
+                len: len.parse().ok()?,
+                text: text.trim_matches('"').to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Acceptance tests mutate process-wide env (`TMUX_TMPDIR`, `HOME`,
 /// `XDG_CONFIG_HOME`) so they MUST run serially within a single
 /// `cargo test` invocation. Each acceptance test holds this mutex for
@@ -108,6 +197,61 @@ impl IsolatedTmux {
             cmd.arg(a);
         }
         cmd
+    }
+
+    /// Create a detached session running an arbitrary command, with extra
+    /// environment entries applied to the pane (`new-session -e`, tmux 3.2+).
+    /// Used to host purpose-built fixtures — e.g. the raw-read probe, or a
+    /// shim named `claude` so ADE's process-based Claude detection fires.
+    pub fn new_session_cmd(
+        &self,
+        name: &str,
+        cols: u16,
+        rows: u16,
+        env: &[(&str, &str)],
+        cmd: &[&str],
+    ) -> Result<(), String> {
+        let cols_s = cols.to_string();
+        let rows_s = rows.to_string();
+        let mut args: Vec<String> = vec![
+            "new-session".into(),
+            "-d".into(),
+            "-s".into(),
+            name.into(),
+            "-x".into(),
+            cols_s,
+            "-y".into(),
+            rows_s,
+        ];
+        for (k, v) in env {
+            args.push("-e".into());
+            args.push(format!("{}={}", k, v));
+        }
+        for c in cmd {
+            args.push((*c).to_string());
+        }
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let out = self
+            .tmux(&arg_refs)
+            .output()
+            .map_err(|e| format!("tmux new-session: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "tmux new-session failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let status_out = self
+            .tmux(&["set-option", "-g", "status", "off"])
+            .output()
+            .map_err(|e| format!("tmux set-option status off: {}", e))?;
+        if !status_out.status.success() {
+            return Err(format!(
+                "tmux set-option status off failed: {}",
+                String::from_utf8_lossy(&status_out.stderr).trim()
+            ));
+        }
+        Ok(())
     }
 
     /// Create a new tmux session running `bash --norc --noprofile`

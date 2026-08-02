@@ -172,6 +172,13 @@ impl RemoteTmux {
                         s.claude_present = rollup.present;
                         s.claude_context_pct = rollup.context_pct;
                         s.claude_usage = rollup.context_usage.clone();
+                        // Remote readings carry no file mtime, so this is
+                        // derived from the status file's `seq`
+                        // (`claude_status::seq_to_activity`) — lets remote
+                        // folders float by recency in `Tree::group`, same as
+                        // local ones. `None` (alphabetical fallback) only when
+                        // no pane had a usable `seq`.
+                        s.claude_last_activity = rollup.last_activity;
                     }
                 }
 
@@ -247,6 +254,23 @@ impl TmuxBackend for RemoteTmux {
             String::from_utf8_lossy(&out.stderr),
         ));
         check_status(out)
+    }
+
+    fn send_text(
+        &self,
+        _target: &str,
+        _text: &str,
+    ) -> Result<(), super::SendTextError> {
+        // Mail delivery to remote sessions is P2: it needs a dedicated,
+        // tested argument-serialization strategy for the remote shell + tmux
+        // layers (bolting ad-hoc quoting onto `self.ssh` is unsafe, and
+        // `shell_safe` rejects the spaces every message body contains). Until
+        // then, refuse rather than silently mis-deliver.
+        Err(super::SendTextError {
+            message: "mail delivery to remote sessions is not supported yet".to_string(),
+            // Nothing was sent, so the caller can safely requeue.
+            progress: super::SendProgress::NotStarted,
+        })
     }
 }
 

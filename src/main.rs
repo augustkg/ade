@@ -11,6 +11,8 @@ mod install_hooks;
 mod install_tmux;
 mod json_out;
 mod kanban;
+mod mail;
+mod mail_delivery;
 mod model;
 mod notifications;
 mod preview_pane;
@@ -49,6 +51,7 @@ fn main() -> Result<()> {
             "install-tmux-config" => return run_install_tmux(&argv[2..]),
             "debug" => return run_debug(&argv[2..]),
             "kanban" => return run_kanban(&argv[2..]),
+            "mail" => return run_mail(&argv[2..]),
             // Non-interactive JSON inventory / monitor summary. Both diverge
             // (print to stdout and `std::process::exit`) — they never start
             // the TUI and never return.
@@ -101,6 +104,10 @@ fn print_usage() {
          \x20\x20ade debug claude [--host H]            Diagnose why ADE does/doesn't see Claude per pane\n\
          \x20\x20ade kanban move <column> [--session S] Move a session's kanban card to a manual column\n\
          \x20\x20ade kanban clear [--session S]         Return a session's card to the automatic columns\n\
+         \x20\x20ade mail send --session S --body TEXT   Leave a message for another local session (routed by ADE)\n\
+         \x20\x20ade mail whoami                         Print this tmux session's name (its mail address)\n\
+         \x20\x20ade mail list                           Show this session's pending messages\n\
+         \x20\x20ade mail deliver [--session S] [--dry-run]  Deliver queued mail without the TUI (headless router)\n\
          \x20\x20ade sessions --json [--local]          Print the full cross-host session inventory as JSON\n\
          \x20\x20ade status --json [--local]            Print a Claude monitor summary as JSON\n\
          \x20\x20ade help                               Show this message\n\
@@ -137,9 +144,7 @@ fn run_kanban(args: &[String]) -> Result<()> {
     }
     /// The tmux session this process runs inside, via `display-message`.
     fn current_session() -> Option<String> {
-        if std::env::var_os("TMUX").is_none() {
-            return None;
-        }
+        std::env::var_os("TMUX")?;
         let out = std::process::Command::new("tmux")
             .args(["display-message", "-p", "#{session_name}"])
             .output()
@@ -237,6 +242,289 @@ fn run_kanban(args: &[String]) -> Result<()> {
         )),
     }
     Ok(())
+}
+
+/// `ade mail send --session <to> --body <text>` / `ade mail whoami` /
+/// `ade mail list`. Publishes a message file for the running (or next) ADE
+/// instance to route — never injects into another pane itself, the App owns
+/// that side effect. Local sessions only (P1).
+fn run_mail(args: &[String]) -> Result<()> {
+    fn fail(msg: &str) -> ! {
+        eprintln!("Error: {}", msg);
+        std::process::exit(2);
+    }
+    /// The tmux session this process runs inside.
+    fn current_session() -> Option<String> {
+        std::env::var_os("TMUX")?;
+        let out = std::process::Command::new("tmux")
+            .args(["display-message", "-p", "#{session_name}"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+    /// The tmux `#{session_id}` (e.g. `$3`) this process runs inside.
+    fn current_session_id() -> Option<String> {
+        std::env::var_os("TMUX")?;
+        let out = std::process::Command::new("tmux")
+            .args(["display-message", "-p", "#{session_id}"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!id.is_empty()).then_some(id)
+    }
+    fn session_exists(name: &str) -> bool {
+        std::process::Command::new("tmux")
+            .args(["has-session", "-t", &format!("={}", name)])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    if args.is_empty() {
+        fail("`ade mail` requires a subcommand: send | whoami | list");
+    }
+    match args[0].as_str() {
+        "send" => {
+            let mut to: Option<String> = None;
+            let mut body: Option<String> = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--session" | "--to" => {
+                        if i + 1 >= args.len() {
+                            fail(&format!("{} requires a value", args[i]));
+                        }
+                        to = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--body" => {
+                        if i + 1 >= args.len() {
+                            fail("--body requires a value");
+                        }
+                        body = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    other => fail(&format!("unknown argument '{}'", other)),
+                }
+            }
+            let to = to.unwrap_or_else(|| {
+                fail("usage: ade mail send --session <name> --body <text>")
+            });
+            let body = body.unwrap_or_else(|| {
+                fail("usage: ade mail send --session <name> --body <text>")
+            });
+            if let Err(e) = mail::validate_body(&body) {
+                fail(&e);
+            }
+            let from = current_session().unwrap_or_else(|| {
+                fail(
+                    "not inside a tmux session — `ade mail send` must run \
+                     from the sending session (local sessions only)",
+                )
+            });
+            let from_id = current_session_id().unwrap_or_default();
+            if to == from {
+                fail("refusing to send a message to yourself");
+            }
+            if !session_exists(&to) {
+                fail(&format!("no local tmux session named '{}'", to));
+            }
+            // Capture the recipient's *current* address (server pid +
+            // session id) so the router can refuse delivery if that session is
+            // later killed and recreated under the same name — or recreated
+            // after a tmux server restart, which resets session ids.
+            let to_addr = match tmux::local_session_addr(&to) {
+                Some(a) => a,
+                None => fail(&format!(
+                    "could not resolve the address of local session '{}'",
+                    to
+                )),
+            };
+            match mail::write_message(&from, &from_id, &to, &to_addr, &body) {
+                Ok(id) => {
+                    println!(
+                        "mail: queued for '{}' (id {}). A running ADE surfaces it \
+                         within ~2s; delivery into the session happens when you \
+                         trigger it from ADE.",
+                        to, id
+                    );
+                }
+                Err(e) => fail(&e),
+            }
+        }
+        "whoami" => match current_session() {
+            Some(name) => println!("{}", name),
+            None => fail("not inside a tmux session"),
+        },
+        "list" => {
+            let me = current_session().unwrap_or_else(|| {
+                fail("not inside a tmux session — `ade mail list` shows this session's inbox")
+            });
+            let inbox = mail::read_inbox();
+            let mine: Vec<_> = inbox.iter().filter(|(_, m)| m.to_session == me).collect();
+            if mine.is_empty() {
+                println!("mail: no pending messages for '{}'.", me);
+            } else {
+                println!("mail: {} pending message(s) for '{}':", mine.len(), me);
+                for (_, m) in mine {
+                    println!("  from {}: {}", m.from_session, m.body);
+                }
+            }
+        }
+        "deliver" => {
+            let mut only: Option<String> = None;
+            let mut dry_run = false;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--session" | "--to" => {
+                        if i + 1 >= args.len() {
+                            fail(&format!("{} requires a value", args[i]));
+                        }
+                        only = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--dry-run" => {
+                        dry_run = true;
+                        i += 1;
+                    }
+                    other => fail(&format!("unknown argument '{}'", other)),
+                }
+            }
+            let delivered = run_mail_deliver(only.as_deref(), dry_run);
+            if delivered == 0 {
+                std::process::exit(1);
+            }
+        }
+        other => fail(&format!(
+            "unknown mail subcommand '{}': use send | whoami | list | deliver",
+            other
+        )),
+    }
+    Ok(())
+}
+
+/// Headless delivery: the same gate + claim + send + archive machinery the TUI
+/// runs on `m`, driven from the CLI so a machine can route its own mail without
+/// anybody sitting in front of a terminal.
+///
+/// This is the seam a router daemon grows out of — the policy lives in
+/// `mail_delivery`, so the TUI and this path cannot drift apart. Delivers **at
+/// most one message per recipient** per invocation (matching the TUI), so a
+/// burst never lands as a wall of text in someone's prompt.
+///
+/// Returns how many messages were delivered. Refusals are printed with their
+/// reason and are not failures — "recipient is mid-turn" is the system working.
+fn run_mail_deliver(only: Option<&str>, dry_run: bool) -> usize {
+    use mail_delivery::{DeliveryRequest, Gate, Outcome};
+    use tmux::TmuxBackend;
+
+    let Some(dir) = mail::mail_dir() else {
+        eprintln!("Error: no $HOME / $XDG_CACHE_HOME — cannot locate the mailbox");
+        std::process::exit(1);
+    };
+
+    let pending = mail::read_inbox();
+    if pending.is_empty() {
+        println!("mail: nothing pending.");
+        return 0;
+    }
+
+    // One local tmux snapshot for every recipient we consider.
+    let sessions = match tmux::local().list_sessions() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: could not list local tmux sessions: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let env = app::TmuxDelivery;
+    let mut delivered = 0usize;
+    let mut seen: Vec<String> = Vec::new();
+
+    for (path, msg) in pending {
+        if let Some(want) = only {
+            if msg.to_session != want {
+                continue;
+            }
+        }
+        // At most one per recipient per run; the inbox is in publish order, so
+        // this naturally picks the oldest.
+        if seen.iter().any(|s| s == &msg.to_session) {
+            continue;
+        }
+        seen.push(msg.to_session.clone());
+
+        let Some(session) = sessions.iter().find(|s| s.name == msg.to_session) else {
+            println!("{}: no such local session — skipped", msg.to_session);
+            continue;
+        };
+
+        let req = DeliveryRequest {
+            session_name: &msg.to_session,
+            is_local: true,
+            has_pending_mail: true,
+            claude_present: session.claude_present,
+            claude: session.claude,
+        };
+
+        let pane = match mail_delivery::gate(&env, &req, &msg.to_session_addr) {
+            Gate::Deliver { pane_id } => pane_id,
+            Gate::Refuse(reason) => {
+                println!("{}: held — {}", msg.to_session, reason);
+                continue;
+            }
+        };
+
+        if dry_run {
+            println!(
+                "{}: WOULD deliver from '{}' into pane {}",
+                msg.to_session, msg.from_session, pane
+            );
+            continue;
+        }
+
+        let claimed = match mail::claim(&dir, &path) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("{}: could not claim — {}", msg.to_session, e);
+                continue;
+            }
+        };
+        match mail_delivery::execute(&env, &dir, &claimed, &msg, &pane) {
+            Outcome::Delivered => {
+                println!("{}: delivered from '{}'", msg.to_session, msg.from_session);
+                delivered += 1;
+            }
+            Outcome::DeliveredButNotArchived(e) => {
+                println!(
+                    "{}: delivered from '{}', but archiving failed: {}",
+                    msg.to_session, msg.from_session, e
+                );
+                delivered += 1;
+            }
+            Outcome::Ambiguous(e) => {
+                println!(
+                    "{}: UNCERTAIN — {}. Not retried; held for recovery.",
+                    msg.to_session, e
+                );
+            }
+            Outcome::Requeued(e) => println!("{}: failed, requeued — {}", msg.to_session, e),
+            Outcome::RequeueFailed { send, requeue } => println!(
+                "{}: failed ({}) and requeue failed ({})",
+                msg.to_session, send, requeue
+            ),
+        }
+    }
+    delivered
 }
 
 fn run_debug(args: &[String]) -> Result<()> {
