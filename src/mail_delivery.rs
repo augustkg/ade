@@ -45,6 +45,52 @@ fn is_frame_rule(line: &str) -> bool {
     t.chars().all(|c| matches!(c, '\u{2500}' | '\u{2501}' | '\u{2504}' | '\u{2505}' | '-' | '\u{2550}'))
 }
 
+/// Strip SGR escape sequences from a captured line, returning the visible text
+/// alongside a per-character flag for whether it was rendered **dim** (SGR 2).
+///
+/// The dim flag is load-bearing: Claude renders a history/placeholder hint in an
+/// *empty* composer using dim text, which is visually and structurally identical
+/// to a real draft once styling is discarded. Treating that hint as a draft
+/// makes the composer guard refuse delivery forever, so the classifier needs the
+/// styling to tell them apart.
+fn strip_sgr_with_dim(line: &str) -> (String, Vec<bool>) {
+    let mut text = String::new();
+    let mut dim_mask = Vec::new();
+    let mut dim = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            text.push(c);
+            dim_mask.push(dim);
+            continue;
+        }
+        // ESC [ params letter — only SGR ('m') affects styling; skip the rest.
+        if chars.peek() != Some(&'[') {
+            continue;
+        }
+        chars.next();
+        let mut params = String::new();
+        for c in chars.by_ref() {
+            if c.is_ascii_alphabetic() {
+                if c == 'm' {
+                    for p in params.split(';') {
+                        match p.trim() {
+                            "2" => dim = true,
+                            // 0 = reset all, 22 = normal intensity
+                            "0" | "" | "22" => dim = false,
+                            _ => {}
+                        }
+                    }
+                }
+                break;
+            }
+            params.push(c);
+        }
+    }
+    (text, dim_mask)
+}
+
 /// Classify a Claude pane's composer from its visible content.
 ///
 /// Claude frames its input box between two horizontal rules, with the prompt
@@ -82,27 +128,22 @@ fn is_frame_rule(line: &str) -> bool {
 /// whether its composer is dirty. It is pinned by table-driven tests built from
 /// real captures (`composer_state_tests`).
 pub fn composer_state(capture: &str) -> ComposerState {
-    let lines: Vec<&str> = capture.lines().collect();
+    // Parse once: visible text for structure, dim flags for the content check.
+    let parsed: Vec<(String, Vec<bool>)> =
+        capture.lines().map(strip_sgr_with_dim).collect();
+    let lines: Vec<&str> = parsed.iter().map(|(t, _)| t.as_str()).collect();
 
-    // Find the last plausible prompt row: the glyph must be the first
-    // non-whitespace thing on the line. (Transcript rows echo submitted
-    // prompts with the same glyph, so we take the lowest one — the composer —
-    // and require the frame below to confirm it.)
-    let prompt_idx = lines.iter().rposition(|line| {
-        match line.find(COMPOSER_PROMPT) {
-            Some(idx) => line[..idx].chars().all(char::is_whitespace),
-            None => false,
-        }
+    let prompt_idx = lines.iter().rposition(|line| match line.find(COMPOSER_PROMPT) {
+        Some(idx) => line[..idx].chars().all(char::is_whitespace),
+        None => false,
     });
     let Some(prompt_idx) = prompt_idx else {
         return ComposerState::Unknown;
     };
     let prompt_line = lines[prompt_idx];
 
-    // Validate the frame FIRST: we only classify layouts we actually
-    // recognise. The frame must open directly above — the first non-blank row
-    // above the prompt has to be a rule. A prompt glyph without a frame is a
-    // transcript echo of a submitted prompt, not a live composer.
+    // Frame must open directly above and close below, or we don't recognise the
+    // layout and must not claim emptiness.
     let opened = lines[..prompt_idx]
         .iter()
         .rev()
@@ -112,9 +153,6 @@ pub fn composer_state(capture: &str) -> ComposerState {
     if !opened {
         return ComposerState::Unknown;
     }
-
-    // ...and it must close below. Everything between the prompt row and the
-    // closing rule belongs to the composer.
     let mut closing = None;
     for (offset, line) in lines[prompt_idx + 1..].iter().enumerate() {
         if is_frame_rule(line) {
@@ -126,17 +164,42 @@ pub fn composer_state(capture: &str) -> ComposerState {
         return ComposerState::Unknown;
     };
 
-    // Now classify content. Text on the prompt row, or on any continuation row
-    // inside the frame (a wrapped or multi-line draft), means unsent input.
+    // Content on the prompt row. Dim-only content is Claude's placeholder hint
+    // shown in an EMPTY composer — typing replaces it rather than appending —
+    // so it must not be mistaken for the user's unsent text.
     let glyph_at = prompt_line.find(COMPOSER_PROMPT).unwrap();
-    if !prompt_line[glyph_at + COMPOSER_PROMPT.len_utf8()..]
-        .trim()
-        .is_empty()
-    {
-        return ComposerState::Draft;
+    let content_from = glyph_at + COMPOSER_PROMPT.len_utf8();
+    if !prompt_line[content_from..].trim().is_empty() {
+        let dim_mask = &parsed[prompt_idx].1;
+        // Map byte offset -> char index so the mask lines up with the text.
+        let start_char = prompt_line[..content_from].chars().count();
+        let all_dim = prompt_line[content_from..]
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| !c.is_whitespace())
+            .all(|(i, _)| dim_mask.get(start_char + i).copied().unwrap_or(false));
+        if !all_dim {
+            return ComposerState::Draft;
+        }
     }
-    for line in &lines[prompt_idx + 1..closing] {
-        if !line.trim().is_empty() {
+
+    // Continuation rows inside the frame: same rule.
+    for (row, line) in lines
+        .iter()
+        .enumerate()
+        .take(closing)
+        .skip(prompt_idx + 1)
+    {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let dim_mask = &parsed[row].1;
+        let all_dim = line
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| !c.is_whitespace())
+            .all(|(i, _)| dim_mask.get(i).copied().unwrap_or(false));
+        if !all_dim {
             return ComposerState::Draft;
         }
     }
@@ -458,6 +521,69 @@ mod composer_state_tests {
             RULE, RULE
         );
         assert_eq!(composer_state(&draft), ComposerState::Draft);
+    }
+
+    // ── dim placeholder hint vs. a real draft ──
+    //
+    // Claude renders a history hint in an EMPTY composer using dim text (SGR 2).
+    // Stripped of styling it is indistinguishable from a typed draft, so an
+    // earlier version refused delivery forever on sessions that were in fact
+    // idle and empty. These strings are verbatim `capture-pane -e -p` output.
+
+    #[test]
+    fn dim_placeholder_hint_is_empty_not_draft() {
+        let cap = format!(
+            "\u{1b}[2m⏺ earlier output\u{1b}[0m\n{}\n\u{1b}[39m❯\u{a0}\u{1b}[2mcheck the inbox again\u{1b}[0m\n{}\n  ADE main\n",
+            RULE, RULE
+        );
+        assert_eq!(
+            composer_state(&cap),
+            ComposerState::Empty,
+            "dim hint text must not be mistaken for the user's unsent input"
+        );
+    }
+
+    #[test]
+    fn undimmed_draft_alongside_ansi_is_still_a_draft() {
+        // Same shape, but the content is NOT dim — that is real typed text.
+        let cap = format!(
+            "{}\n\u{1b}[39m❯\u{a0}commit the mail feature\u{1b}[0m\n{}\n  ADE main\n",
+            RULE, RULE
+        );
+        assert_eq!(composer_state(&cap), ComposerState::Draft);
+    }
+
+    #[test]
+    fn dim_reset_mid_line_counts_as_a_draft() {
+        // A hint that is partly re-styled to normal intensity contains real
+        // text; anything not provably dim must block delivery.
+        let cap = format!(
+            "{}\n\u{1b}[39m❯\u{a0}\u{1b}[2mhint\u{1b}[22m typed\u{1b}[0m\n{}\n",
+            RULE, RULE
+        );
+        assert_eq!(composer_state(&cap), ComposerState::Draft);
+    }
+
+    #[test]
+    fn dim_continuation_row_is_empty_but_normal_one_is_draft() {
+        let ghost = format!(
+            "{}\n\u{1b}[39m❯\u{a0}\n\u{1b}[2m  wrapped hint\u{1b}[0m\n{}\n",
+            RULE, RULE
+        );
+        assert_eq!(composer_state(&ghost), ComposerState::Empty);
+        let real = format!("{}\n❯\u{a0}\n  wrapped draft\n{}\n", RULE, RULE);
+        assert_eq!(composer_state(&real), ComposerState::Draft);
+    }
+
+    #[test]
+    fn sgr_stripping_keeps_frame_detection_working() {
+        // Rules and prompt must still be found when the capture is full of
+        // colour codes.
+        let cap = format!(
+            "\u{1b}[38;5;240m{}\u{1b}[0m\n\u{1b}[39m❯\u{a0}\u{1b}[0m\n\u{1b}[38;5;240m{}\u{1b}[0m\n",
+            RULE, RULE
+        );
+        assert_eq!(composer_state(&cap), ComposerState::Empty);
     }
 }
 

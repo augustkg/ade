@@ -3232,7 +3232,7 @@ impl DeliveryEnv for TmuxDelivery {
 
     fn composer(&self, pane_id: &str) -> ComposerState {
         match std::process::Command::new("tmux")
-            .args(["capture-pane", "-p", "-t", pane_id])
+            .args(["capture-pane", "-e", "-p", "-t", pane_id])
             .output()
         {
             Ok(o) if o.status.success() => {
