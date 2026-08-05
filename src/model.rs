@@ -387,6 +387,10 @@ mod folder_order_tests {
             claude_usage: None,
             claude_last_activity: activity_secs
                 .map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s)),
+            // tmux's own `#{session_activity}` (any pane I/O), which folder
+            // ordering does not consult — these tests pin ordering by *Claude*
+            // activity specifically.
+            last_activity: None,
         }
     }
 
