@@ -448,6 +448,7 @@ mod tests {
             claude_present: false,
             claude_context_pct: None,
             claude_usage: None,
+            claude_last_activity: None,
         }
     }
 

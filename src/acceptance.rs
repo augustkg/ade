@@ -2430,3 +2430,218 @@ fn acceptance_kanban_intent_retained_until_save_succeeds() {
     drop(app);
     drop(tmux);
 }
+
+// ───────────── inter-session mail delivery ─────────────
+
+/// Entry point that turns this test binary into a raw-mode pty reader when
+/// `ADE_RAW_READ_LOG` is set. A no-op in a normal run; the mail delivery test
+/// re-execs the binary inside a tmux pane with that variable set.
+#[test]
+fn raw_read_probe_entrypoint() {
+    if let Ok(log) = std::env::var(crate::test_harness::RAW_READ_LOG_ENV) {
+        crate::test_harness::run_raw_read_probe(&log);
+    }
+}
+
+/// The invariant that makes mail delivery work at all: the submit must reach
+/// the recipient as its own `read(2)`.
+///
+/// Claude Code only treats a carriage return as "submit" when it arrives in a
+/// separate pty read. A CR coalesced into the same read as the message text is
+/// interpreted as pasted content, and the message sits in the composer forever
+/// — which is exactly the bug this test was written after hitting in a real
+/// session. No line-discipline fixture (`cat`, `read`) can see the difference,
+/// so we host a raw-mode probe that records read boundaries.
+///
+/// The test has two halves and both matter:
+///   * a **negative control** that fires the coalesced form and proves the
+///     fixture actually detects it (otherwise the positive assertion below
+///     could pass for the wrong reason);
+///   * the real `LocalTmux::send_text`, which must produce the body and the CR
+///     in separate reads.
+#[test]
+fn send_text_delivers_the_submit_as_a_separate_pty_read() {
+    use crate::test_harness::{parse_raw_read_log, RAW_READ_LOG_ENV};
+
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    let exe = std::env::current_exe().expect("test binary path");
+
+    // Spawn the probe twice — once per half — so each gets a clean log.
+    let run_probe = |session: &str, log: &std::path::Path| {
+        tmux.new_session_cmd(
+            session,
+            80,
+            24,
+            &[(RAW_READ_LOG_ENV, log.to_str().unwrap())],
+            &[
+                exe.to_str().unwrap(),
+                "--exact",
+                "acceptance::raw_read_probe_entrypoint",
+                "--nocapture",
+            ],
+        )
+        .expect("spawn raw-read probe");
+        assert!(
+            poll_until(Duration::from_secs(10), || {
+                std::fs::read_to_string(log)
+                    .map(|c| c.contains("READY"))
+                    .unwrap_or(false)
+            }),
+            "probe never reached raw mode (log: {:?})",
+            std::fs::read_to_string(log).unwrap_or_default()
+        );
+        tmux.pane_id(session).expect("probe pane id")
+    };
+
+    // ── negative control: the coalesced form the code must NOT use ──
+    let ctrl_log = tmux.home.join("control-reads.log");
+    let ctrl_pane = run_probe("ctrl", &ctrl_log);
+    tmux.tmux(&["send-keys", "-t", &ctrl_pane, "-l", "coalesced probe\r"])
+        .output()
+        .expect("send coalesced form");
+    assert!(
+        poll_until(Duration::from_secs(5), || {
+            std::fs::read_to_string(&ctrl_log)
+                .map(|c| c.contains("coalesced probe"))
+                .unwrap_or(false)
+        }),
+        "control text never arrived"
+    );
+    let ctrl = parse_raw_read_log(&std::fs::read_to_string(&ctrl_log).unwrap());
+    let ctrl_body = ctrl
+        .iter()
+        .find(|r| r.text.contains("coalesced probe"))
+        .expect("control body read");
+    assert!(
+        ctrl_body.text.contains("\\r"),
+        "negative control must show the CR riding along in the SAME read \
+         (otherwise this fixture can't detect the bug); got {:?}",
+        ctrl
+    );
+
+    // ── the real thing ──
+    let log = tmux.home.join("reads.log");
+    let pane = run_probe("probe", &log);
+    let body = "[ADE mail from worker/api] build is green";
+    LocalTmux
+        .send_text(&pane, body)
+        .expect("send_text should succeed");
+
+    assert!(
+        poll_until(Duration::from_secs(5), || {
+            std::fs::read_to_string(&log)
+                .map(|c| c.contains("build is green") && c.matches("READ ").count() >= 2)
+                .unwrap_or(false)
+        }),
+        "expected at least two reads; log:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    let reads = parse_raw_read_log(&std::fs::read_to_string(&log).unwrap());
+
+    let body_read = reads
+        .iter()
+        .find(|r| r.text.contains("build is green"))
+        .expect("a read containing the message body");
+    assert!(
+        !body_read.text.contains("\\r"),
+        "the body read must NOT carry the submit; got {:?}",
+        reads
+    );
+    assert_eq!(
+        reads.last().map(|r| r.text.as_str()),
+        Some("\\r"),
+        "the final read must be the bare CR that submits; got {:?}",
+        reads
+    );
+
+    // Tear the probes down deterministically (Ctrl-C ends the read loop).
+    for p in [&ctrl_pane, &pane] {
+        let _ = tmux.tmux(&["send-keys", "-t", p, "-l", "\u{3}"]).output();
+    }
+    drop(tmux);
+}
+
+/// `local_session_addr` must return a fully-formed `<server-pid>:<session_id>`
+/// for a live session — and, critically, must NOT return a half-resolved one.
+///
+/// This pins a real bug: `display-message -t` resolves a *pane* target, so a
+/// bare `=name` (no trailing colon) yields an empty `#{session_id}` instead of
+/// erroring. That produced an address like `"94795:"`, which is unverifiable —
+/// exactly the input the identity check must never accept.
+#[test]
+fn local_session_addr_is_fully_resolved_for_a_live_session() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("addr", 80, 24).expect("create session");
+
+    let addr = crate::tmux::local_session_addr("addr")
+        .expect("a live session must resolve to an address");
+    let (pid, sid) = addr.split_once(':').expect("addr must be pid:session_id");
+    assert!(
+        pid.chars().all(|c| c.is_ascii_digit()) && !pid.is_empty(),
+        "server pid half must be numeric: {:?}",
+        addr
+    );
+    assert!(
+        sid.starts_with('$') && sid.len() > 1,
+        "session-id half must be a real $N: {:?}",
+        addr
+    );
+
+    // A session that doesn't exist has no address.
+    assert_eq!(crate::tmux::local_session_addr("nope-not-here"), None);
+    drop(tmux);
+}
+
+/// Pane enumeration for delivery must be **session-scoped**, covering every
+/// window — not just the active one.
+///
+/// This pins a real bug found in review: `tmux list-panes -t <session>` reports
+/// only the current window's panes, so a session with an idle Claude in window A
+/// and a plain shell in window B looked single-paned. Delivery would then have
+/// typed the message into the shell. `-s` is what makes the count honest.
+#[test]
+fn delivery_pane_lookup_sees_every_window_in_the_session() {
+    use crate::mail_delivery::{ComposerState, DeliveryEnv};
+
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("multi", 80, 24).expect("create session");
+
+    let env = crate::app::TmuxDelivery;
+
+    // One window, one pane.
+    let (addr, panes) = env
+        .live_session("multi")
+        .expect("live lookup for a real session");
+    assert!(addr.contains(':'), "address must be pid:session_id: {:?}", addr);
+    assert_eq!(panes.len(), 1, "one window, one pane");
+
+    // Add a SECOND WINDOW. A window-scoped lookup would still say 1.
+    tmux.tmux(&["new-window", "-d", "-t", "=multi"])
+        .output()
+        .expect("add a second window");
+    let (_, panes) = env.live_session("multi").expect("live lookup");
+    assert_eq!(
+        panes.len(),
+        2,
+        "panes in other windows must be counted (use list-panes -s)"
+    );
+
+    // And a split within a window is counted too.
+    tmux.tmux(&["split-window", "-d", "-t", "=multi:"])
+        .output()
+        .expect("split a window");
+    let (_, panes) = env.live_session("multi").expect("live lookup");
+    assert_eq!(panes.len(), 3);
+
+    // A gone session yields nothing rather than a bogus target.
+    assert!(env.live_session("no-such-session").is_none());
+
+    // Capturing a non-existent pane must read as Unknown, never Empty — an
+    // unreadable pane must not be mistaken for "safe to type into".
+    assert_eq!(env.composer("%99999"), ComposerState::Unknown);
+
+    drop(tmux);
+}

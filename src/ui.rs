@@ -197,12 +197,15 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
                             .as_deref()
                             .map(|n| n == session.raw_name)
                             .unwrap_or(false);
+                    let pending_mail =
+                        app.pending_mail_count(&session.machine, &session.raw_name);
                     render_session_row(
                         session,
                         in_folder,
                         is_selected,
                         app.selected_action,
                         is_current,
+                        pending_mail,
                     )
                 }
             }
@@ -334,6 +337,7 @@ fn render_session_row(
     is_selected: bool,
     selected_action: SessionAction,
     is_current: bool,
+    pending_mail: usize,
 ) -> ListItem<'static> {
     let dot = if session.attached { "●" } else { "○" };
     let dot_color = if session.attached {
@@ -413,6 +417,16 @@ fn render_session_row(
     if let Some(state) = chip_state {
         spans.push(Span::raw("  "));
         spans.push(claude_chip(state, session.claude_context_pct));
+    }
+
+    // Pending inter-session mail: a glanceable count. "Pending", not
+    // "unread" — ADE can't know whether Claude read a delivered message.
+    if pending_mail > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!(" ✉ {} ", pending_mail),
+            Style::default().fg(theme::BASE).bg(theme::YELLOW),
+        ));
     }
 
     if is_current {
@@ -1345,37 +1359,57 @@ fn render_help_bar(frame: &mut Frame, area: Rect, app: &App) {
             key("K/q/Esc"),
             txt(" back to tree"),
         ],
-        AppState::Tree => vec![
-            Span::raw(" "),
-            key("↑↓/jk"),
-            txt(" nav  "),
-            key("o/␣"),
-            txt(" expand  "),
-            key("⏎"),
-            txt(" attach  "),
-            key("Tab"),
-            txt(" embed  "),
-            key("p"),
-            txt(" preview-pane  "),
-            key("N"),
-            txt(" notify  "),
-            key("n"),
-            txt(" new  "),
-            key("R"),
-            txt(" rename  "),
-            key("y"),
-            txt(" duplicate  "),
-            key("d"),
-            txt(" delete  "),
-            key("K"),
-            txt(" kanban  "),
-            key("H"),
-            txt(" hosts  "),
-            key("r"),
-            txt(" refresh  "),
-            key("q"),
-            txt(" quit"),
-        ],
+        AppState::Tree => {
+            let mut spans = vec![
+                Span::raw(" "),
+                key("↑↓/jk"),
+                txt(" nav  "),
+                key("o/␣"),
+                txt(" expand  "),
+                key("⏎"),
+                txt(" attach  "),
+                key("Tab"),
+                txt(" embed  "),
+                key("p"),
+                txt(" preview-pane  "),
+                key("N"),
+                txt(" notify  "),
+                key("n"),
+                txt(" new  "),
+                key("R"),
+                txt(" rename  "),
+                key("y"),
+                txt(" duplicate  "),
+                key("d"),
+                txt(" delete  "),
+            ];
+            // Surface the mail-delivery key only when the selected session
+            // actually has queued mail — keeps the (already long) bar quiet
+            // otherwise.
+            let selected_has_mail = match app.current_row() {
+                Some(Row::Session(idx)) => app
+                    .tree
+                    .session(idx)
+                    .map(|s| app.pending_mail_count(&s.machine, &s.raw_name) > 0)
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if selected_has_mail {
+                spans.push(key("m"));
+                spans.push(txt(" deliver-mail  "));
+            }
+            spans.extend([
+                key("K"),
+                txt(" kanban  "),
+                key("H"),
+                txt(" hosts  "),
+                key("r"),
+                txt(" refresh  "),
+                key("q"),
+                txt(" quit"),
+            ]);
+            spans
+        }
         AppState::CreatingSession(_) => vec![
             Span::raw(" "),
             key("Tab"),

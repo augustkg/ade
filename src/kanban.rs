@@ -489,6 +489,7 @@ mod tests {
             claude_demoted: false,
             claude_present: claude.is_some(),
             claude_context_pct: None,
+            claude_last_activity: None,
         }
     }
 

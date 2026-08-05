@@ -1,6 +1,8 @@
 pub mod local;
 pub mod remote;
 
+use std::time::SystemTime;
+
 use crate::claude_status::{self, ClaudeState, ContextUsage, Provenance, Reading};
 use crate::hosts::Host;
 use crate::model::Machine;
@@ -51,6 +53,12 @@ pub struct Session {
     /// numbers; the TUI itself only renders the percentage. `None` whenever
     /// `claude_context_pct` is `None`.
     pub claude_usage: Option<ContextUsage>,
+    /// Most-recent Claude activity in this session, mirrored from
+    /// `ClaudeRollup::last_activity`. Local: the status-file mtime. Remote:
+    /// derived from the status file's `seq` (see `seq_to_activity`). Sorted
+    /// on by `Tree::group` to float the just-active session's folder to the
+    /// top. `None` for sessions with no usable activity signal yet.
+    pub claude_last_activity: Option<SystemTime>,
 }
 
 /// Per-session rollup of every Claude pane in that session — produced by
@@ -77,6 +85,58 @@ pub struct ClaudeRollup {
     /// one). Kept so the JSON output can report `model` / `ctx_tokens` /
     /// Claude `session_id`. Moves in lockstep with `context_pct`.
     pub context_usage: Option<ContextUsage>,
+    /// Most-recent Claude activity across this session's panes — the freshest
+    /// "user typed / Claude finished a turn" moment. Drives recency ordering
+    /// of folders in `Tree::group`. Sourced from each pane's
+    /// `Reading::last_activity` (local: file mtime; remote: `seq`-derived).
+    /// `None` when no pane had a usable activity signal (idle Claude that has
+    /// never written a status file, or a `seq` outside the plausible window).
+    pub last_activity: Option<SystemTime>,
+}
+
+/// How far a failed `send_text` got before it failed.
+///
+/// Delivering a line takes two tmux calls (body, then a separate `Enter` — see
+/// `LocalTmux::send_text` for why they cannot be combined), so a failure is not
+/// automatically a no-op.
+///
+/// The names are deliberately hedged. A successful tmux client exit proves the
+/// *server accepted the command*, not that bytes reached the program; a failed
+/// exit after dispatch does not prove they didn't. So the only two states worth
+/// distinguishing are "certainly nothing was typed" and "something may have
+/// been" — and the latter must never be retried (Codex review). This is an
+/// at-most-once channel: an uncertain message is dead-lettered, never
+/// re-injected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendProgress {
+    /// Rejected before the body command was dispatched (local validation, or
+    /// the tmux client failed to even run it). Nothing can have been typed, so
+    /// the caller may safely requeue.
+    NotStarted,
+    /// The body command was dispatched. Text may already sit in the
+    /// recipient's composer, so the caller MUST NOT retry or requeue —
+    /// doing so risks typing the body twice.
+    MayHaveTyped,
+}
+
+/// Why a `send_text` failed, plus how far it got.
+#[derive(Debug, Clone)]
+pub struct SendTextError {
+    pub message: String,
+    pub progress: SendProgress,
+}
+
+impl SendTextError {
+    /// True when the caller must not retry: something may already be typed.
+    pub fn is_ambiguous(&self) -> bool {
+        matches!(self.progress, SendProgress::MayHaveTyped)
+    }
+}
+
+impl std::fmt::Display for SendTextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
 }
 
 pub trait TmuxBackend {
@@ -98,6 +158,16 @@ pub trait TmuxBackend {
         new_name: &str,
         claude_running: bool,
     ) -> Result<(), String>;
+    /// Type `text` into a specific tmux pane and submit it. `target` is a
+    /// complete tmux target-pane string — the mail router passes an exact
+    /// `#{pane_id}` (e.g. `%3`), not a session name, so a session killed and
+    /// recreated under the same name can't receive the keys (the old pane id
+    /// is simply gone → the send fails rather than mis-delivering).
+    ///
+    /// `text` must be single-line printable content
+    /// (`crate::mail::validate_injection`); the impl issues the submit
+    /// itself, so no newline is ever embedded in `text`.
+    fn send_text(&self, target: &str, text: &str) -> Result<(), SendTextError>;
 }
 
 /// True if ADE is being launched from inside a tmux pane. Checks `TMUX`
@@ -111,6 +181,35 @@ pub fn is_inside_tmux() -> bool {
 /// the calling pane belongs to. Uses `#{session_name}` — `#{client_session}`
 /// is empty when tmux is invoked as a subprocess (no client context), so
 /// using it gave us false negatives on the same-session check.
+/// The mail address of a local tmux session: `"<server-pid>:<session_id>"`.
+///
+/// Both halves are needed. `#{session_id}` (`$N`) distinguishes a session from
+/// a later one reusing the same *name*, but the counter restarts at `$0` when
+/// the tmux server itself restarts — so `#{pid}` (the server pid) is included
+/// to keep the address unique across server generations. `mail` records this at
+/// send time and the router re-resolves it immediately before injecting.
+pub fn local_session_addr(name: &str) -> Option<String> {
+    // Trailing colon is required: `display-message -t` resolves a *pane*
+    // target, and a bare `=name` silently yields an EMPTY `#{session_id}`
+    // rather than erroring — which would produce an unverifiable address. Same
+    // gotcha `duplicate_session` and `capture_pane` document.
+    let target = format!("={}:", name);
+    let out = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "-t", &target, "#{pid}:#{session_id}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let addr = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Reject a half-resolved address (e.g. empty session_id) — an
+    // unverifiable address must never be stored.
+    match addr.split_once(':') {
+        Some((pid, sid)) if !pid.is_empty() && sid.starts_with('$') => Some(addr),
+        _ => None,
+    }
+}
+
 pub fn current_session() -> Option<String> {
     if !is_inside_tmux() {
         return None;
@@ -188,6 +287,7 @@ pub(crate) fn parse_session_line(line: &str) -> Option<Session> {
             claude_present: false,
             claude_context_pct: None,
             claude_usage: None,
+            claude_last_activity: None,
         })
     } else {
         None
@@ -295,6 +395,15 @@ pub(crate) fn map_claude_states(
         let Some(reading) = statuses.get(&pane_id) else {
             continue;
         };
+        // Track the freshest activity across the session's Claude panes,
+        // regardless of state — an idle pane whose turn *just* finished is
+        // exactly what should float its folder to the top.
+        if let Some(ts) = reading.last_activity {
+            entry.last_activity = Some(match entry.last_activity {
+                Some(cur) => cur.max(ts),
+                None => ts,
+            });
+        }
         if matches!(
             reading.state,
             ClaudeState::Working | ClaudeState::AwaitingApproval
@@ -356,6 +465,7 @@ mod claude_rollup_tests {
             provenance: Provenance::Recorded,
             usage,
             seq: None,
+            last_activity: None,
         }
     }
 
@@ -423,6 +533,30 @@ mod claude_rollup_tests {
             .get("sess")
             .expect("descendant-pid Claude must be detected");
         assert!(rollup.present);
+    }
+
+    #[test]
+    fn last_activity_is_maxed_across_panes_including_idle() {
+        use std::time::{Duration, SystemTime};
+        let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+        // Two Claude panes in one session: an older working pane and a
+        // newer *idle* pane (a turn that just finished). The rollup must
+        // take the newest timestamp regardless of state.
+        let panes = pane_line("sess", "claude", "%1", 1, "$1")
+            + "\n"
+            + &pane_line("sess", "claude", "%2", 2, "$1")
+            + "\n";
+        let mut statuses = HashMap::new();
+        let mut working = reading(ClaudeState::Working, None);
+        working.last_activity = Some(t(100));
+        let mut idle = reading(ClaudeState::Idle, None);
+        idle.last_activity = Some(t(200));
+        statuses.insert("%1".to_string(), working);
+        statuses.insert("%2".to_string(), idle);
+        let out = map_claude_states(&panes, &statuses, &HashSet::new());
+        let rollup = out.get("sess").expect("rollup");
+        assert_eq!(rollup.last_activity, Some(t(200)), "newest wins, idle included");
+        assert_eq!(rollup.state, Some(ClaudeState::Working), "state still from active pane");
     }
 
     #[test]

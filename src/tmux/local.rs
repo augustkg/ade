@@ -1,5 +1,6 @@
 use super::{
-    is_session_uuid, map_claude_states, parse_pane_line, parse_session_line, Session, TmuxBackend,
+    is_session_uuid, map_claude_states, parse_pane_line, parse_session_line, SendProgress,
+    SendTextError, Session, TmuxBackend,
 };
 use crate::claude_status;
 use std::process::Command;
@@ -83,6 +84,7 @@ impl TmuxBackend for LocalTmux {
                 s.claude_present = rollup.present;
                 s.claude_context_pct = rollup.context_pct;
                 s.claude_usage = rollup.context_usage.clone();
+                s.claude_last_activity = rollup.last_activity;
             }
         }
 
@@ -240,6 +242,95 @@ impl TmuxBackend for LocalTmux {
             Err(msg.to_string())
         }
     }
+
+    fn send_text(&self, target: &str, text: &str) -> Result<(), SendTextError> {
+        // Injection-boundary revalidation: the sole place text enters a live
+        // pane, so re-check here even if the caller already validated — a
+        // forged inbox file must never get a control/ESC through. Nothing has
+        // been typed yet, so this failure is a clean no-op.
+        if let Err(e) = crate::mail::validate_injection(text) {
+            return Err(SendTextError { message: e, progress: SendProgress::NotStarted });
+        }
+
+        // TWO separate `tmux` invocations: the body, then a bare `Enter`.
+        //
+        // This shape is load-bearing and was established by measuring the
+        // bytes a real Claude Code pane receives. Claude's TUI only treats a
+        // carriage return as *submit* when it arrives as its own pty read; a
+        // CR that arrives in the same read burst as the text is interpreted as
+        // pasted multi-line content, so the message just sits in the composer
+        // unsent. Both "clever" one-shot forms hit exactly that:
+        //
+        //   send-keys -l "<text>\r"                  → one 34-byte read  ✗
+        //   send-keys -l "<text>" ';' send-keys Enter → one 34-byte read  ✗
+        //     (tmux coalesces a chained command sequence into a single write)
+        //   two separate invocations                  → 18-byte + 1-byte  ✓
+        //
+        // Note a line-discipline program like `cat` accepts the coalesced
+        // forms, so only a raw-mode TUI (or a byte-level probe) reveals this.
+        //
+        // The cost is a small window in which the user could type between the
+        // body and the submit. That is accepted: delivery is human-triggered
+        // against a session observed idle, and a message that never submits is
+        // a total failure whereas the interleave is a rare cosmetic race.
+        // `target` is a caller-supplied exact pane target (e.g. `%3`).
+        let body = Command::new("tmux")
+            .args(send_body_args(target, text))
+            .output()
+            .map_err(|e| SendTextError {
+                message: format!("send-keys (body) failed: {}", e),
+                progress: SendProgress::NotStarted,
+            })?;
+        if !body.status.success() {
+            let stderr = String::from_utf8_lossy(&body.stderr);
+            return Err(SendTextError {
+                message: format!(
+                    "send-keys (body) failed: {}",
+                    stderr.lines().next().unwrap_or("unknown error")
+                ),
+                // The tmux client refused the command outright.
+                progress: SendProgress::NotStarted,
+            });
+        }
+
+        // From here the body IS in the recipient's composer. Any failure is
+        // therefore a *partial* send: the caller must not retry, or the body
+        // would be typed twice.
+        let enter = Command::new("tmux")
+            .args(send_enter_args(target))
+            .output()
+            .map_err(|e| SendTextError {
+                message: format!("send-keys (Enter) failed: {}", e),
+                progress: SendProgress::MayHaveTyped,
+            })?;
+        if !enter.status.success() {
+            let stderr = String::from_utf8_lossy(&enter.stderr);
+            return Err(SendTextError {
+                message: format!(
+                    "send-keys (Enter) failed: {}",
+                    stderr.lines().next().unwrap_or("unknown error")
+                ),
+                progress: SendProgress::MayHaveTyped,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// argv for the body half of a `send_text` — the literal text, with no
+/// submit of any kind. Extracted so unit tests can pin the command shape
+/// without a live tmux server; the split from `send_enter_args` is
+/// load-bearing (see `LocalTmux::send_text`).
+pub(crate) fn send_body_args<'a>(target: &'a str, text: &'a str) -> Vec<&'a str> {
+    vec!["send-keys", "-t", target, "-l", text]
+}
+
+/// argv for the submit half — a bare `Enter` key name (NOT `-l`, so tmux
+/// resolves it as a key press). Must be a *separate* tmux invocation from
+/// `send_body_args`: any form that lets the CR share a pty read with the body
+/// is interpreted as pasted text and never submits.
+pub(crate) fn send_enter_args(target: &str) -> Vec<&str> {
+    vec!["send-keys", "-t", target, "Enter"]
 }
 
 /// Find the most recently modified `.jsonl` in
@@ -318,6 +409,45 @@ pub fn capture_pane(name: &str) -> Result<String, String> {
         return Err(format!("tmux capture-pane: {}", stderr.trim()));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod send_text_tests {
+    use super::{send_body_args, send_enter_args};
+
+    /// Regression guard for a bug found by measuring the bytes a real Claude
+    /// Code pane receives: the submit must be a SEPARATE tmux invocation, so
+    /// the carriage return arrives as its own pty read. Any form that lets the
+    /// CR share a read with the body (a trailing `\r` in the `-l` payload, or
+    /// two commands chained with `;` in one invocation — tmux coalesces those
+    /// into a single write) is interpreted as pasted text and the message sits
+    /// unsent in the composer. Line-discipline programs like `cat` accept the
+    /// coalesced forms, so the behavioural acceptance test cannot catch this —
+    /// hence this structural check.
+    #[test]
+    fn body_is_literal_and_carries_no_submit() {
+        let args = send_body_args("%7", "[ADE mail from a] hi");
+        assert_eq!(args, vec!["send-keys", "-t", "%7", "-l", "[ADE mail from a] hi"]);
+        // No submit may ride along with the body — not as a CR/LF in any
+        // argument, and not as a chained second command.
+        assert!(
+            !args.iter().any(|a| a.contains('\r') || a.contains('\n')),
+            "body argv must not carry a newline/CR: {:?}",
+            args
+        );
+        assert!(!args.contains(&";"), "body argv must not chain a second command");
+        assert!(!args.contains(&"Enter"));
+        assert_eq!(args.iter().filter(|a| **a == "send-keys").count(), 1);
+    }
+
+    #[test]
+    fn submit_is_a_bare_enter_key_to_the_same_pane() {
+        let args = send_enter_args("%7");
+        // Bare key name, NOT `-l` — otherwise tmux would type the literal
+        // word "Enter" instead of pressing the key.
+        assert_eq!(args, vec!["send-keys", "-t", "%7", "Enter"]);
+        assert!(!args.contains(&"-l"));
+    }
 }
 
 #[cfg(test)]
