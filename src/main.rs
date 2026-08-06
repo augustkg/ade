@@ -19,6 +19,7 @@ mod peek;
 mod preview_pane;
 mod prompt_snapshot;
 mod refresh;
+mod spawn;
 mod ssh_io;
 mod state;
 mod term_title;
@@ -54,6 +55,7 @@ fn main() -> Result<()> {
             "debug" => return run_debug(&argv[2..]),
             "kanban" => return run_kanban(&argv[2..]),
             "mail" => return run_mail(&argv[2..]),
+            "session" => return run_session(&argv[2..]),
             // Non-interactive JSON inventory / monitor summary. Both diverge
             // (print to stdout and `std::process::exit`) — they never start
             // the TUI and never return.
@@ -113,6 +115,7 @@ fn print_usage() {
          \x20\x20ade mail whoami                         Print this tmux session's name (its mail address)\n\
          \x20\x20ade mail list                           Show this session's pending messages\n\
          \x20\x20ade mail deliver [--session S] [--dry-run]  Deliver queued mail without the TUI (headless router)\n\
+         \x20\x20ade session new --name N [--cwd D] [--prompt TEXT]  Spin up a new workstream session\n\
          \x20\x20ade sessions --json [--local]          Print the full cross-host session inventory as JSON\n\
          \x20\x20ade status --json [--local]            Print a Claude monitor summary as JSON\n\
          \x20\x20ade peek <session> --json              Print what a local session is asking + a transcript recap\n\
@@ -531,6 +534,129 @@ fn run_mail_deliver(only: Option<&str>, dry_run: bool) -> usize {
         }
     }
     delivered
+}
+
+/// `ade session new --name N [--cwd D] [--prompt TEXT] [--no-claude]`.
+///
+/// Lets an orchestrator session create a new workstream. Two design choices
+/// worth knowing:
+///
+///  * **The initial prompt is delivered as mail, not typed here.** A freshly
+///    spawned Claude takes seconds to boot, so typing immediately would land in
+///    a terminal that isn't listening. Queuing it means the existing router
+///    delivers it exactly when the new session is idle with an empty composer,
+///    reusing every gate rather than inventing a second, weaker path.
+///  * **Lineage is stamped on the tmux session**, so depth and quota survive
+///    ADE restarts and are cleaned up by `tmux kill-session`.
+fn run_session(args: &[String]) -> Result<()> {
+    fn fail(msg: &str) -> ! {
+        eprintln!("Error: {}", msg);
+        std::process::exit(2);
+    }
+    if args.is_empty() || args[0] != "new" {
+        fail("`ade session` requires a subcommand: new");
+    }
+
+    let mut name: Option<String> = None;
+    let mut cwd: Option<String> = None;
+    let mut prompt: Option<String> = None;
+    let mut run_claude = true;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" => {
+                if i + 1 >= args.len() { fail("--name requires a value"); }
+                name = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--cwd" => {
+                if i + 1 >= args.len() { fail("--cwd requires a value"); }
+                cwd = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--prompt" => {
+                if i + 1 >= args.len() { fail("--prompt requires a value"); }
+                prompt = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--no-claude" => { run_claude = false; i += 1; }
+            other => fail(&format!("unknown argument '{}'", other)),
+        }
+    }
+
+    let name = name.unwrap_or_else(|| {
+        fail("usage: ade session new --name <name> [--cwd D] [--prompt TEXT]")
+    });
+    // Validate the name before touching the environment: a bad name is the
+    // most useful error to return, and it must not be masked by "you are not
+    // inside tmux".
+    if let Err(e) = spawn::validate_session_name(&name) {
+        fail(&e);
+    }
+    // A prompt must survive being typed into a prompt line, same rules as mail.
+    if let Some(p) = &prompt {
+        if let Err(e) = mail::validate_body(p) {
+            fail(&format!("--prompt rejected: {}", e));
+        }
+    }
+
+    // The caller is the parent of the chain. Outside tmux there is no parent,
+    // which also means no depth accounting — refuse rather than silently
+    // rooting a new chain from nowhere.
+    let parent = tmux::current_session().unwrap_or_else(|| {
+        fail("not inside a tmux session — `ade session new` records the calling \
+              session as the new one's parent")
+    });
+
+    let inventory = match tmux::local::spawn_inventory() {
+        Ok(inv) => inv,
+        Err(e) => fail(&e),
+    };
+    let caller_depth = inventory
+        .iter()
+        .find(|r| r.name == parent)
+        .map(|r| r.depth)
+        .unwrap_or(0);
+    let depth = match spawn::authorize_spawn(caller_depth, &inventory, &name) {
+        Ok(d) => d,
+        Err(e) => fail(&e),
+    };
+
+    let cwd = cwd.unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
+
+    if let Err(e) = tmux::local::spawn_session(&name, &cwd, run_claude, &parent, depth) {
+        fail(&e);
+    }
+    println!("session: created '{}' in {} (depth {})", name, cwd, depth);
+
+    let Some(prompt) = prompt else {
+        return Ok(());
+    };
+
+    // Queue the opening instruction. The recipient address must be read AFTER
+    // creation, and delivery waits for the new Claude to actually be idle.
+    let Some(to_addr) = tmux::local_session_addr(&name) else {
+        eprintln!(
+            "Warning: created '{}' but could not resolve its address; \
+             re-send the prompt with `ade mail send` once it is up.",
+            name
+        );
+        return Ok(());
+    };
+    let from_id = tmux::local_session_addr(&parent).unwrap_or_default();
+    match mail::write_message(&parent, &from_id, &name, &to_addr, &prompt) {
+        Ok(id) => println!(
+            "session: opening prompt queued for '{}' (id {}) — it is delivered \
+             once that session is idle at its prompt.",
+            name, id
+        ),
+        Err(e) => eprintln!("Warning: session created but prompt not queued: {}", e),
+    }
+    Ok(())
 }
 
 fn run_debug(args: &[String]) -> Result<()> {

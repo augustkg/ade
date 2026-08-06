@@ -317,6 +317,108 @@ impl TmuxBackend for LocalTmux {
     }
 }
 
+/// Read every local session's spawn lineage in one call, for the quota and
+/// depth checks in `crate::spawn`.
+pub fn spawn_inventory() -> Result<Vec<crate::spawn::SpawnRecord>, String> {
+    let out = Command::new("tmux")
+        .args([
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{@ade-spawned-by}\t#{@ade-spawn-depth}",
+        ])
+        .output()
+        .map_err(|e| format!("tmux list-sessions failed: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // No server running is a confirmed-empty list, not a failure.
+        if super::is_no_server_error(&stderr) {
+            return Ok(Vec::new());
+        }
+        return Err(format!(
+            "tmux list-sessions failed: {}",
+            stderr.lines().next().unwrap_or("unknown error")
+        ));
+    }
+    Ok(crate::spawn::parse_spawn_inventory(
+        &String::from_utf8_lossy(&out.stdout),
+    ))
+}
+
+
+/// Create a detached session named `name` in `cwd`, optionally running Claude,
+/// and stamp its lineage so depth/quota checks can see it later.
+///
+/// Claude is launched through `bash -lc` for the same reason
+/// `duplicate_session` does: tmux would otherwise use a bare `/bin/sh -c` PATH
+/// and fail to find a `claude` installed in a user-managed bin dir.
+///
+/// The caller is expected to have run `crate::spawn::authorize_spawn` first;
+/// this performs no policy of its own beyond what tmux enforces.
+pub fn spawn_session(
+    name: &str,
+    cwd: &str,
+    run_claude: bool,
+    parent: &str,
+    depth: u32,
+) -> Result<(), String> {
+    let mut args: Vec<String> = vec![
+        "new-session".into(),
+        "-d".into(),
+        "-s".into(),
+        name.to_string(),
+        "-c".into(),
+        cwd.to_string(),
+    ];
+    if run_claude {
+        args.push("bash -lc 'claude'".into());
+    }
+    let out = Command::new("tmux")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("tmux new-session failed: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "could not create session: {}",
+            stderr.lines().next().unwrap_or("tmux new-session failed")
+        ));
+    }
+
+    // Stamp lineage. `set-option -t` resolves a *pane* target, so `=name` alone
+    // silently fails — address the resolved `$id` instead (same gotcha
+    // `set_session_title_option` documents). Best-effort: a missing marker only
+    // costs us depth accounting, and is not worth unwinding a live session for.
+    if let Some(id) = lookup_session_id_local(name) {
+        for (opt, val) in [
+            ("@ade-spawned-by", parent.to_string()),
+            ("@ade-spawn-depth", depth.to_string()),
+        ] {
+            let _ = Command::new("tmux")
+                .args(["set-option", "-t", &id, opt, &val])
+                .output();
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a session name to its `$id` by exact match. `list-sessions` is used
+/// rather than a `-t` lookup because `=name` targets are pane-scoped and refuse
+/// to resolve for `set-option`.
+fn lookup_session_id_local(name: &str) -> Option<String> {
+    let out = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}\t#{session_id}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .filter_map(|l| l.split_once('\t'))
+        .find(|(n, _)| *n == name)
+        .map(|(_, id)| id.trim().to_string())
+}
+
 /// argv for the body half of a `send_text` — the literal text, with no
 /// submit of any kind. Extracted so unit tests can pin the command shape
 /// without a live tmux server; the split from `send_enter_args` is
