@@ -141,6 +141,68 @@ pub fn authorize_spawn(
     Ok(child_depth)
 }
 
+/// Whether Claude has already accepted its workspace-trust dialog for `cwd`.
+///
+/// Claude records accepted directories in `~/.claude.json` under `projects`.
+/// Spawning into a directory that isn't there produces a session that sits at
+/// the trust prompt and never starts, so `ade session new` warns up front
+/// instead of letting it stall silently.
+///
+/// Deliberately advisory, not authoritative: this reads another tool's private
+/// config, which may move or change shape. `Unknown` means "don't claim
+/// anything" — callers must not refuse on it, because a wrong refusal is worse
+/// than a stall we can now diagnose at delivery time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustState {
+    Trusted,
+    Untrusted,
+    Unknown,
+}
+
+/// Decide the trust state of `cwd` from the parsed contents of
+/// `~/.claude.json`. Split from the file read so it can be tested.
+///
+/// A parent directory being trusted covers its children, matching how the
+/// dialog behaves — trusting `~/Dev` means sessions in `~/Dev/foo` start
+/// without prompting.
+pub fn trust_state_for(cwd: &str, trusted_dirs: &[String]) -> TrustState {
+    if trusted_dirs.is_empty() {
+        return TrustState::Unknown;
+    }
+    let cwd = cwd.trim_end_matches('/');
+    for dir in trusted_dirs {
+        let d = dir.trim_end_matches('/');
+        if d.is_empty() {
+            continue;
+        }
+        if cwd == d || cwd.starts_with(&format!("{}/", d)) {
+            return TrustState::Trusted;
+        }
+    }
+    TrustState::Untrusted
+}
+
+/// Extract the directories whose trust dialog has been accepted from the raw
+/// text of `~/.claude.json`. Returns an empty vec on any parse trouble, which
+/// `trust_state_for` maps to `Unknown`.
+pub fn parse_trusted_dirs(config_json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(config_json) else {
+        return Vec::new();
+    };
+    let Some(projects) = v.get("projects").and_then(|p| p.as_object()) else {
+        return Vec::new();
+    };
+    projects
+        .iter()
+        .filter(|(_, cfg)| {
+            cfg.get("hasTrustDialogAccepted")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false)
+        })
+        .map(|(dir, _)| dir.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +329,48 @@ mod tests {
         // Even at quota, the name error is the useful one to surface.
         let e = authorize_spawn(0, &inv, "bad name").unwrap_err();
         assert!(e.contains("may only contain"));
+    }
+
+    // ── workspace trust pre-flight ──
+
+    #[test]
+    fn parses_only_accepted_projects() {
+        let cfg = r#"{"projects":{
+            "/home/h/Dev":{"hasTrustDialogAccepted":true},
+            "/home/h/Other":{"hasTrustDialogAccepted":false},
+            "/home/h/NoFlag":{}
+        }}"#;
+        let mut dirs = parse_trusted_dirs(cfg);
+        dirs.sort();
+        assert_eq!(dirs, vec!["/home/h/Dev".to_string()]);
+    }
+
+    #[test]
+    fn unreadable_or_odd_config_yields_no_claim() {
+        for bad in ["", "not json", "{}", r#"{"projects":[]}"#] {
+            assert!(parse_trusted_dirs(bad).is_empty(), "{:?}", bad);
+            assert_eq!(
+                trust_state_for("/anywhere", &parse_trusted_dirs(bad)),
+                TrustState::Unknown,
+                "must not assert untrusted when the config can't be read"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_is_inherited_by_subdirectories() {
+        let dirs = vec!["/home/h/Dev".to_string()];
+        assert_eq!(trust_state_for("/home/h/Dev", &dirs), TrustState::Trusted);
+        assert_eq!(trust_state_for("/home/h/Dev/x/y", &dirs), TrustState::Trusted);
+        // Trailing slashes on either side must not change the answer.
+        assert_eq!(trust_state_for("/home/h/Dev/", &dirs), TrustState::Trusted);
+    }
+
+    #[test]
+    fn a_sibling_with_a_shared_prefix_is_not_trusted() {
+        // "/home/h/Devious" must not inherit "/home/h/Dev".
+        let dirs = vec!["/home/h/Dev".to_string()];
+        assert_eq!(trust_state_for("/home/h/Devious", &dirs), TrustState::Untrusted);
+        assert_eq!(trust_state_for("/home/h", &dirs), TrustState::Untrusted);
     }
 }

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The embedded-terminal acceptance tests run `tmux attach` inside a PTY.
+  # A runner has no TERM, and tmux refuses with "terminal does not support
+  # clear", so those tests fail at setup rather than exercising anything.
+  TERM: xterm-256color
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The acceptance tests drive a real tmux server on an isolated socket.
+      # Without tmux they fail at setup rather than being skipped, which is the
+      # behaviour we want: silently losing that coverage would defeat the point.
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      # Run tests explicitly, not just `cargo build`. A merge once left `main`
+      # compiling under `--release` while the test build was broken, so a
+      # build-only gate would have passed it.
+      - name: Test
+        run: cargo test --locked
+
+      # Warnings are not failed here: the repo carries a known backlog. This
+      # reports them so a PR that adds new ones is visible in the log.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets
