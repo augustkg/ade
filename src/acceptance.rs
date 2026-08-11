@@ -547,6 +547,10 @@ fn acceptance_duplicate_session_no_claude() {
 fn acceptance_duplicate_session_claude_with_jsonl() {
     let _lock = acquire_acceptance_lock();
     let tmux = IsolatedTmux::spawn();
+    // Without a `claude` on the login-shell PATH the duplicated pane exits
+    // immediately and reports no cwd — which made this test quietly depend on
+    // the machine running it having Claude installed.
+    tmux.install_claude_shim().expect("install claude shim");
     tmux.new_session("src", 80, 24).expect("new-session");
     tmux.set_option("remain-on-exit", "on")
         .expect("remain-on-exit on");

@@ -199,6 +199,37 @@ impl IsolatedTmux {
         cmd
     }
 
+    /// Put a fake `claude` on the PATH that a login shell will find, and keep
+    /// it alive so the pane it starts in stays queryable.
+    ///
+    /// `duplicate_session` launches Claude as `bash -lc 'claude …'`
+    /// specifically so login-shell init supplies the PATH — real installs live
+    /// in user-managed bin dirs. A test that depends on the developer having
+    /// Claude installed passes on a laptop and fails on a runner (where the
+    /// pane dies instantly and reports no cwd), so the fixture provides its
+    /// own. Installing it via `.bash_profile` also means the test exercises
+    /// that login-shell PATH behaviour rather than assuming it.
+    pub fn install_claude_shim(&self) -> Result<(), String> {
+        let bin = self.home.join("bin");
+        std::fs::create_dir_all(&bin).map_err(|e| format!("mkdir bin: {}", e))?;
+        let shim = bin.join("claude");
+        // Stays alive so the pane keeps a cwd to report; ignores its args.
+        std::fs::write(&shim, "#!/bin/sh\nexec sleep 300\n")
+            .map_err(|e| format!("write shim: {}", e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod shim: {}", e))?;
+        }
+        std::fs::write(
+            self.home.join(".bash_profile"),
+            "export PATH=\"$HOME/bin:$PATH\"\n",
+        )
+        .map_err(|e| format!("write .bash_profile: {}", e))?;
+        Ok(())
+    }
+
     /// Create a detached session running an arbitrary command, with extra
     /// environment entries applied to the pane (`new-session -e`, tmux 3.2+).
     /// Used to host purpose-built fixtures — e.g. the raw-read probe, or a
