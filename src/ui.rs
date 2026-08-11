@@ -199,6 +199,7 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
                             .unwrap_or(false);
                     let pending_mail =
                         app.pending_mail_count(&session.machine, &session.raw_name);
+                    let held_mail = app.pending_mail_held(session_idx);
                     render_session_row(
                         session,
                         in_folder,
@@ -206,6 +207,7 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
                         app.selected_action,
                         is_current,
                         pending_mail,
+                        held_mail,
                     )
                 }
             }
@@ -338,6 +340,7 @@ fn render_session_row(
     selected_action: SessionAction,
     is_current: bool,
     pending_mail: usize,
+    held_mail: Option<(std::time::Duration, crate::mail_delivery::HeldReason)>,
 ) -> ListItem<'static> {
     let dot = if session.attached { "●" } else { "○" };
     let dot_color = if session.attached {
@@ -421,12 +424,37 @@ fn render_session_row(
 
     // Pending inter-session mail: a glanceable count. "Pending", not
     // "unread" — ADE can't know whether Claude read a delivered message.
+    //
+    // Once it has waited past `HELD_AFTER` the chip also carries how long and
+    // why. That is the difference between "a message is queued" and "this
+    // workstream has been stuck for 40 minutes and nobody noticed" — the
+    // failure mode an unattended router otherwise hides in a log.
     if pending_mail > 0 {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!(" ✉ {} ", pending_mail),
-            Style::default().fg(theme::BASE).bg(theme::YELLOW),
-        ));
+        match held_mail {
+            None => spans.push(Span::styled(
+                format!(" ✉ {} ", pending_mail),
+                Style::default().fg(theme::BASE).bg(theme::YELLOW),
+            )),
+            Some((wait, reason)) => {
+                // A session that is merely mid-turn will clear on its own, so
+                // it stays yellow; anything else wants a human and goes red.
+                let bg = if reason.is_transient() {
+                    theme::YELLOW
+                } else {
+                    theme::RED
+                };
+                spans.push(Span::styled(
+                    format!(
+                        " ✉ {} · {} {} ",
+                        pending_mail,
+                        crate::mail_delivery::format_wait(wait),
+                        reason.short_label()
+                    ),
+                    Style::default().fg(theme::BASE).bg(bg),
+                ));
+            }
+        }
     }
 
     if is_current {

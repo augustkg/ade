@@ -496,6 +496,11 @@ pub struct App {
     /// `deliver_selected_mail` consumes it on the user's key. P1 recipients
     /// are always local.
     pub mail_pending: HashMap<(Machine, String), Vec<mail::Message>>,
+    /// When the oldest queued message for each recipient was first seen (the
+    /// file's mtime, not the sender's clock). Drives the "held for 12m" signal
+    /// so a stalled workstream is visible on the board instead of only in a
+    /// router log. Free to compute — `process_mail` already stats each file.
+    pub mail_oldest: HashMap<(Machine, String), std::time::SystemTime>,
 }
 
 impl Default for App {
@@ -556,6 +561,7 @@ impl App {
             kanban_placements,
             kanban_filter,
             mail_pending: HashMap::new(),
+            mail_oldest: HashMap::new(),
         };
         app.refresh();
         app
@@ -745,6 +751,7 @@ impl App {
         }
 
         let mut pending: HashMap<(Machine, String), Vec<mail::Message>> = HashMap::new();
+        let mut oldest: HashMap<(Machine, String), std::time::SystemTime> = HashMap::new();
         for (path, msg) in mail::read_inbox() {
             // Safety valve: expire messages that have waited too long. Uses
             // the file's mtime (first-seen), not the sender's timestamp. The
@@ -770,9 +777,44 @@ impl App {
             }
             // P1: all recipients are local.
             let key = (Machine::Local, msg.to_session.clone());
+            // First-seen wins: the inbox is in publish order, so the first
+            // message for a recipient is the one that has waited longest.
+            if let Ok(seen) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+                oldest.entry(key.clone()).or_insert(seen);
+            }
             pending.entry(key).or_default().push(msg);
         }
         self.mail_pending = pending;
+        self.mail_oldest = oldest;
+    }
+
+    /// How long the oldest queued message for a session has been waiting.
+    pub fn pending_mail_wait(
+        &self,
+        machine: &Machine,
+        session_name: &str,
+    ) -> Option<std::time::Duration> {
+        self.mail_oldest
+            .get(&(machine.clone(), session_name.to_string()))
+            .and_then(|t| t.elapsed().ok())
+    }
+
+    /// The held signal for a session row: `Some((wait, reason))` once mail has
+    /// been queued longer than `HELD_AFTER`. `None` while it is merely pending,
+    /// so the ordinary case stays quiet.
+    pub fn pending_mail_held(
+        &self,
+        idx: usize,
+    ) -> Option<(std::time::Duration, mail_delivery::HeldReason)> {
+        let s = self.tree.session(idx)?;
+        let wait = self.pending_mail_wait(&s.machine, &s.raw_name)?;
+        if wait < mail_delivery::HELD_AFTER {
+            return None;
+        }
+        Some((
+            wait,
+            mail_delivery::HeldReason::from_session_state(s.claude_present, s.claude),
+        ))
     }
 
     /// Number of pending messages queued for a session — drives the `✉ N`

@@ -417,6 +417,83 @@ pub fn execute(
     }
 }
 
+/// Why a queued message is sitting there, as far as ADE can tell **without**
+/// running a tmux query.
+///
+/// The router logs an exact reason when it tries to deliver, but nobody reads a
+/// router log — the operator watching the TUI needs to know that mail is stuck
+/// and roughly why. This derives what it can from the session state already
+/// held in memory, so it costs nothing per refresh. The precise reason (draft
+/// in the composer, workspace trust, multi-pane, identity mismatch) needs a
+/// pane probe and is surfaced when the user actually presses `m`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldReason {
+    /// Claude is mid-turn; delivery waits for the turn to end. Expected, brief.
+    Working,
+    /// Sitting at a permission prompt — ADE will not type there.
+    AwaitingApproval,
+    /// No Claude in that session at all; nothing will ever pick this up until
+    /// one is started.
+    NoClaude,
+    /// Nothing in the cheap state explains it — the blocker is something only a
+    /// pane probe can see (an unsent draft, the workspace-trust screen, more
+    /// than one pane, or a recreated session).
+    NeedsProbe,
+}
+
+impl HeldReason {
+    /// From the session facts ADE already refreshes every ~2s.
+    pub fn from_session_state(
+        claude_present: bool,
+        claude: Option<ClaudeState>,
+    ) -> Self {
+        if !claude_present {
+            return HeldReason::NoClaude;
+        }
+        match claude {
+            Some(ClaudeState::Working) => HeldReason::Working,
+            Some(ClaudeState::AwaitingApproval) => HeldReason::AwaitingApproval,
+            _ => HeldReason::NeedsProbe,
+        }
+    }
+
+    /// Compact label for the session row.
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            HeldReason::Working => "busy",
+            HeldReason::AwaitingApproval => "approve",
+            HeldReason::NoClaude => "no claude",
+            HeldReason::NeedsProbe => "blocked",
+        }
+    }
+
+    /// Whether this is a normal transient wait rather than something the
+    /// operator probably has to act on. A session that is merely mid-turn will
+    /// clear on its own; the others generally will not.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, HeldReason::Working)
+    }
+}
+
+/// How long a message may wait before the UI calls it *held* rather than merely
+/// pending. Long enough that an ordinary turn (and the ~2s router cadence)
+/// doesn't trip it, short enough that a real stall is visible quickly.
+pub const HELD_AFTER: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Render a wait as a compact age for the session row: `45s`, `12m`, `3h`, `2d`.
+pub fn format_wait(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
 #[cfg(test)]
 mod composer_state_tests {
     //! Table-driven tests for `composer_state`, built from real
@@ -1000,5 +1077,93 @@ mod policy_tests {
             }
             other => panic!("expected RequeueFailed, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod held_signal_tests {
+    //! The held signal exists so a stalled workstream is visible on the board
+    //! rather than only in a router log nobody reads. These pin the two things
+    //! that matter: the reason derived from cheap state, and whether it reads
+    //! as "will clear itself" or "needs you".
+    use super::*;
+    use crate::claude_status::ClaudeState;
+    use std::time::Duration;
+
+    #[test]
+    fn reason_is_derived_from_state_ade_already_has() {
+        assert_eq!(
+            HeldReason::from_session_state(true, Some(ClaudeState::Working)),
+            HeldReason::Working
+        );
+        assert_eq!(
+            HeldReason::from_session_state(true, Some(ClaudeState::AwaitingApproval)),
+            HeldReason::AwaitingApproval
+        );
+        // Idle with a live Claude: the blocker needs a pane probe to name.
+        assert_eq!(
+            HeldReason::from_session_state(true, None),
+            HeldReason::NeedsProbe
+        );
+    }
+
+    #[test]
+    fn no_claude_outranks_whatever_state_was_recorded() {
+        // A stale status file must not make an empty session look merely busy —
+        // nothing will ever pick that mail up.
+        for st in [None, Some(ClaudeState::Working), Some(ClaudeState::AwaitingApproval)] {
+            assert_eq!(
+                HeldReason::from_session_state(false, st),
+                HeldReason::NoClaude,
+                "claude_present=false must dominate ({:?})",
+                st
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_running_turn_counts_as_transient() {
+        // Transient decides yellow vs red on the board: everything else is a
+        // stall a human has to clear.
+        assert!(HeldReason::Working.is_transient());
+        for r in [
+            HeldReason::AwaitingApproval,
+            HeldReason::NoClaude,
+            HeldReason::NeedsProbe,
+        ] {
+            assert!(!r.is_transient(), "{:?} should read as needing a human", r);
+        }
+    }
+
+    #[test]
+    fn every_reason_has_a_short_label() {
+        for r in [
+            HeldReason::Working,
+            HeldReason::AwaitingApproval,
+            HeldReason::NoClaude,
+            HeldReason::NeedsProbe,
+        ] {
+            let l = r.short_label();
+            assert!(!l.is_empty() && l.len() <= 10, "{:?} -> {:?}", r, l);
+        }
+    }
+
+    #[test]
+    fn wait_is_formatted_compactly_across_scales() {
+        assert_eq!(format_wait(Duration::from_secs(0)), "0s");
+        assert_eq!(format_wait(Duration::from_secs(59)), "59s");
+        assert_eq!(format_wait(Duration::from_secs(60)), "1m");
+        assert_eq!(format_wait(Duration::from_secs(3599)), "59m");
+        assert_eq!(format_wait(Duration::from_secs(3600)), "1h");
+        assert_eq!(format_wait(Duration::from_secs(86_399)), "23h");
+        assert_eq!(format_wait(Duration::from_secs(86_400)), "1d");
+        assert_eq!(format_wait(Duration::from_secs(86_400 * 9)), "9d");
+    }
+
+    #[test]
+    fn held_threshold_outlasts_an_ordinary_turn() {
+        // Must not fire for a session that is simply mid-response, or the
+        // signal becomes noise and gets ignored.
+        assert!(HELD_AFTER >= Duration::from_secs(60));
     }
 }
