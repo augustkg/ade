@@ -407,10 +407,13 @@ fn run_mail(args: &[String]) -> Result<()> {
                     other => fail(&format!("unknown argument '{}'", other)),
                 }
             }
-            let delivered = run_mail_deliver(only.as_deref(), dry_run);
-            if delivered == 0 {
-                std::process::exit(1);
-            }
+            // Exit 0 whether or not anything moved: "nothing pending" and
+            // "held until that session is idle" are the system working, not
+            // failures. This runs on a timer, and a unit that reports failure
+            // every 30s trains the operator to ignore it — the exact habit that
+            // hides a real fault. Hard errors (no mailbox, tmux unusable) still
+            // exit non-zero from inside.
+            let _ = run_mail_deliver(only.as_deref(), dry_run);
         }
         other => fail(&format!(
             "unknown mail subcommand '{}': use send | whoami | list | deliver",
