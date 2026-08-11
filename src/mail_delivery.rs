@@ -24,10 +24,28 @@ pub enum ComposerState {
     /// Prompt found with text already in it — a human's unsent draft.
     /// Injecting would append to it and submit both together.
     Draft,
+    /// Claude is showing its first-run workspace-trust dialog instead of a
+    /// composer ("Do you trust the files in this folder?"). Refuses like
+    /// `Unknown`, but it is worth its own variant because the cause is
+    /// specific, common for freshly spawned sessions, and has an obvious fix —
+    /// and because that screen contains a prompt glyph, so a looser reading
+    /// could "find a prompt" and answer a security dialog.
+    AwaitingTrust,
     /// No prompt line found, or the pane couldn't be read. We can't prove the
     /// composer is empty, so callers must treat this as unsafe (fail-closed).
     Unknown,
 }
+
+/// Markers for Claude's first-run workspace-trust screen. Matched
+/// case-insensitively against the whole capture. Kept to short, stable phrases
+/// rather than the full layout: a miss only costs us a vaguer message (we still
+/// refuse via `Unknown`), so over-fitting to the exact wording would be worse
+/// than matching loosely.
+const TRUST_MARKERS: &[&str] = &[
+    "trust the files in this folder",
+    "trust this folder",
+    "do you trust",
+];
 
 /// Claude Code's composer prompt marker.
 const COMPOSER_PROMPT: char = '\u{276F}';
@@ -132,6 +150,18 @@ pub fn composer_state(capture: &str) -> ComposerState {
     let parsed: Vec<(String, Vec<bool>)> =
         capture.lines().map(strip_sgr_with_dim).collect();
     let lines: Vec<&str> = parsed.iter().map(|(t, _)| t.as_str()).collect();
+
+    // A modal first-run screen is checked first: it renders its own `\u{276F}`
+    // selector ("> 1. Yes, I trust this folder"), so structural parsing below
+    // would call it Unknown and lose the reason.
+    //
+    // Matched against the SGR-stripped text, not the raw capture: the screen
+    // styles part of the phrase, so escape sequences land mid-sentence and a
+    // raw substring search silently misses.
+    let lowered = lines.join("\n").to_lowercase();
+    if TRUST_MARKERS.iter().any(|m| lowered.contains(m)) {
+        return ComposerState::AwaitingTrust;
+    }
 
     let prompt_idx = lines.iter().rposition(|line| match line.find(COMPOSER_PROMPT) {
         Some(idx) => line[..idx].chars().all(char::is_whitespace),
@@ -324,6 +354,13 @@ pub fn gate<'a>(
         ComposerState::Draft => Gate::Refuse(format!(
             "'{}' has unsent text at its prompt — not delivering on top of it. \
              Clear or submit that draft, then press m again.",
+            name
+        )),
+        ComposerState::AwaitingTrust => Gate::Refuse(format!(
+            "'{}' is waiting on Claude's workspace-trust prompt and hasn't \
+             started yet — accept it once in that session (or spawn into an \
+             already-trusted directory); ADE will not answer a security prompt \
+             for you",
             name
         )),
         ComposerState::Unknown => Gate::Refuse(format!(
@@ -521,6 +558,75 @@ mod composer_state_tests {
             RULE, RULE
         );
         assert_eq!(composer_state(&draft), ComposerState::Draft);
+    }
+
+
+    // ── first-run workspace-trust screen ──
+    //
+    // Verbatim from a session spawned into an untrusted directory on the
+    // server. Note it renders its own selector glyph, so the classifier must
+    // recognise the screen rather than trying to parse a composer out of it.
+
+    const TRUST_SCREEN: &str = "\
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ \u{276F} 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm \u{b7} Esc to cancel
+";
+
+    #[test]
+    fn workspace_trust_screen_is_reported_as_such() {
+        assert_eq!(composer_state(TRUST_SCREEN), ComposerState::AwaitingTrust);
+    }
+
+    #[test]
+    fn trust_screen_is_never_mistaken_for_a_usable_prompt() {
+        // The failure that matters: treating that `>` selector as a composer
+        // would type into — and submit — a security dialog.
+        let st = composer_state(TRUST_SCREEN);
+        assert_ne!(st, ComposerState::Empty, "must never look deliverable");
+        assert_ne!(st, ComposerState::Draft);
+    }
+
+    #[test]
+    fn trust_screen_is_recognised_through_ansi_styling() {
+        // The real screen highlights part of the line, so escape sequences sit
+        // mid-phrase. Matching the raw capture misses it; matching the stripped
+        // text must not. This exact gap shipped once and was caught live.
+        let styled = " \u{1b}[7m\u{276F} 1. Yes, I trust \u{1b}[1mthis folder\u{1b}[0m\n   2. No, exit\n";
+        assert_eq!(composer_state(styled), ComposerState::AwaitingTrust);
+    }
+
+    #[test]
+    fn trust_wording_variants_are_recognised() {
+        for phrase in [
+            "Do you trust the files in this folder?",
+            "1. Yes, I trust this folder",
+            "do you trust",
+        ] {
+            let cap = format!("{}\n\u{276F} 1. Yes\n", phrase);
+            assert_eq!(
+                composer_state(&cap),
+                ComposerState::AwaitingTrust,
+                "phrase {:?} should be recognised",
+                phrase
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_composer_is_not_flagged_as_trust() {
+        // Guard against the markers being so loose they swallow normal panes.
+        assert_eq!(composer_state(&framed(&["\u{276F}\u{a0}"])), ComposerState::Empty);
+        assert_eq!(
+            composer_state(&framed(&["\u{276F}\u{a0}should I trust this library?"])),
+            ComposerState::Draft,
+            "a draft merely mentioning trust is still a draft"
+        );
     }
 
     // ── dim placeholder hint vs. a real draft ──
@@ -760,6 +866,20 @@ mod policy_tests {
         let mut env = FakeEnv::good();
         env.composer = ComposerState::Draft;
         assert!(refusal(gate(&env, &ok_req("s"), ADDR)).contains("unsent text"));
+    }
+
+    #[test]
+    fn workspace_trust_refusal_explains_the_fix() {
+        let mut env = FakeEnv::good();
+        env.composer = ComposerState::AwaitingTrust;
+        let r = refusal(gate(&env, &ok_req("s"), ADDR));
+        assert!(r.contains("workspace-trust"), "must name the cause: {}", r);
+        assert!(r.contains("already-trusted directory"), "must give the fix: {}", r);
+        assert!(
+            r.contains("will not answer a security prompt"),
+            "must state that ADE won't answer it: {}",
+            r
+        );
     }
 
     #[test]

@@ -628,6 +628,28 @@ fn run_session(args: &[String]) -> Result<()> {
             .unwrap_or_else(|_| ".".to_string())
     });
 
+    // Pre-flight: a session started in a directory Claude has not been trusted
+    // with stops at the workspace-trust dialog and never reaches its prompt, so
+    // its opening instruction would sit queued indefinitely. Warn now — this
+    // reads another tool's private config, so it only ever warns, never blocks.
+    if run_claude {
+        let trusted = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|h| h.join(".claude.json"))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|c| spawn::parse_trusted_dirs(&c))
+            .unwrap_or_default();
+        if spawn::trust_state_for(&cwd, &trusted) == spawn::TrustState::Untrusted {
+            eprintln!(
+                "Warning: Claude has not been trusted with {} yet, so '{}' will \
+                 stop at the workspace-trust prompt and its opening instruction \
+                 will wait. Accept it once in that session, or use --cwd with a \
+                 directory you already work in.",
+                cwd, name
+            );
+        }
+    }
+
     if let Err(e) = tmux::local::spawn_session(&name, &cwd, run_claude, &parent, depth) {
         fail(&e);
     }
