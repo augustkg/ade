@@ -111,7 +111,7 @@ fn print_usage() {
          \x20\x20ade debug claude [--host H]            Diagnose why ADE does/doesn't see Claude per pane\n\
          \x20\x20ade kanban move <column> [--session S] Move a session's kanban card to a manual column\n\
          \x20\x20ade kanban clear [--session S]         Return a session's card to the automatic columns\n\
-         \x20\x20ade mail send --session S --body TEXT   Leave a message for another local session (routed by ADE)\n\
+         \x20\x20ade mail send --session S --body TEXT [--from L]  Leave a message for another local session (--from for non-session senders)\n\
          \x20\x20ade mail whoami                         Print this tmux session's name (its mail address)\n\
          \x20\x20ade mail list                           Show this session's pending messages\n\
          \x20\x20ade mail deliver [--session S] [--dry-run]  Deliver queued mail without the TUI (headless router)\n\
@@ -303,6 +303,7 @@ fn run_mail(args: &[String]) -> Result<()> {
         "send" => {
             let mut to: Option<String> = None;
             let mut body: Option<String> = None;
+            let mut from_label: Option<String> = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -320,6 +321,13 @@ fn run_mail(args: &[String]) -> Result<()> {
                         body = Some(args[i + 1].clone());
                         i += 2;
                     }
+                    "--from" => {
+                        if i + 1 >= args.len() {
+                            fail("--from requires a value");
+                        }
+                        from_label = Some(args[i + 1].clone());
+                        i += 2;
+                    }
                     other => fail(&format!("unknown argument '{}'", other)),
                 }
             }
@@ -332,13 +340,32 @@ fn run_mail(args: &[String]) -> Result<()> {
             if let Err(e) = mail::validate_body(&body) {
                 fail(&e);
             }
-            let from = current_session().unwrap_or_else(|| {
-                fail(
-                    "not inside a tmux session — `ade mail send` must run \
-                     from the sending session (local sessions only)",
-                )
-            });
-            let from_id = current_session_id().unwrap_or_default();
+            // A sender is normally the tmux session running the command, so
+            // the address is derived and cannot be forged. `--from` exists for
+            // senders that are not sessions at all — a watcher, a timer, CI —
+            // which otherwise could not participate. That label IS
+            // self-asserted, so it is recorded with a `service` id rather than
+            // a tmux `$N` to keep the two kinds distinguishable in the audit
+            // trail. Note the recipient cannot reply to a service sender:
+            // there is no session by that name.
+            let (from, from_id) = match from_label {
+                Some(label) => {
+                    if let Err(e) = spawn::validate_session_name(&label) {
+                        fail(&format!("--from rejected: {}", e));
+                    }
+                    (label, "service".to_string())
+                }
+                None => (
+                    current_session().unwrap_or_else(|| {
+                        fail(
+                            "not inside a tmux session — `ade mail send` must run \
+                             from the sending session, or pass --from <label> for \
+                             a service sender (local sessions only)",
+                        )
+                    }),
+                    current_session_id().unwrap_or_default(),
+                ),
+            };
             if to == from {
                 fail("refusing to send a message to yourself");
             }
