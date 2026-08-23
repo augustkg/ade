@@ -81,6 +81,8 @@ ADE also surfaces a one-time peach `Tip` banner inside the TUI when it notices t
 | `d` | Delete session, or on a folder open a confirm with: Enter = delete + kill all sessions, `s` = dissolve (keep sessions), Esc = cancel |
 | `K` | Kanban board |
 | `H` | Hosts list |
+| `p` | Toggle the read-only session preview; drag selected text to copy it |
+| `Tab` | Open the focused session interactively in the preview pane |
 | `r` | Refresh |
 | `x` | Dismiss the tmux-config nudge |
 | `q` / `Esc` | Quit |

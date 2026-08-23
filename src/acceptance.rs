@@ -366,6 +366,134 @@ fn acceptance_mouse_scroll_enters_copy_mode() {
     drop(tmux);
 }
 
+/// Read-only preview drag selection copies the exact visible cells through
+/// App's clipboard queue. This covers the path that direct iTerm launches use
+/// (there is no outer tmux client to perform copy-on-drag for ADE).
+#[test]
+fn acceptance_preview_drag_copies_visible_text() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("previewcopy", 80, 24)
+        .expect("new-session");
+    tmux.send_keys("previewcopy", "printf 'PREVIEWCOPY\\n'\r")
+        .expect("print fixture");
+    poll_for_capture_contains(
+        &tmux,
+        "previewcopy",
+        "PREVIEWCOPY",
+        Duration::from_secs(3),
+    )
+    .expect("fixture should reach tmux pane");
+
+    let mut app = App::new();
+    app.handle_key(k('p'));
+    let mut tries = 0;
+    while app.preview_target().as_ref().map(|key| key.name.as_str()) != Some("previewcopy") {
+        if tries > 10 {
+            panic!("cursor never reached previewcopy");
+        }
+        app.handle_key(k_down());
+        tries += 1;
+    }
+
+    let loaded = poll_until(Duration::from_secs(3), || {
+        app.tick();
+        app.preview_target()
+            .and_then(|key| app.preview_pane.get(&key))
+            .and_then(|capture| capture.body.as_ref().ok())
+            .map(|body| body.contains("PREVIEWCOPY"))
+            .unwrap_or(false)
+    });
+    assert!(loaded, "preview capture should contain the fixture");
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| crate::ui::render(frame, &app))
+        .expect("render preview");
+    let (start_col, start_row) = app
+        .preview_viewport
+        .borrow()
+        .as_ref()
+        .and_then(|viewport| viewport.find_text("PREVIEWCOPY"))
+        .expect("fixture should be visible in rendered viewport");
+    let (x, y, _, _) = app.preview_panel_rect.get().expect("preview rect");
+    let event = |kind, col| MouseEvent {
+        kind,
+        column: x + col,
+        row: y + start_row,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(event(MouseEventKind::Down(MouseButton::Left), start_col));
+    app.handle_mouse(event(
+        MouseEventKind::Drag(MouseButton::Left),
+        start_col + "PREVIEWCOPY".len() as u16 - 1,
+    ));
+    app.handle_mouse(event(
+        MouseEventKind::Up(MouseButton::Left),
+        start_col + "PREVIEWCOPY".len() as u16 - 1,
+    ));
+
+    assert_eq!(app.take_clipboard_text().as_deref(), Some("PREVIEWCOPY"));
+}
+
+/// A clipboard update produced by a real tmux server attached through ADE's
+/// embedded PTY reaches App's outer-terminal queue. Together with the mouse
+/// passthrough test above, this guards the full copy-on-drag transport.
+#[test]
+fn acceptance_embedded_tmux_osc52_reaches_outer_clipboard_queue() {
+    let _lock = acquire_acceptance_lock();
+    let tmux = IsolatedTmux::spawn();
+    tmux.new_session("osc52copy", 80, 24)
+        .expect("new-session");
+    tmux.set_option("set-clipboard", "on")
+        .expect("set clipboard on");
+    tmux.set_option(
+        "terminal-overrides",
+        r",*:Ms=\E]52;c%p1%s;%p2%s\007",
+    )
+    .expect("set OSC 52 capability");
+
+    let mut app = App::new();
+    app.handle_key(k('p'));
+    let mut tries = 0;
+    while app.preview_target().as_ref().map(|key| key.name.as_str()) != Some("osc52copy") {
+        if tries > 10 {
+            panic!("cursor never reached osc52copy");
+        }
+        app.handle_key(k_down());
+        tries += 1;
+    }
+    app.handle_key(k_tab());
+    poll_for_embedded_grid_contains(&app, "$ ", Duration::from_secs(5))
+        .expect("embedded prompt");
+
+    let out = tmux
+        .tmux(&["set-buffer", "-w", "embedded-tmux-copy"])
+        .output()
+        .expect("tmux set-buffer -w");
+    assert!(
+        out.status.success(),
+        "set-buffer -w failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut copied = None;
+    let reached = poll_until(Duration::from_secs(3), || {
+        app.tick();
+        copied = app.take_clipboard_text();
+        copied.is_some()
+    });
+    assert!(reached, "embedded tmux OSC 52 should reach App");
+    assert_eq!(copied.as_deref(), Some("embedded-tmux-copy"));
+
+    app.handle_key(k_ctrl_space());
+    app.handle_key(k(' '));
+}
+
 /// External kill of the target session while embedded should be
 /// detected on the next `tick()` and exit cleanly back to the tree
 /// — no panic, no leaked PTY child.

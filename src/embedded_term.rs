@@ -22,6 +22,7 @@ use ratatui::{
 };
 
 use crate::hosts::Host;
+use crate::clipboard::Osc52Scanner;
 
 /// Translate a `crossterm::KeyEvent` into the bytes a terminal would
 /// expect to receive when the user pressed that key. Used to forward
@@ -405,10 +406,10 @@ pub type SharedParser = Arc<Mutex<vt100::Parser>>;
 ///  - global capture made tree/preview-mode scroll feel broken
 ///  - panicking while embedded would have left the terminal in
 ///    capture mode (Drop runs during unwind)
-struct MouseCaptureGuard;
+pub(crate) struct MouseCaptureGuard;
 
 impl MouseCaptureGuard {
-    fn enable() -> Self {
+    pub(crate) fn enable() -> Self {
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::EnableMouseCapture
@@ -438,6 +439,10 @@ pub struct EmbeddedTerm {
     writer: Box<dyn Write + Send>,
     /// Shared parser. The reader thread writes; the UI renderer reads.
     parser: SharedParser,
+    /// Latest clipboard text emitted by the embedded terminal. The reader
+    /// thread replaces the slot and the main UI thread drains it, preventing
+    /// terminal writes from racing ratatui draws.
+    clipboard_update: Arc<Mutex<Option<String>>>,
     /// Handle to the spawned process (`tmux attach`, `ssh`, `mosh`, …).
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Reader-thread join handle. `None` after Drop has joined it.
@@ -524,14 +529,22 @@ impl EmbeddedTerm {
         drop(pair.slave);
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let clipboard_update = Arc::new(Mutex::new(None));
 
         let parser_for_thread = parser.clone();
+        let clipboard_for_thread = clipboard_update.clone();
         let reader_thread = std::thread::spawn(move || {
             let mut buf = [0u8; 8 * 1024];
+            let mut clipboard_scanner = Osc52Scanner::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF
                     Ok(n) => {
+                        for update in clipboard_scanner.feed(&buf[..n]) {
+                            if let Ok(mut pending) = clipboard_for_thread.lock() {
+                                *pending = Some(update);
+                            }
+                        }
                         if let Ok(mut p) = parser_for_thread.lock() {
                             p.process(&buf[..n]);
                         }
@@ -551,6 +564,7 @@ impl EmbeddedTerm {
             master: pair.master,
             writer,
             parser,
+            clipboard_update,
             child,
             reader_thread: Some(reader_thread),
             last_size: Mutex::new((rows, cols)),
@@ -598,6 +612,15 @@ impl EmbeddedTerm {
     /// reads `screen()`, drops the lock.
     pub fn parser(&self) -> SharedParser {
         self.parser.clone()
+    }
+
+    /// Drain the most recent OSC 52 clipboard update observed in PTY output.
+    /// A single-slot queue is intentional: clipboard state is last-write-wins.
+    pub fn take_clipboard_update(&self) -> Option<String> {
+        self.clipboard_update
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
     }
 
     /// `true` if the child is still running. False once it has exited
@@ -1249,6 +1272,30 @@ mod embedded_term_tests {
         drop(term);
         // No assertion here — if Drop hangs, the test deadline above
         // catches us. If it returns, we're good.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_osc52_is_exposed_as_clipboard_text() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args([
+            "-c",
+            r"printf '\033]52;c;ZW1iZWRkZWQtY29weQ==\007'; sleep 1",
+        ]);
+        let mut term = EmbeddedTerm::spawn_with_command(cmd, 24, 80).expect("spawn");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(text) = term.take_clipboard_update() {
+                assert_eq!(text, "embedded-copy");
+                break;
+            }
+            if Instant::now() >= deadline {
+                term.kill();
+                panic!("PTY reader never exposed the OSC 52 clipboard update");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        term.kill();
     }
 }
 

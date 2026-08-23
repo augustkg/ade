@@ -23,6 +23,15 @@ use std::collections::HashMap;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use ansi_to_tui::IntoText;
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    text::Text,
+    widgets::{Paragraph, Widget},
+};
+use unicode_width::UnicodeWidthStr;
+
 use crate::hosts::Host;
 use crate::model::Machine;
 use crate::tmux::{local, remote::RemoteTmux};
@@ -55,6 +64,153 @@ pub struct PreviewKey {
 pub struct Capture {
     pub at: Instant,
     pub body: Result<String, String>,
+}
+
+/// Plain cells for exactly what the preview Paragraph rendered. Keeping this
+/// alongside the styled draw lets mouse selection copy visible text without
+/// trying to reverse-map terminal coordinates into raw ANSI bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewViewport {
+    width: u16,
+    height: u16,
+    rows: Vec<Vec<String>>,
+}
+
+impl PreviewViewport {
+    pub fn from_ansi(ansi: &str, width: u16, height: u16) -> Self {
+        if width == 0 || height == 0 {
+            return Self {
+                width,
+                height,
+                rows: Vec::new(),
+            };
+        }
+        let text = ansi
+            .as_bytes()
+            .into_text()
+            .unwrap_or_else(|_| Text::raw(ansi.to_string()));
+        let content_lines = text
+            .lines
+            .iter()
+            .rposition(|line| line.spans.iter().any(|span| !span.content.trim().is_empty()))
+            .map(|index| index as u16 + 1)
+            .unwrap_or(0);
+        let scroll = content_lines.saturating_sub(height);
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(text)
+            .scroll((scroll, 0))
+            .render(area, &mut buffer);
+        let rows = (0..height)
+            .map(|row| {
+                let mut remaining_wide_cells = 0usize;
+                (0..width)
+                    .map(|col| {
+                        if remaining_wide_cells > 0 {
+                            remaining_wide_cells -= 1;
+                            return String::new();
+                        }
+                        let symbol = buffer[(col, row)].symbol().to_string();
+                        remaining_wide_cells = UnicodeWidthStr::width(symbol.as_str())
+                            .saturating_sub(1);
+                        symbol
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            width,
+            height,
+            rows,
+        }
+    }
+
+    pub fn selected_text(&self, start: (u16, u16), end: (u16, u16)) -> String {
+        if self.width == 0 || self.height == 0 {
+            return String::new();
+        }
+        let clamp = |(col, row): (u16, u16)| {
+            (
+                col.min(self.width.saturating_sub(1)),
+                row.min(self.height.saturating_sub(1)),
+            )
+        };
+        let start = clamp(start);
+        let end = clamp(end);
+        let ((start_col, start_row), (end_col, end_row)) =
+            if (start.1, start.0) <= (end.1, end.0) {
+                (start, end)
+            } else {
+                (end, start)
+            };
+
+        let mut lines = Vec::new();
+        for row in start_row..=end_row {
+            let first_col = if row == start_row { start_col } else { 0 };
+            let last_col = if row == end_row {
+                end_col
+            } else {
+                self.width - 1
+            };
+            let mut line = String::new();
+            if let Some(cells) = self.rows.get(row as usize) {
+                for col in first_col..=last_col {
+                    if let Some(symbol) = cells.get(col as usize) {
+                        line.push_str(symbol);
+                    }
+                }
+            }
+            lines.push(line.trim_end_matches(' ').to_string());
+        }
+        lines.join("\n")
+    }
+
+    #[cfg(test)]
+    pub fn find_text(&self, needle: &str) -> Option<(u16, u16)> {
+        for (row_index, cells) in self.rows.iter().enumerate() {
+            let mut rendered = String::new();
+            let mut starts = Vec::new();
+            for (column, symbol) in cells.iter().enumerate() {
+                if symbol.is_empty() {
+                    continue;
+                }
+                starts.push((rendered.len(), column as u16));
+                rendered.push_str(symbol);
+            }
+            let Some(byte_index) = rendered.find(needle) else {
+                continue;
+            };
+            let column = starts
+                .iter()
+                .rev()
+                .find(|(start, _)| *start <= byte_index)
+                .map(|(_, column)| *column)?;
+            return Some((column, row_index as u16));
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewSelection {
+    pub key: PreviewKey,
+    pub start: (u16, u16),
+    pub end: (u16, u16),
+    pub dragged: bool,
+    pub viewport: PreviewViewport,
+}
+
+impl PreviewSelection {
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        let start = (self.start.1, self.start.0);
+        let end = (self.end.1, self.end.0);
+        let (first, last) = if start <= end { (start, end) } else { (end, start) };
+        (row, col) >= first && (row, col) <= last
+    }
+
+    pub fn text(&self) -> String {
+        self.viewport.selected_text(self.start, self.end)
+    }
 }
 
 pub struct PreviewPane {
@@ -219,5 +375,25 @@ mod tests {
     fn stale_remote_success_refreshes() {
         let c = capture(Ok("ok"), REMOTE_OK_TTL + Duration::from_millis(10));
         assert!(needs_refresh(&Machine::Remote("h".into()), Some(&c)));
+    }
+
+    #[test]
+    fn viewport_selection_supports_forward_and_reverse_multiline_drag() {
+        let viewport = PreviewViewport::from_ansi("alpha\nbeta\ngamma", 8, 3);
+        let expected = "pha\nbeta\nga";
+        assert_eq!(viewport.selected_text((2, 0), (1, 2)), expected);
+        assert_eq!(viewport.selected_text((1, 2), (2, 0)), expected);
+    }
+
+    #[test]
+    fn viewport_selection_uses_the_visible_tail() {
+        let viewport = PreviewViewport::from_ansi("old\nmiddle\nlatest", 8, 2);
+        assert_eq!(viewport.selected_text((0, 0), (5, 1)), "middle\nlatest");
+    }
+
+    #[test]
+    fn viewport_selection_preserves_wide_characters_once() {
+        let viewport = PreviewViewport::from_ansi("a界b", 6, 1);
+        assert_eq!(viewport.selected_text((0, 0), (3, 0)), "a界b");
     }
 }

@@ -14,10 +14,15 @@ use crate::app::{
 use crate::claude_status::ClaudeState;
 use crate::hosts::{Host, HostKind};
 use crate::model::{Folder, Machine, Row, Session};
+use crate::preview_pane::PreviewViewport;
 use crate::text_field::TextField;
 use crate::theme;
 
 pub fn render(frame: &mut Frame, app: &App) {
+    // Mouse hit-testing always reflects this frame. Renderers that expose a
+    // selectable preview set these back to their concrete content rect/grid.
+    app.preview_panel_rect.set(None);
+    app.preview_viewport.replace(None);
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(5),
@@ -595,6 +600,8 @@ fn render_preview_pane(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if embedded {
+        app.preview_panel_rect.set(None);
+        app.preview_viewport.replace(None);
         render_embedded_grid(frame, inner, app);
         return;
     }
@@ -611,11 +618,14 @@ fn render_preview_pane(frame: &mut Frame, area: Rect, app: &App) {
 /// capture for `preview_target()`, or a dim placeholder. (The kanban
 /// board has no ambient preview — its modal is the embedded PTY.)
 fn render_preview_snapshot(frame: &mut Frame, inner: Rect, app: &App, empty_msg: &str) {
+    app.preview_panel_rect
+        .set(Some((inner.x, inner.y, inner.width, inner.height)));
     // Each arm renders its own Paragraph so we don't have to unify the
     // `Text` type across `ansi_to_tui` (returns `ratatui_core::Text`) and
     // direct ratatui::text::Text construction. `Paragraph::new` accepts
     // `Into<Text>` for both flavours.
     let placeholder = |frame: &mut Frame, msg: &str| {
+        app.preview_viewport.replace(None);
         frame.render_widget(
             Paragraph::new(msg.to_string()).style(Style::default().fg(theme::OVERLAY1)),
             inner,
@@ -634,6 +644,11 @@ fn render_preview_snapshot(frame: &mut Frame, inner: Rect, app: &App, empty_msg:
             Some(capture) => match &capture.body {
                 Ok(ansi) => match ansi.as_bytes().into_text() {
                     Ok(text) => {
+                        app.preview_viewport.replace(Some(PreviewViewport::from_ansi(
+                            ansi,
+                            inner.width,
+                            inner.height,
+                        )));
                         let content_lines = text
                             .lines
                             .iter()
@@ -648,6 +663,11 @@ fn render_preview_snapshot(frame: &mut Frame, inner: Rect, app: &App, empty_msg:
                         );
                     }
                     Err(_) => {
+                        app.preview_viewport.replace(Some(PreviewViewport::from_ansi(
+                            ansi,
+                            inner.width,
+                            inner.height,
+                        )));
                         let content_lines = ansi
                             .lines()
                             .collect::<Vec<_>>()
@@ -666,6 +686,24 @@ fn render_preview_snapshot(frame: &mut Frame, inner: Rect, app: &App, empty_msg:
                 Err(e) => placeholder(frame, &format!("preview unavailable: {}", e)),
             },
         },
+    }
+    highlight_preview_selection(frame, inner, app);
+}
+
+fn highlight_preview_selection(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(selection) = app.preview_selection.as_ref() else {
+        return;
+    };
+    if app.preview_target().as_ref() != Some(&selection.key) {
+        return;
+    }
+    for row in 0..area.height {
+        for col in 0..area.width {
+            if selection.contains(col, row) {
+                frame.buffer_mut()[(area.x + col, area.y + row)]
+                    .set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+        }
     }
 }
 

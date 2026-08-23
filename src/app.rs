@@ -1,11 +1,13 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::claude_status::ClaudeState;
 use crate::cwd;
-use crate::embedded_term::{chord_step, translate_mouse, ChordOutcome, ChordState, EmbeddedTerm};
+use crate::embedded_term::{
+    chord_step, translate_mouse, ChordOutcome, ChordState, EmbeddedTerm, MouseCaptureGuard,
+};
 use crate::notifications;
 use crate::hosts::{Config, Host, HostKind};
 use crate::install_hooks;
@@ -14,12 +16,12 @@ use crate::kanban::{self, KanbanConfig};
 use crate::mail;
 use crate::mail_delivery::{self, ComposerState, DeliveryEnv, DeliveryRequest, Gate, Outcome};
 use crate::model::{Machine, Row, RowKey, Tree};
-use crate::preview_pane::{PreviewKey, PreviewPane};
+use crate::preview_pane::{PreviewKey, PreviewPane, PreviewSelection, PreviewViewport};
 use crate::refresh::{refresh_all, RefreshResult};
 use crate::state::State;
 use crate::text_field::TextField;
 use crate::tmux::{self, TmuxBackend};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 /// How often the TUI fires a background refresh while idle. Local backend is
 /// cheap; remote backends are spawned in parallel threads and bounded by the
@@ -32,6 +34,38 @@ const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// multiple times during a single approval flow). Conservative default;
 /// raise if real users report banner spam.
 const NOTIFICATION_DEBOUNCE: Duration = Duration::from_secs(5);
+
+fn point_in_rect(
+    column: u16,
+    row: u16,
+    rect: (u16, u16, u16, u16),
+) -> Option<(u16, u16)> {
+    let (x, y, width, height) = rect;
+    if width == 0
+        || height == 0
+        || column < x
+        || row < y
+        || column >= x.saturating_add(width)
+        || row >= y.saturating_add(height)
+    {
+        return None;
+    }
+    Some((column - x, row - y))
+}
+
+fn point_clamped_to_rect(
+    column: u16,
+    row: u16,
+    rect: (u16, u16, u16, u16),
+) -> (u16, u16) {
+    let (x, y, width, height) = rect;
+    let max_x = x.saturating_add(width.saturating_sub(1));
+    let max_y = y.saturating_add(height.saturating_sub(1));
+    (
+        column.clamp(x, max_x).saturating_sub(x),
+        row.clamp(y, max_y).saturating_sub(y),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -414,6 +448,19 @@ pub struct App {
     /// Cache + worker pool for the preview pane. Populated only when
     /// `preview_pane_enabled` is true.
     pub preview_pane: PreviewPane,
+    /// The visible cell grid recorded by the preview renderer. Mouse-down
+    /// snapshots it into `preview_selection` so refreshes cannot change text
+    /// halfway through a drag.
+    pub preview_viewport: RefCell<Option<PreviewViewport>>,
+    /// Current preview drag (retained after release so the highlight remains
+    /// visible until the next keypress/click).
+    pub preview_selection: Option<PreviewSelection>,
+    /// Preview content rect from the latest frame, in frame-local coords.
+    pub preview_panel_rect: Cell<Option<(u16, u16, u16, u16)>>,
+    /// Preview mode needs mouse reporting for tmux-style copy-on-release.
+    /// Embedded terminals own a separate guard, so this one is dropped before
+    /// an embedded PTY is spawned.
+    preview_mouse_capture: Option<MouseCaptureGuard>,
     /// `Some` while the user has Tab'd into a session. The PTY is
     /// alive and the right panel renders its vt100 grid instead of the
     /// ambient snapshot. Mutated only on Tab (enter), the exit chord
@@ -429,6 +476,10 @@ pub struct App {
     /// whether a mouse event lands inside the embedded pane and to
     /// translate frame coords to pane-local coords before forwarding.
     pub embedded_panel_rect: Cell<Option<(u16, u16, u16, u16)>>,
+    /// Clipboard text waiting for the main event loop to emit to the outer
+    /// terminal. Both embedded OSC 52 events and preview drag selection use
+    /// this single last-write-wins slot.
+    pending_clipboard_text: Option<String>,
     /// Transient banner shown at the top of the Hosts screen (install /
     /// retry results). Cleared on the next keypress in HostsList.
     pub hosts_notice: Option<Notice>,
@@ -545,9 +596,14 @@ impl App {
             tmux_nudge_dismissed: persisted.tmux_install_nudge.dismissed,
             preview_pane_enabled: persisted.preview_pane.enabled,
             preview_pane: PreviewPane::new(),
+            preview_viewport: RefCell::new(None),
+            preview_selection: None,
+            preview_panel_rect: Cell::new(None),
+            preview_mouse_capture: None,
             embedded_term: None,
             embedded_chord: ChordState::Idle,
             embedded_panel_rect: Cell::new(None),
+            pending_clipboard_text: None,
             hosts_notice: None,
             pending_refresh: None,
             last_refresh_started: Instant::now(),
@@ -563,6 +619,7 @@ impl App {
             mail_pending: HashMap::new(),
             mail_oldest: HashMap::new(),
         };
+        app.sync_preview_mouse_capture();
         app.refresh();
         app
     }
@@ -1195,6 +1252,14 @@ impl App {
             self.exit_embedded();
         }
 
+        if let Some(text) = self
+            .embedded_term
+            .as_ref()
+            .and_then(|term| term.take_clipboard_update())
+        {
+            self.pending_clipboard_text = Some(text);
+        }
+
         if let Some(handle) = self.pending_refresh.take() {
             if handle.is_finished() {
                 if let Ok(result) = handle.join() {
@@ -1234,6 +1299,12 @@ impl App {
 
     pub fn current_row(&self) -> Option<Row> {
         self.tree.visible_rows().get(self.selected_index).copied()
+    }
+
+    /// Called by the main loop between terminal draws. Keeping stdout writes
+    /// there avoids interleaving OSC bytes with ratatui's renderer.
+    pub fn take_clipboard_text(&mut self) -> Option<String> {
+        self.pending_clipboard_text.take()
     }
 
     /// Title to write to the outer terminal tab. Session rows produce
@@ -1361,6 +1432,7 @@ impl App {
         if self.embedded_term.is_some() {
             return self.handle_embedded_key(key);
         }
+        self.preview_selection = None;
         match &self.state {
             AppState::Tree => self.handle_tree_key(key),
             AppState::Kanban(_) => self.handle_kanban_key(key),
@@ -1372,28 +1444,99 @@ impl App {
             AppState::HostsList { .. } => self.handle_hosts_list_key(key),
             AppState::HostForm(_) => self.handle_host_form_key(key),
         }
+        self.sync_preview_mouse_capture();
     }
 
-    /// Forward a mouse event to the embedded PTY *only* when the click
-    /// landed inside the embedded panel rect that the renderer last
-    /// drew. Outside the panel (i.e. on the tree side) the event is
-    /// dropped — we don't currently handle mouse on the tree, and we
-    /// definitely don't want stray clicks to reach the embedded
-    /// session.
-    pub fn handle_mouse(&mut self, event: crossterm::event::MouseEvent) {
-        let Some(rect) = self.embedded_panel_rect.get() else {
+    /// Route mouse events to the live embedded PTY or the read-only preview
+    /// selector, using the content rect recorded by the latest render. Events
+    /// outside either pane are ignored.
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        if self.embedded_term.is_some() {
+            let Some(rect) = self.embedded_panel_rect.get() else {
+                return;
+            };
+            let bytes = translate_mouse(event, rect);
+            if bytes.is_empty() {
+                return;
+            }
+            if let Some(et) = self.embedded_term.as_mut() {
+                if let Err(e) = et.write(&bytes) {
+                    self.error_message = Some(format!("embedded mouse write: {}", e));
+                    self.exit_embedded();
+                }
+            }
+            return;
+        }
+        self.handle_preview_mouse(event);
+    }
+
+    fn handle_preview_mouse(&mut self, event: MouseEvent) {
+        let Some(rect) = self.preview_panel_rect.get() else {
             return;
         };
-        let bytes = translate_mouse(event, rect);
-        if bytes.is_empty() {
-            return;
-        }
-        if let Some(et) = self.embedded_term.as_mut() {
-            if let Err(e) = et.write(&bytes) {
-                self.error_message = Some(format!("embedded mouse write: {}", e));
-                self.exit_embedded();
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(point) = point_in_rect(event.column, event.row, rect) else {
+                    self.preview_selection = None;
+                    return;
+                };
+                let Some(key) = self.preview_target() else {
+                    return;
+                };
+                let Some(viewport) = self.preview_viewport.borrow().clone() else {
+                    return;
+                };
+                self.preview_selection = Some(PreviewSelection {
+                    key,
+                    start: point,
+                    end: point,
+                    dragged: false,
+                    viewport,
+                });
             }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(selection) = self.preview_selection.as_mut() {
+                    selection.end = point_clamped_to_rect(event.column, event.row, rect);
+                    selection.dragged = true;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(selection) = self.preview_selection.as_mut() {
+                    selection.end = point_clamped_to_rect(event.column, event.row, rect);
+                    if selection.dragged {
+                        let text = selection.text();
+                        if !text.is_empty() {
+                            self.pending_clipboard_text = Some(text);
+                        }
+                    } else {
+                        self.preview_selection = None;
+                    }
+                }
+            }
+            _ => {}
         }
+    }
+
+    fn sync_preview_mouse_capture(&mut self) {
+        let wanted = self.preview_pane_enabled
+            && self.embedded_term.is_none()
+            && matches!(self.state, AppState::Tree);
+        match (wanted, self.preview_mouse_capture.is_some()) {
+            (true, false) => self.preview_mouse_capture = Some(MouseCaptureGuard::enable()),
+            (false, true) => self.preview_mouse_capture = None,
+            _ => {}
+        }
+    }
+
+    /// Release ADE's preview mouse reporting before a full attach temporarily
+    /// hands the real tty to tmux/ssh/mosh.
+    pub fn suspend_mouse_capture(&mut self) {
+        self.preview_mouse_capture = None;
+    }
+
+    /// Re-establish preview mouse reporting after the full attach returns.
+    pub fn resume_mouse_capture(&mut self) {
+        self.sync_preview_mouse_capture();
     }
 
     /// Drive the chord state machine and forward keystrokes to the
@@ -1463,6 +1606,10 @@ impl App {
         let machine = session.machine.clone();
         let session_id = session.session_id.clone();
 
+        // Avoid overlapping guards: dropping the preview guard after the
+        // embedded guard is enabled would emit DisableMouseCapture last.
+        self.preview_mouse_capture = None;
+
         // Placeholder size — UI's first frame after entering embedded
         // immediately calls `resize()` with the actual rect dimensions.
         let result = match machine.clone() {
@@ -1488,6 +1635,7 @@ impl App {
             }
             Err(e) => {
                 self.error_message = Some(format!("embedded: {}", e));
+                self.sync_preview_mouse_capture();
             }
         }
     }
@@ -1506,6 +1654,7 @@ impl App {
         }
         self.embedded_chord = ChordState::Idle;
         self.embedded_target = None;
+        self.sync_preview_mouse_capture();
     }
 
     /// Returns the embedded session's PTY size if active, useful for
@@ -3408,4 +3557,3 @@ mod tests {
         );
     }
 }
-

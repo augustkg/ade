@@ -2,6 +2,7 @@
 mod acceptance;
 mod app;
 mod claude_status;
+mod clipboard;
 mod cwd;
 mod debug;
 mod duplicate_log;
@@ -75,11 +76,10 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let mut terminal = ratatui::init();
-    // Mouse capture is *not* enabled here. It's scoped to the
-    // duration of an embedded session via `EmbeddedTerm`'s
-    // `MouseCaptureGuard` — enabling it globally would swallow
-    // the user's normal terminal scroll / Cmd+drag selection
-    // while they're just browsing the tree.
+    // Mouse capture is not enabled globally here. Embedded terminals own it
+    // for their lifetime; App enables it while the read-only preview is open
+    // so drag-select can copy visible cells, and releases it again for other
+    // views and full-screen attaches.
     //
     // No `Config::load()` here — `App::new()` loads it (and the Hosts
     // screen mutates `app.config` in place + persists). Loading a
@@ -1502,6 +1502,7 @@ fn run_loop(terminal: &mut DefaultTerminal) -> Result<()> {
                         // wrapper in `remote_attach_cmd` plants + traps
                         // its own marker for SSH/Mosh.
                         set_session_parent_marker(&name, &machine, true);
+                        app.suspend_mouse_capture();
                         let suspend_err = tui_lifecycle::suspend(terminal)
                             .map_err(|e| format!("suspend tui: {}", e));
                         let attach_err = match suspend_err {
@@ -1515,6 +1516,7 @@ fn run_loop(terminal: &mut DefaultTerminal) -> Result<()> {
                         // worse than a missed error.
                         let resume_err = tui_lifecycle::resume(terminal)
                             .map_err(|e| format!("resume tui: {}", e));
+                        app.resume_mouse_capture();
                         // Best-effort marker cleanup. Local: runs after
                         // child.wait() unless ADE itself is SIGKILL'd.
                         // Remote: cleanup lives in the remote shell's
@@ -1556,6 +1558,11 @@ fn run_until_action(terminal: &mut DefaultTerminal, app: &mut App) -> Result<App
 
         terminal.draw(|frame| ui::render(frame, app))?;
         term_title::set(&app.tab_title());
+        if let Some(text) = app.take_clipboard_text() {
+            if let Err(e) = clipboard::emit_text(&text) {
+                app.error_message = Some(format!("clipboard: {}", e));
+            }
+        }
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
@@ -1563,8 +1570,8 @@ fn run_until_action(terminal: &mut DefaultTerminal, app: &mut App) -> Result<App
                     app.handle_key(key);
                 }
                 Event::Mouse(mouse) => {
-                    // Mouse forwarding only matters in embedded mode;
-                    // App::handle_mouse no-ops outside the panel.
+                    // Embedded mode forwards into tmux; preview mode tracks
+                    // visible-cell selection and copies on drag release.
                     app.handle_mouse(mouse);
                 }
                 _ => {}
