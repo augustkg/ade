@@ -103,6 +103,29 @@ fn shell_safe(s: &str) -> bool {
             .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '/'))
 }
 
+/// Make `tmux` findable on the far side.
+///
+/// Remote commands run through the login shell NON-interactively. On macOS that
+/// means zsh reads `.zshenv` but not `.zshrc`, so PATH is the bare system
+/// default and Homebrew's `/opt/homebrew/bin` (Apple silicon) or
+/// `/usr/local/bin` (Intel) is missing — `tmux` is simply not found. Linux
+/// hosts keep tmux in `/usr/bin`, which is why this never surfaced while every
+/// remote ADE drove was Linux.
+///
+/// `export` rather than a one-shot `VAR=x cmd` prefix, because some remote
+/// commands are compound scripts and a prefix would only apply to the first.
+///
+/// Prepending to PATH rather than wrapping in `zsh -lc "..."` is deliberate: a
+/// login-shell wrapper adds another quoting layer around everything it carries,
+/// and keeping the message body out of the command string is the whole basis of
+/// the injection safety in `send_text`.
+pub(crate) fn with_tmux_path(remote_cmd: &str) -> String {
+    format!(
+        "export PATH=\"$PATH:/opt/homebrew/bin:/usr/local/bin\"; {}",
+        remote_cmd
+    )
+}
+
 impl RemoteTmux {
     fn ssh(&self, remote_cmd: &str) -> Result<std::process::Output, String> {
         let mut cmd = Command::new("ssh");
@@ -113,7 +136,7 @@ impl RemoteTmux {
             cmd.arg(a);
         }
         cmd.arg(&self.host.target);
-        cmd.arg(remote_cmd);
+        cmd.arg(with_tmux_path(remote_cmd));
         cmd.output()
             .map_err(|e| format!("ssh failed to launch: {}", e))
     }
@@ -299,7 +322,10 @@ impl TmuxBackend for RemoteTmux {
         // own pty read. Chaining both into one remote command would let tmux
         // coalesce them into a single write, and the message would sit unsent
         // in the composer. The extra round trip is the price of it submitting.
-        let body_cmd = format!("tmux send-keys -t '{}' -l -- \"$(cat)\"", target);
+        let body_cmd = with_tmux_path(&format!(
+            "tmux send-keys -t '{}' -l -- \"$(cat)\"",
+            target
+        ));
         if let Err(e) = crate::ssh_io::run_with_stdin(&self.host, &body_cmd, text.as_bytes()) {
             return Err(super::SendTextError {
                 message: format!("remote send-keys (body) failed: {}", e),
@@ -309,7 +335,7 @@ impl TmuxBackend for RemoteTmux {
 
         // From here the body IS in the recipient's composer, so a failure is a
         // PARTIAL send: the caller must not retry or the body is typed twice.
-        let enter_cmd = format!("tmux send-keys -t '{}' Enter", target);
+        let enter_cmd = with_tmux_path(&format!("tmux send-keys -t '{}' Enter", target));
         if let Err(e) = crate::ssh_io::run(&self.host, &enter_cmd) {
             return Err(super::SendTextError {
                 message: format!("remote send-keys (Enter) failed: {}", e),
