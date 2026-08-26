@@ -78,8 +78,13 @@ pub struct Message {
     /// Recorded for audit; session names are mutable and reused, so this is
     /// the more specific breadcrumb.
     pub from_session_id: String,
-    /// Recipient's tmux session name (P1: local only).
+    /// Recipient's tmux session name.
     pub to_session: String,
+    /// Machine the recipient lives on: `"local"`, or a host name from
+    /// `hosts.toml`. Defaults to `"local"` so messages queued by an older
+    /// build — and every message already sitting in an inbox — still parse.
+    #[serde(default = "host_local")]
+    pub to_host: String,
     /// Opaque address of the recipient session captured at send time:
     /// `"<tmux-server-pid>:<session_id>"` (e.g. `"94795:$5"`).
     ///
@@ -105,6 +110,14 @@ impl Message {
     pub fn render_injection(&self) -> String {
         format!("[ADE mail from {}] {}", self.from_session, self.body)
     }
+}
+
+/// The machine name meaning "where ADE itself runs". Matches the reserved host
+/// name in `hosts::Config::upsert` and the `machine` field of `sessions --json`.
+pub const HOST_LOCAL: &str = "local";
+
+fn host_local() -> String {
+    HOST_LOCAL.to_string()
 }
 
 /// Reject bodies that could do more than paste plain text into a prompt.
@@ -236,11 +249,13 @@ fn create_dir_private(dir: &Path) -> Result<(), String> {
 /// testable. Enforces body validation and the queue caps, then atomically
 /// publishes via `create_new` on a `.tmp` + rename — the reader never sees a
 /// partial write. Returns the message id (== inbox filename stem).
+#[allow(clippy::too_many_arguments)]
 pub fn write_message_in(
     dir: &Path,
     from_session: &str,
     from_session_id: &str,
     to_session: &str,
+    to_host: &str,
     to_session_addr: &str,
     body: &str,
 ) -> Result<String, String> {
@@ -249,6 +264,9 @@ pub fn write_message_in(
     validate_body(body)?;
     if from_session.is_empty() || to_session.is_empty() {
         return Err("sender and recipient session names must be non-empty".to_string());
+    }
+    if to_host.is_empty() {
+        return Err("recipient host must be non-empty (use \"local\" for this machine)".to_string());
     }
     // The recipient's address is mandatory: it's how the router confirms it's
     // injecting into the same conversation the sender addressed (not a
@@ -299,6 +317,7 @@ pub fn write_message_in(
             from_session: from_session.to_string(),
             from_session_id: from_session_id.to_string(),
             to_session: to_session.to_string(),
+            to_host: to_host.to_string(),
             to_session_addr: to_session_addr.to_string(),
             body: body.to_string(),
             created_millis: millis,
@@ -332,6 +351,7 @@ pub fn write_message(
     from_session: &str,
     from_session_id: &str,
     to_session: &str,
+    to_host: &str,
     to_session_addr: &str,
     body: &str,
 ) -> Result<String, String> {
@@ -341,6 +361,7 @@ pub fn write_message(
         from_session,
         from_session_id,
         to_session,
+        to_host,
         to_session_addr,
         body,
     )
@@ -529,7 +550,7 @@ mod tests {
     #[test]
     fn write_then_read_round_trips() {
         let dir = tmp_base();
-        let id = write_message_in(&dir, "a", "$1", "b", "1:$2", "hello there").unwrap();
+        let id = write_message_in(&dir, "a", "$1", "b", "local", "1:$2", "hello there").unwrap();
         let inbox = read_inbox_in(&dir);
         assert_eq!(inbox.len(), 1);
         let (_, msg) = &inbox[0];
@@ -543,9 +564,9 @@ mod tests {
     #[test]
     fn read_inbox_is_publish_ordered() {
         let dir = tmp_base();
-        write_message_in(&dir, "a", "$1", "b", "1:$2", "first").unwrap();
-        write_message_in(&dir, "a", "$1", "b", "1:$2", "second").unwrap();
-        write_message_in(&dir, "a", "$1", "b", "1:$2", "third").unwrap();
+        write_message_in(&dir, "a", "$1", "b", "local", "1:$2", "first").unwrap();
+        write_message_in(&dir, "a", "$1", "b", "local", "1:$2", "second").unwrap();
+        write_message_in(&dir, "a", "$1", "b", "local", "1:$2", "third").unwrap();
         let bodies: Vec<_> = read_inbox_in(&dir)
             .into_iter()
             .map(|(_, m)| m.body)
@@ -654,11 +675,11 @@ mod tests {
     #[test]
     fn write_rejects_bad_body_self_send_and_missing_recipient_addr() {
         let dir = tmp_base();
-        assert!(write_message_in(&dir, "a", "$1", "b", "1:$2", "bad\nbody").is_err());
-        assert!(write_message_in(&dir, "a", "$1", "a", "$1", "to self").is_err());
+        assert!(write_message_in(&dir, "a", "$1", "b", "local", "1:$2", "bad\nbody").is_err());
+        assert!(write_message_in(&dir, "a", "$1", "a", "local", "$1", "to self").is_err());
         // An unresolvable recipient id must refuse — delivery can't be
         // verified without it.
-        assert!(write_message_in(&dir, "a", "$1", "b", "", "no recipient id").is_err());
+        assert!(write_message_in(&dir, "a", "$1", "b", "local", "", "no recipient id").is_err());
         assert!(read_inbox_in(&dir).is_empty());
     }
 
@@ -683,11 +704,11 @@ mod tests {
     fn per_sender_cap_is_enforced() {
         let dir = tmp_base();
         for i in 0..MAX_PER_SENDER {
-            write_message_in(&dir, "spammer", "$1", "b", "1:$2", &format!("m{}", i)).unwrap();
+            write_message_in(&dir, "spammer", "$1", "b", "local", "1:$2", &format!("m{}", i)).unwrap();
         }
-        let over = write_message_in(&dir, "spammer", "$1", "b", "1:$2", "one too many");
+        let over = write_message_in(&dir, "spammer", "$1", "b", "local", "1:$2", "one too many");
         assert!(over.is_err());
-        assert!(write_message_in(&dir, "other", "$3", "b", "1:$2", "fine").is_ok());
+        assert!(write_message_in(&dir, "other", "$3", "b", "local", "1:$2", "fine").is_ok());
     }
 
     #[test]
@@ -699,7 +720,7 @@ mod tests {
         use std::sync::{Arc, Barrier};
 
         let dir = Arc::new(tmp_base());
-        write_message_in(&dir, "a", "$1", "b", "1:$2", "deliver me").unwrap();
+        write_message_in(&dir, "a", "$1", "b", "local", "1:$2", "deliver me").unwrap();
         let (path, _) = read_inbox_in(&dir).into_iter().next().unwrap();
         let path = Arc::new(path);
 
@@ -735,7 +756,7 @@ mod tests {
     #[test]
     fn archive_leaves_an_audit_record() {
         let dir = tmp_base();
-        write_message_in(&dir, "a", "$1", "b", "1:$2", "deliver me").unwrap();
+        write_message_in(&dir, "a", "$1", "b", "local", "1:$2", "deliver me").unwrap();
         let (path, _) = read_inbox_in(&dir).into_iter().next().unwrap();
         let claimed = claim(&dir, &path).unwrap();
         assert!(claimed.path.exists());
@@ -750,7 +771,7 @@ mod tests {
     #[test]
     fn requeue_returns_a_claim_to_the_inbox() {
         let dir = tmp_base();
-        write_message_in(&dir, "a", "$1", "b", "1:$2", "retry me").unwrap();
+        write_message_in(&dir, "a", "$1", "b", "local", "1:$2", "retry me").unwrap();
         let (path, _) = read_inbox_in(&dir).into_iter().next().unwrap();
         let claimed = claim(&dir, &path).unwrap();
         requeue(&dir, &claimed).unwrap();
@@ -766,7 +787,7 @@ mod tests {
         // is recovered. (A zero threshold would pass even if the comparison
         // were inverted, so a real interval is used.)
         let dir = tmp_base();
-        write_message_in(&dir, "a", "$1", "b", "1:$2", "stranded").unwrap();
+        write_message_in(&dir, "a", "$1", "b", "local", "1:$2", "stranded").unwrap();
         let (path, _) = read_inbox_in(&dir).into_iter().next().unwrap();
         let claimed = claim(&dir, &path).unwrap();
 
@@ -828,14 +849,14 @@ mod tests {
             );
             fs::write(inbox.join(format!("{}.json", id)), body).unwrap();
         }
-        let over = write_message_in(&dir, "fresh", "$9", "b", "1:$2", "one too many");
+        let over = write_message_in(&dir, "fresh", "$9", "b", "local", "1:$2", "one too many");
         assert!(over.is_err(), "total cap must refuse further sends");
     }
 
     #[test]
     fn render_injection_prefixes_sender() {
         let dir = tmp_base();
-        write_message_in(&dir, "worker/api", "$7", "b", "1:$2", "build is green").unwrap();
+        write_message_in(&dir, "worker/api", "$7", "b", "local", "1:$2", "build is green").unwrap();
         let (_, msg) = read_inbox_in(&dir).into_iter().next().unwrap();
         assert_eq!(
             msg.render_injection(),
