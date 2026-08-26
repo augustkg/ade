@@ -2249,7 +2249,13 @@ impl App {
             return;
         };
 
-        let env = TmuxDelivery;
+        let Some(env) = Delivery::for_machine(&machine, &self.config.hosts) else {
+            self.error_message = Some(format!(
+                "'{}' is on a host that is no longer configured — cannot deliver",
+                name
+            ));
+            return;
+        };
         let pane_id = match mail_delivery::gate(&env, &req, &msg.to_session_addr) {
             Gate::Deliver { pane_id } => pane_id,
             Gate::Refuse(reason) => {
@@ -3436,6 +3442,71 @@ impl DeliveryEnv for TmuxDelivery {
 
     fn send_text(&self, pane_id: &str, text: &str) -> Result<(), crate::tmux::SendTextError> {
         tmux::local().send_text(pane_id, text)
+    }
+}
+
+/// A `DeliveryEnv` that knows WHICH MACHINE the recipient is on.
+///
+/// This exists so the gate and the injection can never disagree about that.
+/// Before, the gate refused remote recipients outright and both call sites
+/// hardcoded the local adapter; lifting the refusal without this would have
+/// meant gating a remote session and then typing into the local machine's pane
+/// of the same id — delivering someone else's message into the wrong terminal.
+/// Carrying the host in the env makes that mistake unrepresentable.
+pub enum Delivery {
+    Local,
+    Remote(crate::hosts::Host),
+}
+
+impl Delivery {
+    /// Resolve from a machine plus the host list. `None` when the machine names
+    /// a host that is no longer configured — the caller must refuse, not guess.
+    pub fn for_machine(machine: &Machine, hosts: &[crate::hosts::Host]) -> Option<Self> {
+        match machine {
+            Machine::Local => Some(Delivery::Local),
+            Machine::Remote(name) => hosts
+                .iter()
+                .find(|h| &h.name == name)
+                .map(|h| Delivery::Remote(h.clone())),
+        }
+    }
+
+    fn remote(&self) -> Option<crate::tmux::remote::RemoteTmux> {
+        match self {
+            Delivery::Local => None,
+            Delivery::Remote(h) => Some(crate::tmux::remote::RemoteTmux { host: h.clone() }),
+        }
+    }
+}
+
+impl DeliveryEnv for Delivery {
+    fn live_session(&self, name: &str) -> Option<(String, Vec<String>)> {
+        match self.remote() {
+            None => TmuxDelivery.live_session(name),
+            Some(r) => r.live_session(name),
+        }
+    }
+
+    fn composer(&self, pane_id: &str) -> ComposerState {
+        match self.remote() {
+            None => TmuxDelivery.composer(pane_id),
+            Some(r) => match r.capture_pane_id(pane_id) {
+                Ok(cap) => mail_delivery::composer_state(&cap),
+                // An unreadable pane — or an unreachable host — must never be
+                // mistaken for an empty composer.
+                Err(_) => ComposerState::Unknown,
+            },
+        }
+    }
+
+    fn send_text(&self, pane_id: &str, text: &str) -> Result<(), crate::tmux::SendTextError> {
+        match self.remote() {
+            None => TmuxDelivery.send_text(pane_id, text),
+            Some(r) => {
+                use crate::tmux::TmuxBackend;
+                r.send_text(pane_id, text)
+            }
+        }
     }
 }
 

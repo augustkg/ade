@@ -170,6 +170,22 @@ targets another local session; `ade kanban clear` returns a card to the
 automatic columns. Columns resolve by id or display name; only manual
 columns are valid targets.
 
+### Mail across machines
+
+`ade mail send --host <name> --session <name>` addresses a session on any host in
+`hosts.toml`, not just the local machine. The recipient's address is resolved on
+that host at send time, and the router injects over the same SSH channel ADE
+already uses — so a session on your laptop can hand work to one on a server and
+get a reply back.
+
+The body never appears in the remote command string: it travels on stdin and the
+remote side reads it with `"$(cat)"`. A message containing `$(...)`, backticks,
+quotes or semicolons is delivered as literal text.
+
+Everything else is unchanged. Delivery still only happens into a session whose
+Claude is idle at its prompt, the recorded address must still match live, and a
+message for a session that has been killed and recreated is still refused.
+
 The CLI never writes state directly — it drops an intent file in
 `~/.cache/ade/kanban-inbox/` which the running ADE consumes within ~2s
 (or at the next launch). A user-level Claude Code skill
@@ -197,6 +213,8 @@ Press these from inside any tmux session that has ADE's tmux config sourced:
 | `ade install-tmux-config [--host H]` | Install tmux clipboard config |
 | `ade install-tmux-config --all` | Install tmux config on local + every host |
 | `ade install-tmux-config --uninstall` | Remove the tmux clipboard config |
+| `ade mail send --session S --body TEXT [--host H]` | Leave a message for another session; `--host` targets a session on a configured remote |
+| `ade mail deliver [--session S] [--dry-run]` | Deliver queued mail without the TUI |
 | `ade kanban move <column> [--session S]` | Move a session's kanban card to a manual column (defaults to the tmux session it runs inside) |
 | `ade kanban clear [--session S]` | Return a session's card to the automatic columns |
 | `ade debug claude [--host H]` | Diagnose Claude detection per pane (shows `· NN%` per session) |

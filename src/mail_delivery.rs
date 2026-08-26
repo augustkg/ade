@@ -284,11 +284,16 @@ pub fn gate<'a>(
 ) -> Gate {
     let name = req.session_name;
 
-    if !req.is_local {
-        return Gate::Refuse(
-            "mail delivery to remote sessions isn't supported yet".to_string(),
-        );
-    }
+    // `is_local` is no longer a refusal. Remote delivery is supported, and the
+    // machine travels with the env (`app::Delivery`) rather than being a policy
+    // decision here — so the gate and the injection cannot disagree about where
+    // the recipient is.
+    //
+    // It still earns its place in the messages. When mail does not arrive, the
+    // first thing worth knowing is whether the gate was even looking at the
+    // right machine: a refusal naming a session that "has no live Claude" reads
+    // very differently once you know it was inspected over SSH.
+    let whence = if req.is_local { "" } else { " (on a remote host)" };
     if !req.has_pending_mail {
         return Gate::Refuse(format!("no pending mail for '{}'", name));
     }
@@ -298,8 +303,8 @@ pub fn gate<'a>(
     // (never produced by the rollup) is treated as unproven.
     if !req.claude_present {
         return Gate::Refuse(format!(
-            "'{}' has no live Claude session to deliver into",
-            name
+            "'{}'{} has no live Claude session to deliver into",
+            name, whence
         ));
     }
     match req.claude {
@@ -323,7 +328,12 @@ pub fn gate<'a>(
     }
 
     let Some((live_addr, pane_ids)) = env.live_session(name) else {
-        return Gate::Refuse(format!("could not inspect panes of '{}'", name));
+        // For a remote recipient this is also what an unreachable host looks
+        // like, which is worth saying rather than implying the session is gone.
+        return Gate::Refuse(format!(
+            "could not inspect panes of '{}'{}",
+            name, whence
+        ));
     };
 
     // Exactly one pane, or we can't know which one holds Claude. (A second
@@ -858,10 +868,25 @@ mod policy_tests {
     // ── gate matrix: every refusal reason ────────────────────────────
 
     #[test]
-    fn remote_is_refused() {
+    fn remote_is_gated_exactly_like_local() {
+        // Remote delivery used to be refused here outright. It is supported
+        // now, and WHERE the recipient is travels with the env
+        // (`app::Delivery`) rather than being a policy decision — so a remote
+        // request must pass the same gate a local one does, no more and no
+        // less. If this ever starts refusing again, delivery to another
+        // machine has silently regressed.
         let mut r = ok_req("s");
         r.is_local = false;
-        assert!(refusal(gate(&FakeEnv::good(), &r, ADDR)).contains("remote"));
+        assert!(matches!(
+            gate(&FakeEnv::good(), &r, ADDR),
+            Gate::Deliver { .. }
+        ));
+
+        // ...and it is still subject to every other refusal.
+        let mut busy = ok_req("s");
+        busy.is_local = false;
+        busy.claude = Some(ClaudeState::Working);
+        assert!(matches!(gate(&FakeEnv::good(), &busy, ADDR), Gate::Refuse(_)));
     }
 
     #[test]
@@ -968,8 +993,11 @@ mod policy_tests {
 
     #[test]
     fn cheap_checks_run_before_any_tmux_call() {
-        // A remote request must be refused without consulting the environment,
-        // so an env that would panic if touched still yields a refusal.
+        // A request that fails a cheap in-memory check must be refused without
+        // consulting the environment, so an env that would panic if touched
+        // still yields a refusal. (This used to use a remote recipient as the
+        // cheap refusal; remote is a legitimate target now, so it uses the
+        // no-pending-mail check instead.)
         struct Exploding;
         impl DeliveryEnv for Exploding {
             fn live_session(&self, _: &str) -> Option<(String, Vec<String>)> {
@@ -983,7 +1011,7 @@ mod policy_tests {
             }
         }
         let mut r = ok_req("s");
-        r.is_local = false;
+        r.has_pending_mail = false;
         assert!(matches!(gate(&Exploding, &r, ADDR), Gate::Refuse(_)));
     }
 
@@ -1003,7 +1031,7 @@ mod policy_tests {
     /// Queue one message and claim it, returning (dir, claimed, msg).
     fn claimed_message() -> (PathBuf, Claimed, Message) {
         let dir = tmp_base();
-        mail::write_message_in(&dir, "sender", "$1", "rcpt", ADDR, "hello").unwrap();
+        mail::write_message_in(&dir, "sender", "$1", "rcpt", "local", ADDR, "hello").unwrap();
         let (path, msg) = mail::read_inbox_in(&dir).into_iter().next().unwrap();
         let claimed = mail::claim(&dir, &path).unwrap();
         (dir, claimed, msg)

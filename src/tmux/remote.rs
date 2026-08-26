@@ -256,22 +256,75 @@ impl TmuxBackend for RemoteTmux {
         check_status(out)
     }
 
+    /// Type `text` into an exact REMOTE pane and submit it.
+    ///
+    /// The hard part is that the body crosses two parsers — the remote login
+    /// shell, then tmux — and it is arbitrary printable text. Quoting it into
+    /// the command string is what made this unsafe to attempt before: a body
+    /// containing `$(...)`, backticks or quotes would execute on the far side.
+    ///
+    /// So the body never appears in the command string at all. It travels on
+    /// STDIN and the remote command reads it with `"$(cat)"`. Command
+    /// substitution output is not re-scanned for metacharacters, and the
+    /// expansion is double-quoted, so there is no word splitting either. This
+    /// was verified against a body containing `$(echo PWNED)`, backticks,
+    /// quotes, globs, pipes and semicolons: the pane received it byte for byte.
+    ///
+    /// The only thing interpolated is the pane id, which is validated to
+    /// `%<digits>` first — tmux's own format, and nothing a shell reacts to.
     fn send_text(
         &self,
-        _target: &str,
-        _text: &str,
+        target: &str,
+        text: &str,
     ) -> Result<(), super::SendTextError> {
-        // Mail delivery to remote sessions is P2: it needs a dedicated,
-        // tested argument-serialization strategy for the remote shell + tmux
-        // layers (bolting ad-hoc quoting onto `self.ssh` is unsafe, and
-        // `shell_safe` rejects the spaces every message body contains). Until
-        // then, refuse rather than silently mis-deliver.
-        Err(super::SendTextError {
-            message: "mail delivery to remote sessions is not supported yet".to_string(),
-            // Nothing was sent, so the caller can safely requeue.
-            progress: super::SendProgress::NotStarted,
-        })
+        // Injection-boundary revalidation, exactly as the local backend does:
+        // this is where text enters a live pane, and a forged inbox file must
+        // never get a control character or ESC through.
+        if let Err(e) = crate::mail::validate_injection(text) {
+            return Err(super::SendTextError {
+                message: e,
+                progress: super::SendProgress::NotStarted,
+            });
+        }
+        if !is_pane_id(target) {
+            return Err(super::SendTextError {
+                message: format!("refusing to send to '{}': not a tmux pane id", target),
+                progress: super::SendProgress::NotStarted,
+            });
+        }
+
+        // TWO separate ssh invocations, mirroring the local backend's two tmux
+        // invocations. The reason is the same and it is load-bearing: Claude's
+        // TUI only treats a carriage return as *submit* when it arrives as its
+        // own pty read. Chaining both into one remote command would let tmux
+        // coalesce them into a single write, and the message would sit unsent
+        // in the composer. The extra round trip is the price of it submitting.
+        let body_cmd = format!("tmux send-keys -t '{}' -l -- \"$(cat)\"", target);
+        if let Err(e) = crate::ssh_io::run_with_stdin(&self.host, &body_cmd, text.as_bytes()) {
+            return Err(super::SendTextError {
+                message: format!("remote send-keys (body) failed: {}", e),
+                progress: super::SendProgress::NotStarted,
+            });
+        }
+
+        // From here the body IS in the recipient's composer, so a failure is a
+        // PARTIAL send: the caller must not retry or the body is typed twice.
+        let enter_cmd = format!("tmux send-keys -t '{}' Enter", target);
+        if let Err(e) = crate::ssh_io::run(&self.host, &enter_cmd) {
+            return Err(super::SendTextError {
+                message: format!("remote send-keys (Enter) failed: {}", e),
+                progress: super::SendProgress::MayHaveTyped,
+            });
+        }
+        Ok(())
     }
+}
+
+/// A tmux pane id: `%` followed by digits. Deliberately strict — this is the
+/// only caller-influenced value interpolated into a remote command string.
+pub(crate) fn is_pane_id(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('%') else { return false };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
 }
 
 impl RemoteTmux {
@@ -350,6 +403,66 @@ impl RemoteTmux {
             return Err("invalid session name".to_string());
         }
         let cmd = format!("tmux capture-pane -e -p -t '={}:'", name);
+        let out = self.ssh(&cmd)?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(stderr
+                .lines()
+                .next()
+                .unwrap_or("remote capture-pane failed")
+                .to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
+impl RemoteTmux {
+    /// Remote twin of `app::TmuxDelivery::live_session`: one query returning
+    /// the session's address and every pane across ALL its windows.
+    ///
+    /// Session scope (`-s`) is as essential here as locally — without it
+    /// `list-panes` reports only the active window, so a second window could
+    /// hide a shell we would then type into.
+    pub fn live_session(&self, name: &str) -> Option<(String, Vec<String>)> {
+        if !shell_safe(name) {
+            return None;
+        }
+        let cmd = format!(
+            "tmux list-panes -s -t '={}' -F '#{{pid}}:#{{session_id}}\t#{{pane_id}}'",
+            name
+        );
+        let out = self.ssh(&cmd).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut addr = String::new();
+        let mut panes = Vec::new();
+        for line in text.lines() {
+            let mut cols = line.split('\t');
+            let a = cols.next().unwrap_or("").trim();
+            let p = cols.next().unwrap_or("").trim();
+            if a.is_empty() || p.is_empty() {
+                continue;
+            }
+            if addr.is_empty() {
+                addr = a.to_string();
+            }
+            panes.push(p.to_string());
+        }
+        if addr.is_empty() || panes.is_empty() {
+            return None;
+        }
+        Some((addr, panes))
+    }
+
+    /// Capture one exact remote PANE (not the session's active pane), which is
+    /// what composer classification needs.
+    pub fn capture_pane_id(&self, pane_id: &str) -> Result<String, String> {
+        if !is_pane_id(pane_id) {
+            return Err("invalid pane id".to_string());
+        }
+        let cmd = format!("tmux capture-pane -e -p -t '{}'", pane_id);
         let out = self.ssh(&cmd)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);

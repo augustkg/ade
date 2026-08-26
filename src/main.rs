@@ -111,7 +111,7 @@ fn print_usage() {
          \x20\x20ade debug claude [--host H]            Diagnose why ADE does/doesn't see Claude per pane\n\
          \x20\x20ade kanban move <column> [--session S] Move a session's kanban card to a manual column\n\
          \x20\x20ade kanban clear [--session S]         Return a session's card to the automatic columns\n\
-         \x20\x20ade mail send --session S --body TEXT [--from L]  Leave a message for another local session (--from for non-session senders)\n\
+         \x20\x20ade mail send --session S --body TEXT [--host H] [--from L]  Leave a message for another session (--host for a session on a configured remote; --from for non-session senders)\n\
          \x20\x20ade mail whoami                         Print this tmux session's name (its mail address)\n\
          \x20\x20ade mail list                           Show this session's pending messages\n\
          \x20\x20ade mail deliver [--session S] [--dry-run]  Deliver queued mail without the TUI (headless router)\n\
@@ -304,6 +304,7 @@ fn run_mail(args: &[String]) -> Result<()> {
             let mut to: Option<String> = None;
             let mut body: Option<String> = None;
             let mut from_label: Option<String> = None;
+            let mut host: Option<String> = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -326,6 +327,13 @@ fn run_mail(args: &[String]) -> Result<()> {
                             fail("--from requires a value");
                         }
                         from_label = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "--host" => {
+                        if i + 1 >= args.len() {
+                            fail("--host requires a value");
+                        }
+                        host = Some(args[i + 1].clone());
                         i += 2;
                     }
                     other => fail(&format!("unknown argument '{}'", other)),
@@ -366,30 +374,58 @@ fn run_mail(args: &[String]) -> Result<()> {
                     current_session_id().unwrap_or_default(),
                 ),
             };
-            if to == from {
+            let to_host = host.unwrap_or_else(|| mail::HOST_LOCAL.to_string());
+            // Same-name sessions on different machines are different sessions,
+            // so only refuse self-send when the host matches too.
+            if to == from && to_host == mail::HOST_LOCAL {
                 fail("refusing to send a message to yourself");
             }
-            if !session_exists(&to) {
-                fail(&format!("no local tmux session named '{}'", to));
-            }
-            // Capture the recipient's *current* address (server pid +
-            // session id) so the router can refuse delivery if that session is
-            // later killed and recreated under the same name — or recreated
-            // after a tmux server restart, which resets session ids.
-            let to_addr = match tmux::local_session_addr(&to) {
-                Some(a) => a,
-                None => fail(&format!(
-                    "could not resolve the address of local session '{}'",
-                    to
-                )),
+
+            // Capture the recipient's *current* address (server pid + session
+            // id) so the router can refuse delivery if that session is later
+            // killed and recreated under the same name — or recreated after a
+            // tmux server restart, which resets session ids. Addresses are
+            // per-machine, which is exactly why the host is recorded with it.
+            let to_addr = if to_host == mail::HOST_LOCAL {
+                if !session_exists(&to) {
+                    fail(&format!("no local tmux session named '{}'", to));
+                }
+                match tmux::local_session_addr(&to) {
+                    Some(a) => a,
+                    None => fail(&format!(
+                        "could not resolve the address of local session '{}'",
+                        to
+                    )),
+                }
+            } else {
+                let (cfg, _) = hosts::Config::load();
+                let Some(h) = cfg.host_by_name(&to_host) else {
+                    fail(&format!(
+                        "unknown host '{}' — add it with `ade` (H) or in ~/.config/ade/hosts.toml",
+                        to_host
+                    ));
+                };
+                let backend = tmux::remote::RemoteTmux { host: h.clone() };
+                match backend.live_session(&to) {
+                    Some((addr, _panes)) => addr,
+                    None => fail(&format!(
+                        "no tmux session named '{}' on host '{}' (or the host is unreachable)",
+                        to, to_host
+                    )),
+                }
             };
-            match mail::write_message(&from, &from_id, &to, &to_addr, &body) {
+            match mail::write_message(&from, &from_id, &to, &to_host, &to_addr, &body) {
                 Ok(id) => {
+                    let where_ = if to_host == mail::HOST_LOCAL {
+                        String::new()
+                    } else {
+                        format!(" on {}", to_host)
+                    };
                     println!(
-                        "mail: queued for '{}' (id {}). A running ADE surfaces it \
+                        "mail: queued for '{}'{} (id {}). A running ADE surfaces it \
                          within ~2s; delivery into the session happens when you \
                          trigger it from ADE.",
-                        to, id
+                        to, where_, id
                     );
                 }
                 Err(e) => fail(&e),
@@ -476,7 +512,9 @@ fn run_mail_deliver(only: Option<&str>, dry_run: bool) -> usize {
         return 0;
     }
 
-    // One local tmux snapshot for every recipient we consider.
+    // One local tmux snapshot for every LOCAL recipient we consider. Remote
+    // hosts are listed lazily and cached, so a queue with no remote mail never
+    // pays for an SSH round trip.
     let sessions = match tmux::local().list_sessions() {
         Ok(s) => s,
         Err(e) => {
@@ -484,10 +522,13 @@ fn run_mail_deliver(only: Option<&str>, dry_run: bool) -> usize {
             std::process::exit(1);
         }
     };
+    let (host_cfg, _) = hosts::Config::load();
+    let mut remote_sessions: Vec<(String, Vec<tmux::Session>)> = Vec::new();
 
-    let env = app::TmuxDelivery;
     let mut delivered = 0usize;
-    let mut seen: Vec<String> = Vec::new();
+    // Recipients are unique per (host, session): the same session name on two
+    // machines is two different recipients.
+    let mut seen: Vec<(String, String)> = Vec::new();
 
     for (path, msg) in pending {
         if let Some(want) = only {
@@ -497,19 +538,60 @@ fn run_mail_deliver(only: Option<&str>, dry_run: bool) -> usize {
         }
         // At most one per recipient per run; the inbox is in publish order, so
         // this naturally picks the oldest.
-        if seen.iter().any(|s| s == &msg.to_session) {
+        let key = (msg.to_host.clone(), msg.to_session.clone());
+        if seen.contains(&key) {
             continue;
         }
-        seen.push(msg.to_session.clone());
+        seen.push(key);
 
-        let Some(session) = sessions.iter().find(|s| s.name == msg.to_session) else {
-            println!("{}: no such local session — skipped", msg.to_session);
+        let is_local = msg.to_host == mail::HOST_LOCAL;
+        let machine = if is_local {
+            model::Machine::Local
+        } else {
+            model::Machine::Remote(msg.to_host.clone())
+        };
+        let Some(env) = app::Delivery::for_machine(&machine, &host_cfg.hosts) else {
+            println!(
+                "{} on {}: host is not configured — skipped",
+                msg.to_session, msg.to_host
+            );
+            continue;
+        };
+
+        // The session list for the recipient's machine.
+        let pool: &Vec<tmux::Session> = if is_local {
+            &sessions
+        } else {
+            if !remote_sessions.iter().any(|(h, _)| h == &msg.to_host) {
+                let Some(h) = host_cfg.host_by_name(&msg.to_host) else {
+                    continue;
+                };
+                let listed = tmux::remote::RemoteTmux { host: h.clone() }
+                    .refresh()
+                    .map(|r| r.sessions)
+                    .unwrap_or_default();
+                remote_sessions.push((msg.to_host.clone(), listed));
+            }
+            &remote_sessions
+                .iter()
+                .find(|(h, _)| h == &msg.to_host)
+                .expect("just inserted")
+                .1
+        };
+
+        let where_ = if is_local {
+            String::new()
+        } else {
+            format!(" on {}", msg.to_host)
+        };
+        let Some(session) = pool.iter().find(|s| s.name == msg.to_session) else {
+            println!("{}{}: no such session — skipped", msg.to_session, where_);
             continue;
         };
 
         let req = DeliveryRequest {
             session_name: &msg.to_session,
-            is_local: true,
+            is_local,
             has_pending_mail: true,
             claude_present: session.claude_present,
             claude: session.claude,
@@ -700,7 +782,7 @@ fn run_session(args: &[String]) -> Result<()> {
         return Ok(());
     };
     let from_id = tmux::local_session_addr(&parent).unwrap_or_default();
-    match mail::write_message(&parent, &from_id, &name, &to_addr, &prompt) {
+    match mail::write_message(&parent, &from_id, &name, mail::HOST_LOCAL, &to_addr, &prompt) {
         Ok(id) => println!(
             "session: opening prompt queued for '{}' (id {}) — it is delivered \
              once that session is idle at its prompt.",
