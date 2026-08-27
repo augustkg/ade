@@ -156,12 +156,32 @@ fn is_forbidden_char(c: char) -> bool {
     if c.is_control() {
         return true;
     }
+    // Every Unicode format character (category Cf), not a hand-picked subset.
+    //
+    // The previous list covered the well-known bidi overrides and zero-width
+    // marks but missed others in the same category — U+2060 WORD JOINER and
+    // U+061C ARABIC LETTER MARK among them. Those cannot escape the shell or
+    // tmux; what they do is render invisibly in the recipient's prompt and in
+    // the audit trail, so a body can be made to display as something other than
+    // what was sent. A partial list invites exactly that, so the rule is the
+    // whole category. Raised by Codex review.
     matches!(c,
-        // Bidi overrides / isolates and zero-width joiners/marks.
-        '\u{200B}'..='\u{200F}'
-        | '\u{202A}'..='\u{202E}'
-        | '\u{2066}'..='\u{2069}'
-        | '\u{FEFF}'
+        '\u{00AD}'                      // SOFT HYPHEN
+        | '\u{0600}'..='\u{0605}'       // Arabic number/format signs
+        | '\u{061C}'                     // ARABIC LETTER MARK
+        | '\u{06DD}' | '\u{070F}' | '\u{08E2}'
+        | '\u{180E}'                     // MONGOLIAN VOWEL SEPARATOR
+        | '\u{200B}'..='\u{200F}'       // zero-width + LRM/RLM
+        | '\u{202A}'..='\u{202E}'       // bidi embeddings/overrides
+        | '\u{2060}'..='\u{2064}'       // WORD JOINER + invisible operators
+        | '\u{2066}'..='\u{206F}'       // isolates + deprecated formatting
+        | '\u{FEFF}'                     // ZERO WIDTH NO-BREAK SPACE / BOM
+        | '\u{FFF9}'..='\u{FFFB}'       // interlinear annotation
+        | '\u{110BD}' | '\u{110CD}'
+        | '\u{13430}'..='\u{1343F}'     // Egyptian hieroglyph format controls
+        | '\u{1BCA0}'..='\u{1BCA3}'     // shorthand format controls
+        | '\u{1D173}'..='\u{1D17A}'     // musical beam/slur controls
+        | '\u{E0001}' | '\u{E0020}'..='\u{E007F}' // language + TAG chars
     )
 }
 
@@ -854,6 +874,36 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn rejects_every_invisible_format_character() {
+        // Codex named U+2060 and U+061C specifically: both passed the old
+        // hand-picked list and can make a body render as something other than
+        // what was sent.
+        for bad in ['\u{2060}', '\u{061C}', '\u{00AD}', '\u{200B}', '\u{202E}',
+                    '\u{FEFF}', '\u{2066}', '\u{E0041}'] {
+            let body = format!("ok{}hidden", bad);
+            assert!(
+                validate_body(&body).is_err(),
+                "U+{:04X} must be rejected",
+                bad as u32
+            );
+            assert!(validate_injection(&body).is_err(), "U+{:04X}", bad as u32);
+        }
+    }
+
+    #[test]
+    fn ordinary_text_and_real_punctuation_still_pass() {
+        // The widened rule must not start rejecting normal messages.
+        for good in [
+            "build is green",
+            "see PR #28 — merged, 371 tests",
+            "path: /Users/x/Dev/archie/archie-monorepo",
+            "naïve café — 日本語 emoji 🚀 ok",
+        ] {
+            assert!(validate_body(good).is_ok(), "{:?} must be allowed", good);
+        }
+    }
+
     fn render_injection_prefixes_sender() {
         let dir = tmp_base();
         write_message_in(&dir, "worker/api", "$7", "b", "local", "1:$2", "build is green").unwrap();
