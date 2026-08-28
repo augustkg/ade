@@ -832,8 +832,12 @@ impl App {
                     continue;
                 }
             }
-            // P1: all recipients are local.
-            let key = (Machine::Local, msg.to_session.clone());
+            // Key by the machine the message is ADDRESSED to. This was
+            // `Machine::Local` unconditionally, from when mail could only go to
+            // a local session — which meant a message for `work` on a remote
+            // host raised the mail chip on the LOCAL row named `work`, and
+            // delivery was then attempted against the wrong machine entirely.
+            let key = (machine_for_host(&msg.to_host), msg.to_session.clone());
             // First-seen wins: the inbox is in publish order, so the first
             // message for a recipient is the one that has waited longest.
             if let Ok(seen) = std::fs::metadata(&path).and_then(|m| m.modified()) {
@@ -2243,7 +2247,7 @@ impl App {
         // payloads, not on-disk paths.
         let Some((path, msg)) = mail::read_inbox()
             .into_iter()
-            .find(|(_, m)| m.to_session == name)
+            .find(|(_, m)| m.to_session == name && machine_for_host(&m.to_host) == machine)
         else {
             self.error_message = Some(format!("no pending mail for '{}'", name));
             return;
@@ -3374,6 +3378,17 @@ fn compute_closed_list(prev_closed: &[String], snapshot: HashMap<String, bool>) 
     let mut out: Vec<String> = closed.into_iter().collect();
     out.sort();
     out
+}
+
+/// Map a message's `to_host` onto the machine model. `"local"` is the reserved
+/// name for the machine ADE runs on (`hosts::Config::upsert` refuses it as a
+/// remote name), so the two namespaces cannot collide.
+pub fn machine_for_host(to_host: &str) -> Machine {
+    if to_host == crate::mail::HOST_LOCAL {
+        Machine::Local
+    } else {
+        Machine::Remote(to_host.to_string())
+    }
 }
 
 /// Production `DeliveryEnv`: every method is a live tmux query. Kept as a

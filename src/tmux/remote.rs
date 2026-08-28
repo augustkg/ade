@@ -120,8 +120,15 @@ fn shell_safe(s: &str) -> bool {
 /// and keeping the message body out of the command string is the whole basis of
 /// the injection safety in `send_text`.
 pub(crate) fn with_tmux_path(remote_cmd: &str) -> String {
+    // `${PATH:+$PATH:}` rather than `$PATH:` — if the remote PATH is empty the
+    // naive form yields a LEADING EMPTY COMPONENT, which POSIX shells read as
+    // the current directory. That would make the remote `tmux` resolvable from
+    // whatever directory the command happens to start in.
+    //
+    // Appending, not prepending: the system locations keep priority, so this
+    // cannot shadow a real tmux with one from a package directory.
     format!(
-        "export PATH=\"$PATH:/opt/homebrew/bin:/usr/local/bin\"; {}",
+        "export PATH=\"${{PATH:+$PATH:}}/opt/homebrew/bin:/usr/local/bin\"; {}",
         remote_cmd
     )
 }
@@ -326,10 +333,20 @@ impl TmuxBackend for RemoteTmux {
             "tmux send-keys -t '{}' -l -- \"$(cat)\"",
             target
         ));
+        // A failure here is MayHaveTyped, NOT NotStarted.
+        //
+        // Once ssh has been handed the command there is no way to tell, from a
+        // non-zero result, whether the remote tmux ran. The connection can drop
+        // after the body reached the pane but before the status came back, and
+        // ssh reports its own transport errors with the same exit code a remote
+        // command can return. Calling that NotStarted lets the caller requeue,
+        // and the retry types the body into the recipient's prompt a second
+        // time. A stuck claim needs a human; a duplicated injection corrupts
+        // what the recipient is reading, so the ambiguity resolves this way.
         if let Err(e) = crate::ssh_io::run_with_stdin(&self.host, &body_cmd, text.as_bytes()) {
             return Err(super::SendTextError {
                 message: format!("remote send-keys (body) failed: {}", e),
-                progress: super::SendProgress::NotStarted,
+                progress: super::SendProgress::MayHaveTyped,
             });
         }
 
@@ -343,6 +360,27 @@ impl TmuxBackend for RemoteTmux {
             });
         }
         Ok(())
+    }
+}
+
+/// A session address as `<server-pid>:$<session-id>`, both all digits.
+///
+/// This is the value the router compares before injecting, so it is the check
+/// that stops mail landing in a different conversation that merely shares a
+/// name. An older tmux without `#{pid}` renders the first field empty, giving
+/// `:$0` — non-empty, so a bare emptiness test accepts it, and `$0` recurs
+/// after every server restart. Refusing anything malformed keeps that
+/// fail-open shut.
+pub(crate) fn is_valid_session_addr(addr: &str) -> bool {
+    match addr.split_once(':') {
+        Some((pid, sid)) => {
+            !pid.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && sid.len() > 1
+                && sid.starts_with('$')
+                && sid[1..].bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
     }
 }
 
@@ -476,7 +514,13 @@ impl RemoteTmux {
             }
             panes.push(p.to_string());
         }
-        if addr.is_empty() || panes.is_empty() {
+        // Validate the address exactly as `local_session_addr` does. An older
+        // tmux without `#{pid}` renders an empty first field, yielding `:$0` —
+        // non-empty, so a bare emptiness test accepts it, and after a server
+        // restart `$0` comes round again and matches a DIFFERENT session. That
+        // is a fail-open on the one check that stops mail landing in the wrong
+        // conversation, so an address that is not `<pid>:$<id>` is refused.
+        if !is_valid_session_addr(&addr) || panes.is_empty() {
             return None;
         }
         Some((addr, panes))
@@ -522,6 +566,37 @@ mod ls_disposition_tests {
     //! placement pruning would wipe that host's entries.
 
     use super::split_ls_disposition;
+    use super::{is_pane_id, is_valid_session_addr, with_tmux_path};
+
+    #[test]
+    fn rejects_addresses_an_old_tmux_would_fail_open_on() {
+        // tmux without `#{pid}` yields ":$0" — the shape that used to pass.
+        for bad in [":$0", ":$12", "$3", "1234", "", "abc:$1", "1234:5", "1234:$", "1234:$x"] {
+            assert!(!is_valid_session_addr(bad), "{:?} must be refused", bad);
+        }
+        for good in ["1234:$0", "94795:$5", "1:$12"] {
+            assert!(is_valid_session_addr(good), "{:?} must be accepted", good);
+        }
+    }
+
+    #[test]
+    fn pane_ids_are_strict() {
+        for bad in ["%", "%a", "3", "$3", "", "%3;rm -rf /", "%3 %4"] {
+            assert!(!is_pane_id(bad), "{:?} must be refused", bad);
+        }
+        assert!(is_pane_id("%0") && is_pane_id("%117"));
+    }
+
+    #[test]
+    fn path_prefix_never_emits_an_empty_component() {
+        // A leading empty PATH component means "current directory" to a POSIX
+        // shell, which would make the remote tmux resolvable from wherever the
+        // command happened to start.
+        let cmd = with_tmux_path("tmux -V");
+        assert!(cmd.contains("${PATH:+$PATH:}"), "got: {}", cmd);
+        assert!(!cmd.contains("\"$PATH:/"), "naive form would break on empty PATH: {}", cmd);
+        assert!(cmd.ends_with("tmux -V"));
+    }
 
     #[test]
     fn ok_marker_observes_and_yields_lines() {
