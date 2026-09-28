@@ -13,7 +13,7 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Resolve the log path from the two environment values it depends on.
 /// Per the XDG spec an unset *or relative* `XDG_STATE_HOME` is ignored in
@@ -43,7 +43,10 @@ pub fn path() -> Option<PathBuf> {
 /// A symlink at the log path is refused rather than followed, and an existing
 /// file is brought back to 0600 — the log names sessions and SSH targets.
 fn open(truncate: bool) -> Option<File> {
-    let path = path()?;
+    open_at(&path()?, truncate)
+}
+
+fn open_at(path: &Path, truncate: bool) -> Option<File> {
     let dir = path.parent()?;
     fs::create_dir_all(dir).ok()?;
     #[cfg(unix)]
@@ -88,7 +91,7 @@ pub fn append(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve;
+    use super::{open_at, resolve};
     use std::path::PathBuf;
 
     fn os(s: &str) -> Option<std::ffi::OsString> {
@@ -116,5 +119,37 @@ mod tests {
         assert_eq!(resolve(None, None), None);
         assert_eq!(resolve(None, os("relative-home")), None);
         assert_eq!(resolve(os("rel"), None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opener_is_private_and_refuses_symlinks() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("ade-attach-log-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let log = base.join("ade").join("attach.log");
+
+        open_at(&log, true).unwrap().write_all(b"one\n").unwrap();
+        open_at(&log, false).unwrap().write_all(b"two\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "one\ntwo\n");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&log), 0o600);
+        assert_eq!(mode(log.parent().unwrap()), 0o700);
+
+        // A loose file left behind is tightened on the next open.
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_at(&log, false).unwrap();
+        assert_eq!(mode(&log), 0o600);
+
+        // A symlink at the log path is never followed.
+        let target = base.join("elsewhere");
+        std::fs::write(&target, "keep").unwrap();
+        std::fs::remove_file(&log).unwrap();
+        std::os::unix::fs::symlink(&target, &log).unwrap();
+        assert!(open_at(&log, true).is_none());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
