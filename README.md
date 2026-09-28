@@ -13,6 +13,18 @@ Browse, create, rename, and attach to tmux sessions on your laptop and any SSH/M
 - **Smart attach** — handles the awkward edges: same-session no-op, `switch-client` when launched from inside tmux, exec-replace into ssh/mosh for remote sessions. Just press Enter.
 - **Non-blocking refresh** — the tree updates every 2s in the background; manual `r` is instant. SSH per host runs in parallel, bounded by `ConnectTimeout`.
 
+## Install
+
+```sh
+git clone https://github.com/augustkg/ade ~/ade && ~/ade/install.sh
+```
+
+`install.sh` builds with `cargo --locked --release` (cargo 1.78+; install Rust
+per-user with rustup if needed), copies the binary to `~/.local/bin/ade`, and
+runs `ade install-hooks` and `ade install-tmux-config` for this machine. It
+writes only under your home and never uses sudo. `--no-setup` installs just
+the binary.
+
 ## Build
 
 ```sh
@@ -234,9 +246,22 @@ full schema.
 - `sessions --json` → `{ sessions: [ { machine, name, prefix, leaf, session_id, windows, attached, claude: { state, context_pct, model, ctx_tokens, session_id } | null } ], errors: [ { machine, error } ] }`
 - `status --json` → `{ totals: { sessions, working, idle, awaiting_approval }, worst_context_pct, needs_you: [ { machine, name, session_id } ], sessions: [ { machine, name, session_id, state, context_pct } ], errors }`
 
+## Several users on one machine
+
+Each person runs their own ADE, from their own account. ADE drives `tmux` as
+the user who launched it, so it sees that user's tmux server
+(`/tmp/tmux-<uid>/`, which tmux keeps owner-only) and nothing else, and every
+file it keeps lives under that user's home. Two people on one machine get two
+separate trees, kanban boards and mailboxes.
+
+Don't bridge accounts to share sessions. Access to another user's tmux socket,
+or an `ssh` host entry that logs in as them, lets you run any command as that
+user. Sessions you want to drive from ADE have to run under your own account.
+
 ## Config files
 
 - `~/.config/ade/hosts.toml` — host list (managed in-app or by hand)
 - `~/.config/ade/kanban.toml` — kanban column layout (by hand; optional, defaults apply)
 - `~/.config/ade/tmux.conf` — managed tmux clipboard snippet (written by `install-tmux-config`)
 - `~/.config/ade/state.toml` — persisted UI prefs (collapsed folders, dismissed nudges, kanban placements)
+- `~/.local/state/ade/attach.log` — diagnostics for the last attach (`$XDG_STATE_HOME/ade/` if set; owner-only)
