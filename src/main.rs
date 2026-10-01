@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod acceptance;
 mod app;
+mod attach_log;
 mod claude_status;
 mod clipboard;
 mod cwd;
@@ -1180,7 +1181,7 @@ fn log_attach_intent(name: &str, machine: &Machine, outcome: AttachOutcome) {
         env_tmux_pane,
         current,
     );
-    let _ = std::fs::write("/tmp/ade-attach.log", log);
+    attach_log::write(&log);
 }
 
 /// Spawn the attach command and block until it exits. Caller is
@@ -1530,14 +1531,7 @@ fn run_command_capturing(program: &str, args: &[&str]) -> Result<(), String> {
 }
 
 fn append_attach_log(line: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open("/tmp/ade-attach.log")
-    {
-        let _ = f.write_all(line.as_bytes());
-    }
+    attach_log::append(line);
 }
 
 /// Persistent run loop. Today's attach is no longer terminal: ADE stays
